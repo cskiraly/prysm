@@ -1,0 +1,60 @@
+// Copyright 2026 Offchain Labs.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+syntax = "proto3";
+
+package ethereum.eth.v1alpha1;
+
+import "proto/eth/ext/options.proto";
+import "proto/prysm/v1alpha1/partial_data_columns.proto";
+
+option go_package = "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1;eth";
+
+// PartialDataRowSidecar is the RowDAS (EIP-8371) cells wire message, carried on the
+// data_row_{subnet_id} gossip topics as a gossipsub partial message. Row topics carry
+// partial messages only; there is no full-message form of a row.
+//
+// It is the transpose of PartialDataColumnSidecar: a column holds one cell of every blob
+// and its bitmap indexes blobs, while a row holds every cell of one blob and its bitmap
+// indexes columns. number_of_columns.size is the number of cells in an extended blob, which is
+// NUMBER_OF_COLUMNS, so the bitmap is fixed-length regardless of the blob count.
+//
+// Parts metadata reuses PartialDataColumnPartsMetadata: available/requests bitmaps over
+// parts is a domain-agnostic shape, and the gossipsub partial-messages extension carries one
+// peer-state type per host, so rows and columns must share it.
+message PartialDataRowSidecar {
+  // row_index is the blob index this row carries. It is redundant -- the authoritative
+  // value is derived from the topic's row subnet and the slot -- and is carried as a
+  // cross-check: a mismatch is a REJECT, which surfaces a sender computing the mapping
+  // against the wrong slot instead of letting it fail later as an invalid proof. It is also
+  // the field a multi-row-per-subnet rule would need once the blob count can exceed
+  // ROW_SUBNET_COUNT; see notes/rowdas/design.md section 6.1.
+  uint64 row_index = 1;
+  bytes cells_present_bitmap = 2 [
+    (ethereum.eth.ext.ssz_max) = "number_of_columns.size",
+    (ethereum.eth.ext.cast_type) = "github.com/OffchainLabs/go-bitfield.Bitlist"
+  ];
+  repeated bytes partial_row = 3 [
+    (ethereum.eth.ext.ssz_size) = "?,bytes_per_cell.size",
+    (ethereum.eth.ext.ssz_max) = "number_of_columns.size"
+  ];
+  repeated bytes kzg_proofs = 4 [
+    (ethereum.eth.ext.ssz_size) = "?,48",
+    (ethereum.eth.ext.ssz_max) = "number_of_columns.size"
+  ];
+  // header is the same container the column topics use, and a header validated on any
+  // subnet is valid for all of them. Rows need it for more than convenience: with no
+  // full-message form, a node whose only source is the row topic has nowhere else to get
+  // the commitments from.
+  repeated PartialDataColumnHeader header = 5 [(ethereum.eth.ext.ssz_max) = "1"];
+}

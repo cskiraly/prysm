@@ -5,6 +5,7 @@ package eth
 import (
 	binary "encoding/binary"
 	"fmt"
+
 	go_bitfield "github.com/OffchainLabs/go-bitfield"
 	ssz "github.com/OffchainLabs/methodical-ssz/ssz"
 	primitives "github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
@@ -2382,6 +2383,295 @@ func (c *PartialDataColumnSidecar) HashTreeRootWith(hh *ssz.Hasher) (err error) 
 		hh.MerkleizeWithMixin(subIndx, uint64(len(c.KzgProofs)), 4096)
 	}
 	// Field 3: Header
+	{
+		if len(c.Header) > 1 {
+			return ssz.ErrListTooBig
+		}
+		subIndx := hh.Index()
+		for _, o := range c.Header {
+			if err := o.HashTreeRootWith(hh); err != nil {
+				return fmt.Errorf("Header: %w", err)
+			}
+		}
+		hh.MerkleizeWithMixin(subIndx, uint64(len(c.Header)), 1)
+	}
+	hh.Merkleize(indx)
+	return nil
+}
+
+func (c *PartialDataRowSidecar) SizeSSZ() int {
+	size := 24
+	size += len(c.CellsPresentBitmap)
+	size += len(c.PartialRow) * 2048
+	size += len(c.KzgProofs) * 48
+	for _, o := range c.Header {
+		size += 4
+		size += o.SizeSSZ()
+	}
+	return size
+}
+
+func (c *PartialDataRowSidecar) MarshalSSZ() ([]byte, error) {
+	buf := make([]byte, c.SizeSSZ())
+	return c.MarshalSSZTo(buf[:0])
+}
+
+func (c *PartialDataRowSidecar) MarshalSSZTo(dst []byte) ([]byte, error) {
+	var err error
+	offset := 24
+
+	// Field 0: RowIndex
+	dst = binary.LittleEndian.AppendUint64(dst, c.RowIndex)
+
+	// Field 1: CellsPresentBitmap
+	dst = ssz.WriteOffset(dst, offset)
+	offset += len(c.CellsPresentBitmap)
+
+	// Field 2: PartialRow
+	dst = ssz.WriteOffset(dst, offset)
+	offset += len(c.PartialRow) * 2048
+
+	// Field 3: KzgProofs
+	dst = ssz.WriteOffset(dst, offset)
+	offset += len(c.KzgProofs) * 48
+
+	// Field 4: Header
+	dst = ssz.WriteOffset(dst, offset)
+	for _, o := range c.Header {
+		offset += 4
+		offset += o.SizeSSZ()
+	}
+
+	// Field 1: CellsPresentBitmap
+	if len(c.CellsPresentBitmap) > 128 {
+		return nil, ssz.ErrListTooBig
+	}
+	dst = append(dst, c.CellsPresentBitmap...)
+
+	// Field 2: PartialRow
+	if len(c.PartialRow) > 128 {
+		return nil, ssz.ErrListTooBig
+	}
+	for _, o := range c.PartialRow {
+		if len(o) != 2048 {
+			return nil, ssz.ErrBytesLength
+		}
+		dst = append(dst, o...)
+	}
+
+	// Field 3: KzgProofs
+	if len(c.KzgProofs) > 128 {
+		return nil, ssz.ErrListTooBig
+	}
+	for _, o := range c.KzgProofs {
+		if len(o) != 48 {
+			return nil, ssz.ErrBytesLength
+		}
+		dst = append(dst, o...)
+	}
+
+	// Field 4: Header
+	if len(c.Header) > 1 {
+		return nil, ssz.ErrListTooBig
+	}
+	{
+		offset = 4 * len(c.Header)
+		for _, o := range c.Header {
+			dst = ssz.WriteOffset(dst, offset)
+			offset += o.SizeSSZ()
+		}
+	}
+	for _, o := range c.Header {
+		if dst, err = o.MarshalSSZTo(dst); err != nil {
+			return nil, fmt.Errorf("Header: %w", err)
+		}
+	}
+	return dst, err
+}
+
+func (c *PartialDataRowSidecar) UnmarshalSSZ(buf []byte) error {
+	var err error
+	size := uint64(len(buf))
+	if size < 24 {
+		return ssz.ErrSize
+	}
+
+	sszSlice0 := buf[0:8] // c.RowIndex
+
+	sszVarOffset1 := ssz.ReadOffset(buf[8:12]) // c.CellsPresentBitmap
+	if sszVarOffset1 != 24 {
+		return ssz.ErrInvalidVariableOffset
+	}
+	if sszVarOffset1 > size {
+		return ssz.ErrOffset
+	}
+	sszVarOffset2 := ssz.ReadOffset(buf[12:16]) // c.PartialRow
+	if sszVarOffset2 > size || sszVarOffset2 < sszVarOffset1 {
+		return ssz.ErrOffset
+	}
+	sszVarOffset3 := ssz.ReadOffset(buf[16:20]) // c.KzgProofs
+	if sszVarOffset3 > size || sszVarOffset3 < sszVarOffset2 {
+		return ssz.ErrOffset
+	}
+	sszVarOffset4 := ssz.ReadOffset(buf[20:24]) // c.Header
+	if sszVarOffset4 > size || sszVarOffset4 < sszVarOffset3 {
+		return ssz.ErrOffset
+	}
+	sszSlice1 := buf[sszVarOffset1:sszVarOffset2] // c.CellsPresentBitmap
+	sszSlice2 := buf[sszVarOffset2:sszVarOffset3] // c.PartialRow
+	sszSlice3 := buf[sszVarOffset3:sszVarOffset4] // c.KzgProofs
+	sszSlice4 := buf[sszVarOffset4:]              // c.Header
+
+	// Field 0: RowIndex
+	c.RowIndex = binary.LittleEndian.Uint64(sszSlice0)
+
+	// Field 1: CellsPresentBitmap
+	if err = ssz.ValidateBitlist(sszSlice1, 128); err != nil {
+		return fmt.Errorf("CellsPresentBitmap: %w", err)
+	}
+	c.CellsPresentBitmap = append([]byte{}, go_bitfield.Bitlist(sszSlice1)...)
+
+	// Field 2: PartialRow
+	{
+		if len(sszSlice2)%2048 != 0 {
+			return fmt.Errorf("misaligned bytes: c.PartialRow length is %d, which is not a multiple of 2048: %w", len(sszSlice2), ssz.ErrIncorrectListSize)
+		}
+		numElem := len(sszSlice2) / 2048
+		if numElem > 128 {
+			return fmt.Errorf("ssz-max exceeded: c.PartialRow has %d elements, ssz-max is 128: %w", numElem, ssz.ErrListTooBig)
+		}
+		c.PartialRow = make([][]byte, numElem)
+		for i := 0; i < numElem; i++ {
+			var tmp []byte
+
+			tmpSlice := sszSlice2[i*2048 : (1+i)*2048]
+			tmp = make([]byte, 0, 2048)
+			tmp = append(tmp, tmpSlice...)
+			c.PartialRow[i] = tmp
+		}
+	}
+
+	// Field 3: KzgProofs
+	{
+		if len(sszSlice3)%48 != 0 {
+			return fmt.Errorf("misaligned bytes: c.KzgProofs length is %d, which is not a multiple of 48: %w", len(sszSlice3), ssz.ErrIncorrectListSize)
+		}
+		numElem := len(sszSlice3) / 48
+		if numElem > 128 {
+			return fmt.Errorf("ssz-max exceeded: c.KzgProofs has %d elements, ssz-max is 128: %w", numElem, ssz.ErrListTooBig)
+		}
+		c.KzgProofs = make([][]byte, numElem)
+		for i := 0; i < numElem; i++ {
+			var tmp []byte
+
+			tmpSlice := sszSlice3[i*48 : (1+i)*48]
+			tmp = make([]byte, 0, 48)
+			tmp = append(tmp, tmpSlice...)
+			c.KzgProofs[i] = tmp
+		}
+	}
+
+	// Field 4: Header
+	{
+		// empty lists are zero length, so make sure there is room for an offset
+		// before attempting to unmarshal it
+		if len(sszSlice4) > 3 {
+			startOffset := ssz.ReadOffset(sszSlice4[0:4])
+			if startOffset == 0 {
+				return fmt.Errorf("encountered invalid offset of 0 when decoding c.Header")
+			}
+			if startOffset%4 != 0 {
+				return fmt.Errorf("misaligned list bytes: when decoding c.Header, end-of-list offset is %d, which is not a multiple of 4 (offset size)", startOffset)
+			}
+			listLen := startOffset / 4
+			if listLen > 1 {
+				return fmt.Errorf("ssz-max exceeded: c.Header has %d elements, ssz-max is 1: %w", listLen, ssz.ErrListTooBig)
+			}
+			totalVarBytes := uint64(len(sszSlice4))
+			if totalVarBytes < startOffset {
+				return fmt.Errorf("list bytes too short to contain an offset when decoding c.Header")
+			}
+			c.Header = make([]*PartialDataColumnHeader, listLen)
+			var tmpSlice []byte
+			for i := uint64(0); i < listLen; i++ {
+				var tmp *PartialDataColumnHeader
+				tmp = new(PartialDataColumnHeader)
+				endOffset := totalVarBytes
+				if i+1 != listLen {
+					endOffset = ssz.ReadOffset(sszSlice4[(i+1)*4 : (i+2)*4])
+					if totalVarBytes < endOffset {
+						return fmt.Errorf("offset %d points past the end of buffer when decoding c.Header", endOffset)
+					}
+				}
+				if endOffset < startOffset {
+					return fmt.Errorf("offset %d is not greater than start offset %d when decoding c.Header", endOffset, startOffset)
+				}
+				tmpSlice = sszSlice4[startOffset:endOffset]
+				if err = tmp.UnmarshalSSZ(tmpSlice); err != nil {
+					return fmt.Errorf("Header: %w", err)
+				}
+				c.Header[i] = tmp
+				startOffset = endOffset
+			}
+		} else {
+			if len(sszSlice4) > 0 {
+				return fmt.Errorf("list bytes too short to contain an offset when decoding c.Header")
+			}
+			c.Header = make([]*PartialDataColumnHeader, 0)
+		}
+	}
+	return err
+}
+
+func (c *PartialDataRowSidecar) HashTreeRoot() ([32]byte, error) {
+	hh := ssz.DefaultHasherPool.Get()
+	if err := c.HashTreeRootWith(hh); err != nil {
+		ssz.DefaultHasherPool.Put(hh)
+		return [32]byte{}, err
+	}
+	root, err := hh.HashRoot()
+	ssz.DefaultHasherPool.Put(hh)
+	return root, err
+}
+
+func (c *PartialDataRowSidecar) HashTreeRootWith(hh *ssz.Hasher) (err error) {
+	indx := hh.Index()
+	// Field 0: RowIndex
+	hh.PutUint64(c.RowIndex)
+	// Field 1: CellsPresentBitmap
+	if len(c.CellsPresentBitmap) == 0 {
+		return ssz.ErrEmptyBitlist
+	}
+	hh.PutBitlist(c.CellsPresentBitmap, 128)
+	// Field 2: PartialRow
+	{
+		if len(c.PartialRow) > 128 {
+			return ssz.ErrListTooBig
+		}
+		subIndx := hh.Index()
+		for _, o := range c.PartialRow {
+			if len(o) != 2048 {
+				return ssz.ErrBytesLength
+			}
+			hh.PutBytes(o)
+		}
+		hh.MerkleizeWithMixin(subIndx, uint64(len(c.PartialRow)), 128)
+	}
+	// Field 3: KzgProofs
+	{
+		if len(c.KzgProofs) > 128 {
+			return ssz.ErrListTooBig
+		}
+		subIndx := hh.Index()
+		for _, o := range c.KzgProofs {
+			if len(o) != 48 {
+				return ssz.ErrBytesLength
+			}
+			hh.PutBytes(o)
+		}
+		hh.MerkleizeWithMixin(subIndx, uint64(len(c.KzgProofs)), 128)
+	}
+	// Field 4: Header
 	{
 		if len(c.Header) > 1 {
 			return ssz.ErrListTooBig

@@ -8,6 +8,7 @@ types:
   - name: "PartialDataColumnHeader"
   - name: "PartialDataColumnPartsMetadata"
   - name: "PartialDataColumnSidecar"
+  - name: "PartialDataRowSidecar"
   - name: "SignedBeaconBlockContentsFulu"
   - name: "SignedBeaconBlockFulu"
   - name: "SignedBlindedBeaconBlockFulu"
