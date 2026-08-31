@@ -263,7 +263,24 @@ func (f *fakePartialBroadcaster) Unsubscribe(_ context.Context, topic string) er
 	return nil
 }
 
-func (*fakePartialBroadcaster) Start(partialdatacolumnbroadcaster.ColumnCallbacks) {}
+func (*fakePartialBroadcaster) Start(partialdatacolumnbroadcaster.ColumnCallbacks, partialdatacolumnbroadcaster.RowCallbacks) {
+}
+
+func (*fakePartialBroadcaster) PublishRow(context.Context, string, blocks.PartialDataRow) error {
+	return nil
+}
+
+func (*fakePartialBroadcaster) RowSnapshot(context.Context, string, []byte) (*blocks.PartialDataRow, error) {
+	return nil, nil
+}
+
+func (*fakePartialBroadcaster) CrossForwardRow(context.Context, string, *blocks.PartialDataRow, []uint64) (int, error) {
+	return 0, nil
+}
+
+func (*fakePartialBroadcaster) PullRowFromColumns(context.Context, string, *blocks.PartialDataRow, []uint64) (int, error) {
+	return 0, nil
+}
 func (*fakePartialBroadcaster) Publish(context.Context, iter.Seq2[string, blocks.PartialDataColumn]) error {
 	return nil
 }

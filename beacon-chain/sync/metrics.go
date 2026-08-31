@@ -370,3 +370,62 @@ func (s *Service) collectMetricForSubnet(topic string, digest [4]byte, index uin
 	formattedTopic := fmt.Sprintf(topic, digest, index)
 	topicPeerCount.WithLabelValues(formattedTopic).Set(float64(len(s.cfg.p2p.PubSub().ListPeers(formattedTopic))))
 }
+
+// RowDAS (EIP-8371) reconstruction duties. The ratio of cancelled to performed recoveries is the
+// direct measure of what the phase delays buy: a cancellation is a recovery some other node did
+// first, which under PeerDAS every reconstructor would have done anyway.
+var (
+	rowReconstructionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "beacon_row_reconstructions_total",
+		Help: "Number of RowDAS rows recovered locally, by reconstruction phase",
+	}, []string{"phase"})
+
+	rowReconstructionsCancelledTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "beacon_row_reconstructions_cancelled_total",
+		Help: "Number of scheduled RowDAS row recoveries cancelled because the row completed by other means",
+	})
+
+	rowReconstructionDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "beacon_row_reconstruction_seconds",
+		Help:    "Time spent recovering one RowDAS row",
+		Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2},
+	})
+
+	// rowReconstructionSchedulingLag is how much of a phase's window was already spent by the
+	// time the row became recoverable. EIP-8371 measures every delay from block-root
+	// acquisition, so this is the window the phase actually has left, and a lag at or beyond
+	// the phase offset means the recovery fires immediately -- phase 1's jitter, which exists
+	// to desynchronise peers, buys nothing in that case. This is the measurement R7 needs to
+	// replace the phase offsets with evidence.
+	rowReconstructionSchedulingLag = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "beacon_row_reconstruction_scheduling_lag_seconds",
+		Help:    "Time from block-root acquisition to the row becoming recoverable, by phase",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8},
+	}, []string{"phase"})
+
+	// rowReconstructionsSkippedTotal counts rows that became recoverable but were never armed.
+	// reason="not_attached" is EIP-8371's equivocation cap doing its job; reason="unknown_root"
+	// should stay at zero, because row state is only ever built from a validated header --
+	// if it moves, some path is reaching the scheduler without recording an acquisition.
+	rowReconstructionsSkippedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "beacon_row_reconstructions_skipped_total",
+		Help: "Number of recoverable RowDAS rows for which no reconstruction was scheduled",
+	}, []string{"reason"})
+
+	// rowReconstructionsDemotedTotal counts recoveries pushed from an urgent phase to the
+	// opportunistic one because a peer was observed holding the whole row. Against
+	// beacon_row_reconstructions_total{phase="phase3"} it shows how many of those demotions
+	// eventually did the work anyway, which is what a verified signal would remove.
+	rowReconstructionsDemotedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "beacon_row_reconstructions_demoted_total",
+		Help: "Number of armed RowDAS recoveries demoted to phase 3 after a peer was seen holding the whole row",
+	}, []string{"from_phase"})
+
+	// rowDutyRootsUnattachedTotal counts competing block roots for a slot whose duties were
+	// declined. Under an honest proposer this is zero; each increment is one slot's worth of
+	// reconstruction work an equivocation did not buy.
+	rowDutyRootsUnattachedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "beacon_row_duty_roots_unattached_total",
+		Help: "Number of competing block roots for which RowDAS reconstruction duties were declined",
+	})
+)
