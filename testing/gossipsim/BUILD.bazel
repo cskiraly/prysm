@@ -1,0 +1,48 @@
+load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    testonly = True,
+    srcs = [
+        "geo.go",
+        "links.go",
+        "network.go",
+        "payload.go",
+        "pubsubopts.go",
+        "topology.go",
+        "tracer.go",
+    ],
+    importpath = "github.com/OffchainLabs/prysm/v7/testing/gossipsim",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//beacon-chain/p2p:go_default_library",
+        "//testing/require:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/protocol:go_default_library",
+        "@com_github_libp2p_go_libp2p//p2p/net/connmgr:go_default_library",
+        "@com_github_libp2p_go_libp2p//x/simlibp2p:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
+        "@com_github_marcopolo_simnet//:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "calibration_test.go",
+        "subnetaware_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//testing/require:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/network:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/protocol:go_default_library",
+        "@com_github_libp2p_go_libp2p//x/simlibp2p:go_default_library",
+        "@com_github_marcopolo_simnet//:go_default_library",
+    ],
+)
