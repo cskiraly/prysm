@@ -61,6 +61,8 @@ type TestP2P struct {
 	BroadcastCalled       atomic.Bool
 	broadcastedPartials   []blocks.PartialDataColumn
 	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
+	// RowDAS enables the RowDAS row topics for this test node.
+	RowDAS                bool
 	DelaySend             bool
 	Digest                [4]byte
 	peers                 *peers.Status
@@ -337,6 +339,17 @@ func (*TestP2P) Encoding() encoder.NetworkEncoding {
 // to ensure all connected peers receive the message.
 func (p *TestP2P) PubSub() *pubsub.PubSub {
 	return p.pubsub
+}
+
+// RowDASEnabled reports whether this test node serves RowDAS row topics. Rows need the partial
+// broadcaster, so enabling one without the other is not a state a test can reach.
+func (p *TestP2P) RowDASEnabled() bool {
+	return p.RowDAS && p.partialBroadcaster != nil
+}
+
+// RowDASPullEnabled implements the p2p interface. The pull arm is off in tests.
+func (p *TestP2P) RowDASPullEnabled() bool {
+	return false
 }
 
 func (p *TestP2P) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {

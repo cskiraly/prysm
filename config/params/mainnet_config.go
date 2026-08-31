@@ -389,6 +389,9 @@ var mainnetBeaconConfig = &BeaconChainConfig{
 	SubnetsPerNode:                  2,
 	NodeIdBits:                      256,
 
+	// Values related to RowDAS (EIP-8371).
+	RowSubnetCount: 128,
+
 	// Values related to the fast confirmation rule.
 	ConfirmationByzantineThreshold: 25,
 

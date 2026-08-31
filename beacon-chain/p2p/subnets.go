@@ -59,6 +59,10 @@ const blobSubnetLockerVal = 110
 // chosen more than sync, attestation and blob subnet (6) combined.
 const dataColumnSubnetVal = 150
 
+// dataRowSubnetVal namespaces the row subnet lockers. It has to clear the column range,
+// which runs from dataColumnSubnetVal to dataColumnSubnetVal+NUMBER_OF_COLUMNS (150..278).
+const dataRowSubnetVal = 300
+
 const errSavingSequenceNumber = "saving sequence number after updating subnets: %w"
 
 // nodeFilter returns a function that filters nodes based on the subnet topic and subnet index.
@@ -72,6 +76,8 @@ func (s *Service) nodeFilter(topic string, indices map[uint64]int) (func(node *e
 		return s.filterPeerForBlobSubnet(indices), nil
 	case strings.Contains(topic, GossipDataColumnSidecarMessage):
 		return s.filterPeerForDataColumnsSubnet(indices), nil
+	case strings.Contains(topic, GossipDataRowMessage):
+		return s.filterPeerForDataRowsSubnet(indices), nil
 	default:
 		return nil, errors.Errorf("no subnet exists for provided topic: %s", topic)
 	}
@@ -640,6 +646,26 @@ func syncSubnets(record *enr.Record) (map[uint64]bool, error) {
 }
 
 // Retrieve the data columns subnets from a node's ENR and node ID.
+// filterPeerForDataRowsSubnet returns a function that returns the row subnets a peer
+// participates in, intersected with the ones we are looking for.
+//
+// Unlike custody, this needs nothing from the ENR beyond the node ID: EIP-8371 makes row subnet
+// membership a pure function of it, so there is no `cgc`-style entry to read and no way for a
+// peer to misreport its subnet.
+func (s *Service) filterPeerForDataRowsSubnet(indices map[uint64]int) func(node *enode.Node) (map[uint64]bool, error) {
+	return func(node *enode.Node) (map[uint64]bool, error) {
+		if !s.filterPeer(node) {
+			return map[uint64]bool{}, nil
+		}
+		subnet, err := peerdas.RowSubnetForNode(node.ID())
+		if err != nil {
+			return nil, errors.Wrap(err, "row subnet for node")
+		}
+
+		return intersect(indices, map[uint64]bool{subnet: true}), nil
+	}
+}
+
 func dataColumnSubnets(nodeID enode.ID, record *enr.Record) (map[uint64]bool, error) {
 	// Retrieve the custody count from the ENR.
 	custodyGroupCount, err := peerdas.CustodyGroupCountFromRecord(record)

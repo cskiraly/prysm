@@ -109,6 +109,16 @@ func (*FakeP2P) PubSub() *pubsub.PubSub {
 	return nil
 }
 
+// RowDASEnabled -- fake.
+func (*FakeP2P) RowDASEnabled() bool {
+	return false
+}
+
+// RowDASPullEnabled implements the p2p interface. The pull arm is off in tests.
+func (*FakeP2P) RowDASPullEnabled() bool {
+	return false
+}
+
 func (*FakeP2P) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {
 	return nil
 }

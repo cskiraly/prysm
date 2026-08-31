@@ -813,7 +813,7 @@ func (f *fakePartialColumnBroadcaster) Publish(_ context.Context, seq iter.Seq2[
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for topic, col := range seq {
-		f.published = append(f.published, publishedPartial{topic: topic, index: col.Index})
+		f.published = append(f.published, publishedPartial{topic: topic, index: col.Index()})
 	}
 	return f.err
 }
@@ -824,7 +824,24 @@ func (f *fakePartialColumnBroadcaster) publishedColumns() []publishedPartial {
 	return slices.Clone(f.published)
 }
 
-func (*fakePartialColumnBroadcaster) Start(partialdatacolumnbroadcaster.ColumnCallbacks) {}
+func (*fakePartialColumnBroadcaster) Start(partialdatacolumnbroadcaster.ColumnCallbacks, partialdatacolumnbroadcaster.RowCallbacks) {
+}
+
+func (*fakePartialColumnBroadcaster) PublishRow(context.Context, string, blocks.PartialDataRow) error {
+	return nil
+}
+
+func (*fakePartialColumnBroadcaster) RowSnapshot(context.Context, string, []byte) (*blocks.PartialDataRow, error) {
+	return nil, nil
+}
+
+func (*fakePartialColumnBroadcaster) CrossForwardRow(context.Context, string, *blocks.PartialDataRow, []uint64) (int, error) {
+	return 0, nil
+}
+
+func (*fakePartialColumnBroadcaster) PullRowFromColumns(context.Context, string, *blocks.PartialDataRow, []uint64) (int, error) {
+	return 0, nil
+}
 func (*fakePartialColumnBroadcaster) AppendPubSubOpts(opts []pubsub.Option) []pubsub.Option {
 	return opts
 }

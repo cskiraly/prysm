@@ -97,6 +97,11 @@ type (
 
 	// PartialColumnBroadcasterProvider provides the broadcaster for partial messages.
 	PartialColumnBroadcasterProvider interface {
+		// RowDASEnabled reports whether this node serves RowDAS row topics.
+		RowDASEnabled() bool
+		// RowDASPullEnabled reports whether this node asks non-custodied column subnets for the
+		// cells a row is missing.
+		RowDASPullEnabled() bool
 		PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster
 	}
 

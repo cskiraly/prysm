@@ -353,6 +353,14 @@ type BeaconChainConfig struct {
 	SubnetsPerNode                  uint64          `yaml:"SUBNETS_PER_NODE" spec:"true"`                   // SubnetsPerNode is the number of long-lived subnets a beacon node should be subscribed to.
 	NodeIdBits                      uint64          `yaml:"NODE_ID_BITS"`                                   // NodeIdBits defines the bit length of a node id.
 
+	// RowDAS (EIP-8371). Not tagged `spec:"true"`: EIP-8371 is a draft and no
+	// ROW_SUBNET_COUNT has landed in the consensus-specs config, so it is not exposed
+	// on /eth/v1/config/spec yet. It is a config value rather than a compile-time
+	// constant on purpose: with one row subnet per node, a network smaller than roughly
+	// ROW_SUBNET_COUNT times the gossipsub mesh degree leaves nodes alone on their row
+	// subnet, so test and devnet configurations have to be able to reduce it.
+	RowSubnetCount uint64 `yaml:"ROW_SUBNET_COUNT"` // RowSubnetCount is the number of data row subnets used in the gossipsub protocol.
+
 	// Fast Confirmation Rule
 	ConfirmationByzantineThreshold uint64 `yaml:"CONFIRMATION_BYZANTINE_THRESHOLD" spec:"true"` // ConfirmationByzantineThreshold is the assumed percentage of byzantine stake used by the fast confirmation rule.
 

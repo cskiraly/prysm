@@ -150,7 +150,30 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	}
 
 	if cfg.PartialDataColumns {
-		s.partialColumnBroadcaster = partialdatacolumnbroadcaster.NewBroadcaster(ctx, log.Logger)
+		broadcaster := partialdatacolumnbroadcaster.NewBroadcaster(ctx, log.Logger)
+		s.partialColumnBroadcaster = broadcaster
+		// RowDAS cross-forwarding pushes a recovered row's cells into column topics this node
+		// does not custody, which means joining those topics without subscribing to them.
+		// Joining goes through the service because it owns the topic-handle cache: a bare
+		// pubsub.Join would take the handle the subscription path later needs and fail it with
+		// "topic already exists".
+		broadcaster.SetTopicPushHooks(partialdatacolumnbroadcaster.TopicPushHooks{
+			Join: func(topic string) error {
+				_, err := s.JoinTopic(topic)
+				return err
+			},
+			Leave: s.LeaveTopic,
+			SetPartialInterest: func(topic string, want bool) error {
+				// The pull direction. Joining gives the local half; this is the announcement that
+				// makes peers see us as a valid recipient of partial messages on a topic we have
+				// not subscribed to. Needs the vendored fork's Topic.SetPartialInterest.
+				handle, err := s.JoinTopic(topic)
+				if err != nil {
+					return err
+				}
+				return handle.SetPartialInterest(s.ctx, want)
+			},
+		})
 	}
 
 	ipAddr := prysmnetwork.IPAddr()
@@ -355,6 +378,17 @@ func (*Service) Encoding() encoder.NetworkEncoding {
 // PubSub returns the p2p pubsub framework.
 func (s *Service) PubSub() *pubsub.PubSub {
 	return s.pubsub
+}
+
+// RowDASEnabled reports whether this node serves RowDAS row topics.
+func (s *Service) RowDASEnabled() bool {
+	return s.cfg.RowDAS && s.partialColumnBroadcaster != nil
+}
+
+// RowDASPullEnabled reports whether this node asks non-custodied column subnets for the cells a
+// row is missing -- EIP-8371's optional pull direction.
+func (s *Service) RowDASPullEnabled() bool {
+	return s.cfg.RowDASPull && s.RowDASEnabled()
 }
 
 func (s *Service) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {

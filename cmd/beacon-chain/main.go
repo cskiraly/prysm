@@ -164,6 +164,8 @@ var appFlags = []cli.Flag{
 	flags.StateDiffExponents,
 	flags.DisableEphemeralLogFile,
 	flags.PartialDataColumns,
+	flags.RowDAS,
+	flags.RowDASPull,
 	flags.DisableGraffitiClientAppend,
 }
 

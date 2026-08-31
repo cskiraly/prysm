@@ -143,6 +143,12 @@ func (s *Service) topicScoreParams(topic string) (*pubsub.TopicScoreParams, erro
 	case strings.Contains(topic, GossipBlobSidecarMessage), strings.Contains(topic, GossipDataColumnSidecarMessage):
 		// TODO(Deneb): Using the default block scoring. But this should be updated.
 		return defaultBlockTopicParams(), nil
+	case strings.Contains(topic, GossipDataRowMessage):
+		// RowDAS rows carry no full messages, so the message-delivery components of a topic
+		// score are driven entirely by the partial-message peer feedback the broadcaster
+		// reports. Block parameters are a placeholder, as they are for the column topics.
+		// TODO: Revisit scoring params for RowDAS row gossip.
+		return defaultBlockTopicParams(), nil
 	case strings.Contains(topic, GossipLightClientOptimisticUpdateMessage):
 		return defaultLightClientOptimisticUpdateTopicParams(), nil
 	case strings.Contains(topic, GossipLightClientFinalityUpdateMessage):

@@ -26,7 +26,13 @@ const (
 // Config for the p2p service. These parameters are set from application level flags
 // to initialize the p2p service.
 type Config struct {
-	PartialDataColumns    bool
+	PartialDataColumns bool
+	// RowDAS enables the EIP-8371 row topics. Meaningless without PartialDataColumns, which is
+	// what installs the partial-messages extension rows travel on.
+	RowDAS bool
+	// RowDASPull enables EIP-8371's optional pull direction: asking column subnets this node does
+	// not custody for the cells a row is missing. Meaningless without RowDAS.
+	RowDASPull            bool
 	NoDiscovery           bool
 	EnableUPnP            bool
 	StaticPeerID          bool
