@@ -2010,14 +2010,19 @@ def prysm_deps():
         name = "com_github_libp2p_go_libp2p_pubsub",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/libp2p/go-libp2p-pubsub",
+        # Fork carrying the partial-messages changes RowDAS needs (branch
+        # rowdas-partial-messages): SetPartialInterest, RegisterPartial with heartbeat
+        # announcement of registered state, PublishAction.OnSent admission reporting. Same
+        # pin as the go.mod replace directive.
+        replace = "github.com/cskiraly/go-libp2p-pubsub",
         # Replaces proto.CloneOf (needs protobuf-go >= v1.36.4) with proto.Clone,
         # as rules_go pins org_golang_google_protobuf to v1.36.3 for bazel builds.
         patch_args = ["-p1"],
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
         ],
-        sum = "h1:SNdvB6V0eYMXLRR95n+4vpxJKbFsbHhgjPdDiTpGoo0=",
-        version = "v0.17.0",
+        sum = "h1:WPuZcw/8Xiscca2uHoE8R6z3qcvLceXZhb33ctGca8E=",
+        version = "v0.17.1-0.20260831133402-115d7f6949f9",
     )
     go_repository(
         name = "com_github_libp2p_go_libp2p_testing",
@@ -2118,8 +2123,14 @@ def prysm_deps():
     go_repository(
         name = "com_github_marcopolo_simnet",
         importpath = "github.com/marcopolo/simnet",
-        sum = "h1:DpH8BMGsF9+1w13L8rvCaAhb6nYJdY+dIXncDrssvUs=",
-        version = "v0.0.7",
+        # Fork (branch burst-window): LinkSettings.BurstWindow sizes the rate link's
+        # token-bucket burst in line time rather than one MTU, so a 50 Mbps link delivers
+        # 50 Mbps on the real clock (wall-clock links set a few milliseconds via
+        # gossipsim.RealClockBurstWindow; zero keeps upstream's behaviour, which is exact
+        # under a virtual clock). Same pin as the go.mod replace directive.
+        replace = "github.com/cskiraly/simnet",
+        sum = "h1:5KF4+gg6TVbdeit+jBt6XbwqBhsUyupVtgyW6rN8SWc=",
+        version = "v0.0.8-0.20260831115143-816b7ffb262a",
     )
     go_repository(
         name = "com_github_marten_seemann_tcp",

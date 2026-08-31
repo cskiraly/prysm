@@ -315,6 +315,17 @@ replace github.com/json-iterator/go => github.com/prestonvanloon/go v1.1.7-0.201
 
 replace github.com/tyler-smith/go-bip39 => ./third_party/go-bip39
 
+// Fork of the gossipsub partial-messages extension (branch rowdas-partial-messages):
+// SetPartialInterest (EIP-8371's pull direction), RegisterPartial with heartbeat announcement
+// of registered state, and PublishAction.OnSent admission reporting. The Bazel side pins the
+// same version via the go_repository replace in deps.bzl.
+replace github.com/libp2p/go-libp2p-pubsub => github.com/cskiraly/go-libp2p-pubsub v0.17.1-0.20260831133402-115d7f6949f9
+
+// simnet fork (branch burst-window): LinkSettings.BurstWindow sizes the rate link's burst in
+// line time rather than one MTU, so a 50 Mbps link delivers 50 Mbps on the real clock. See
+// testing/gossipsim/calibration_test.go.
+replace github.com/marcopolo/simnet => github.com/cskiraly/simnet v0.0.8-0.20260831115143-816b7ffb262a
+
 tool (
 	github.com/OffchainLabs/methodical-ssz/cmd/ssz
 	github.com/prysmaticlabs/protoc-gen-go-cast
