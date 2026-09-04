@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -56,6 +57,7 @@ type (
 		BroadcastLightClientOptimisticUpdate(ctx context.Context, update interfaces.LightClientOptimisticUpdate) error
 		BroadcastLightClientFinalityUpdate(ctx context.Context, update interfaces.LightClientFinalityUpdate) error
 		BroadcastDataColumnSidecars(ctx context.Context, sidecars []blocks.VerifiedRODataColumn, partialColumns []blocks.PartialDataColumn) error
+		BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error
 	}
 
 	// SetStreamHandler configures p2p to handle streams of a certain topic ID.

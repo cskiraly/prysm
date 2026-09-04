@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -231,4 +232,9 @@ func (*FakeP2P) UpdateEarliestAvailableSlot(earliestAvailableSlot primitives.Slo
 // CustodyGroupCountFromPeer -- fake.
 func (*FakeP2P) CustodyGroupCountFromPeer(peer.ID) uint64 {
 	return 0
+}
+
+// BroadcastSegments -- fuzz target, no-op.
+func (*FakeP2P) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	return nil
 }

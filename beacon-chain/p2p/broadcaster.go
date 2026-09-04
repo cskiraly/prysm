@@ -24,6 +24,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/container/slice"
 	"github.com/OffchainLabs/prysm/v7/crypto/hash"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing"
@@ -90,6 +91,78 @@ func (s *Service) BroadcastForEpoch(ctx context.Context, msg proto.Message, epoc
 		return errors.Errorf("message of %T does not support marshaller interface", msg)
 	}
 	return s.broadcastObject(ctx, castMsg, fmt.Sprintf(topic, forkDigest))
+}
+
+// segmentBatchDeadline bounds how long BroadcastSegments may spend queuing its batch. The
+// enqueue itself is immediate; the deadline only guards the wait for a topic peer that
+// addToBatch performs if the last one leaves between the check in BroadcastSegments and
+// the publish.
+const segmentBatchDeadline = time.Second
+
+// BroadcastSegments publishes the segments of a segmented execution payload envelope, each
+// as an ordinary gossip message on the segment topic, as one batch.
+//
+// Batching changes the order in which (message, peer) sends are emitted rather than
+// coalescing them: PublishBatch plans one RPC per recipient per segment, then the round-robin
+// scheduler emits one RPC per message id per pass, so the first copy of every segment is
+// queued before the second copy of any. The first pass spreads one copy of each segment over
+// the mesh; which peer gets which first copy is up to the router.
+//
+// The whole envelope has already been published when this runs, so this never waits for the
+// segment topic to have peers and gives the batch only a short deadline: a node with no
+// segment peers is not helping, not failing.
+func (s *Service) BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error {
+	ctx, span := trace.StartSpan(ctx, "p2p.BroadcastSegments")
+	defer span.End()
+
+	if len(segs) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, segmentBatchDeadline)
+	defer cancel()
+
+	forkDigest, err := s.currentForkDigest()
+	if err != nil {
+		err := errors.Wrap(err, "could not retrieve fork digest")
+		tracing.AnnotateError(span, err)
+		return err
+	}
+	topic := fmt.Sprintf(ExecutionPayloadSegmentTopicFormat, forkDigest)
+	// The router knows topics by their full name, with the encoding suffix: that is what the
+	// subscription allowlist holds and what batchObject publishes on. Joining the bare name
+	// would be refused by the filter before a single segment left this node.
+	fullTopic := topic + s.Encoding().ProtocolSuffix()
+	span.SetAttributes(trace.StringAttribute("topic", fullTopic))
+
+	topicHandle, err := s.JoinTopic(fullTopic)
+	if err != nil {
+		err := errors.Wrap(err, "could not join segment topic")
+		tracing.AnnotateError(span, err)
+		return err
+	}
+	if len(topicHandle.ListPeers()) == 0 {
+		log.WithField("topic", fullTopic).Debug("No peers on the segment topic, envelope published unsegmented")
+		return nil
+	}
+
+	var batch pubsub.MessageBatch
+	for _, seg := range segs {
+		enc, err := seg.Marshal()
+		if err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not marshal payload segment")
+		}
+		if err := s.batchObject(ctx, &batch, &ethpb.ExecutionPayloadSegment{Segment: enc}, topic); err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not batch payload segment")
+		}
+	}
+	if err := s.pubsub.PublishBatch(&batch); err != nil {
+		tracing.AnnotateError(span, err)
+		return errors.Wrap(err, "could not publish payload segment batch")
+	}
+	return nil
 }
 
 // BroadcastAttestation broadcasts an attestation to the p2p network, the message is assumed to be

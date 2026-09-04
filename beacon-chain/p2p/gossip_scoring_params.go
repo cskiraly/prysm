@@ -150,6 +150,11 @@ func (s *Service) topicScoreParams(topic string) (*pubsub.TopicScoreParams, erro
 	case strings.Contains(topic, GossipPayloadAttestationMessageMessage):
 		// TODO: Revisit scoring params for payload attestation gossip.
 		return defaultBlockTopicParams(), nil
+	// This case must precede the envelope case below: "execution_payload_segment"
+	// contains "execution_payload", so the envelope arm would otherwise swallow it.
+	case strings.Contains(topic, GossipExecutionPayloadSegmentMessage):
+		// TODO: Revisit scoring params for execution payload segment gossip.
+		return defaultBlockTopicParams(), nil
 	case strings.Contains(topic, GossipExecutionPayloadEnvelopeMessage):
 		// TODO: Revisit scoring params for execution payload envelope gossip.
 		return defaultBlockTopicParams(), nil

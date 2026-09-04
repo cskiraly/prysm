@@ -54,6 +54,8 @@ const (
 	GossipExecutionPayloadBidMessage = "execution_payload_bid"
 	// GossipSignedProposerPreferencesMessage is the name for the proposer preferences message type.
 	GossipSignedProposerPreferencesMessage = "proposer_preferences"
+	// GossipExecutionPayloadSegmentMessage is the name for one segment of a segmented execution payload envelope.
+	GossipExecutionPayloadSegmentMessage = "execution_payload_segment"
 
 	// Topic Formats
 	//
@@ -91,6 +93,8 @@ const (
 	ExecutionPayloadBidTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadBidMessage
 	// SignedProposerPreferencesTopicFormat is the topic format for signed proposer preferences.
 	SignedProposerPreferencesTopicFormat = GossipProtocolAndDigest + GossipSignedProposerPreferencesMessage
+	// ExecutionPayloadSegmentTopicFormat is the topic format for execution payload segments.
+	ExecutionPayloadSegmentTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadSegmentMessage
 )
 
 // topic is a struct representing a single gossipsub topic.
@@ -178,6 +182,7 @@ func (s *Service) allTopics() []topic {
 		newTopic(gloas, future, empty, GossipExecutionPayloadEnvelopeMessage),
 		newTopic(gloas, future, empty, GossipExecutionPayloadBidMessage),
 		newTopic(gloas, future, empty, GossipSignedProposerPreferencesMessage),
+		newTopic(gloas, future, empty, GossipExecutionPayloadSegmentMessage),
 	}
 	last := params.GetNetworkScheduleEntry(genesis)
 	schedule := []params.NetworkScheduleEntry{last}

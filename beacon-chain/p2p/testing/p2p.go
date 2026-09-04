@@ -22,6 +22,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
@@ -60,6 +61,7 @@ type TestP2P struct {
 	joinedTopics          map[string]*pubsub.Topic
 	BroadcastCalled       atomic.Bool
 	broadcastedPartials   []blocks.PartialDataColumn
+	broadcastedSegments   []*segments.SegmentMessage
 	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
 	DelaySend             bool
 	Digest                [4]byte
@@ -271,6 +273,22 @@ func (p *TestP2P) BroadcastedPartialColumns() []blocks.PartialDataColumn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.broadcastedPartials
+}
+
+// BroadcastSegments records the segments passed to it.
+func (p *TestP2P) BroadcastSegments(_ context.Context, segs []*segments.SegmentMessage) error {
+	p.BroadcastCalled.Store(true)
+	p.mu.Lock()
+	p.broadcastedSegments = segs
+	p.mu.Unlock()
+	return nil
+}
+
+// BroadcastedSegments returns the segments passed to the most recent BroadcastSegments call.
+func (p *TestP2P) BroadcastedSegments() []*segments.SegmentMessage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.broadcastedSegments
 }
 
 // EnablePartialColumnBroadcaster sets a non-nil partial column broadcaster.
