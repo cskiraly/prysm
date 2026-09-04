@@ -1,0 +1,9 @@
+### Added
+
+- `container/segments`: split a large message into fixed-size segments committed by a Merkle tree, so each segment can be verified on its own; Reed-Solomon coded groups that reassemble from any half of their segments, with a codeword check against the commitment; a content encoding in the committed descriptor; a bounded reassembler that completes a group once, at its required count.
+- `verification/segmentauth`: authenticate a segment group by testing its group id against the commitments the chain accepted, with an interim first-group-per-slot authority until `ExecutionPayloadBid` carries the commitment; publish an envelope compressed first as a coded group by default.
+- `proto`: `ExecutionPayloadSegment`, the SSZ gossip wire type framing one segment, with its `SegmentDescriptor`.
+- `beacon-chain/p2p`: the gloas-gated `execution_payload_segment` topic, `BroadcastSegments` (one batch of gossip messages per envelope), a structured message id on that topic (the segment's group root and index ahead of the content id), and, on that topic only, phase forwarding with the push width following the payload's size, the disciplined pull path (one outstanding request per segment, 200 ms move-on, 400 ms promise with a one-strike park, offer table) and a request gate that stops pulling a group's segments once the node has completed it, all from the go-libp2p-pubsub fork.
+- `beacon-chain/sync`: validate and reassemble execution payload segments from gossip, with a per-peer budget on descriptor authentication; recover coded groups, decompress the reassembled envelope, and report completed groups to the pull gate; a reassembled envelope enters the pending envelope queue for full validation.
+- `beacon-chain/rpc`: publish an execution payload envelope as segments in addition to the whole envelope.
+- `--enable-segmented-payload-gossip`: enables the above. Off by default.
