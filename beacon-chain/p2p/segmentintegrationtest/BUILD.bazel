@@ -1,0 +1,20 @@
+load("@prysm//tools/go:def.bzl", "go_test")
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = ["two_node_test.go"],
+    deps = [
+        "//beacon-chain/p2p:go_default_library",
+        "//beacon-chain/p2p/encoder:go_default_library",
+        "//beacon-chain/verification/segmentauth:go_default_library",
+        "//config/params:go_default_library",
+        "//container/segments:go_default_library",
+        "//proto/prysm/v1alpha1:go_default_library",
+        "//testing/require:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_libp2p_go_libp2p//x/simlibp2p:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
+        "@com_github_marcopolo_simnet//:go_default_library",
+    ],
+)
