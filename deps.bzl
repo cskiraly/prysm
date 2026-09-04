@@ -2016,8 +2016,12 @@ def prysm_deps():
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
         ],
-        sum = "h1:SNdvB6V0eYMXLRR95n+4vpxJKbFsbHhgjPdDiTpGoo0=",
-        version = "v0.17.0",
+        # The fork carrying the segment gossip policy (branch variant-a on v0.17.0: phase
+        # forwarding, the IWANT discipline, the commitment park, the offer table, the request
+        # gate). Same pin as the go.mod replace directive.
+        replace = "github.com/cskiraly/go-libp2p-pubsub",
+        sum = "h1:yEKRVeTrZ9eqMkOfqJlNcal5kQs3NB1eOA2PSUoGzzg=",
+        version = "v0.17.1-0.20260916125138-417418e44fe4",
     )
     go_repository(
         name = "com_github_libp2p_go_libp2p_testing",

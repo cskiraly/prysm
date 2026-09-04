@@ -321,3 +321,8 @@ tool (
 	go.uber.org/mock/mockgen
 	gotest.tools/gotestsum
 )
+
+// The go-libp2p-pubsub fork carrying the segment gossip policy (branch variant-a on v0.17.0:
+// phase forwarding, the IWANT discipline, the commitment park, the offer table, the request
+// gate). The fork's go.mod keeps the upstream module path; deps.bzl pins the same version.
+replace github.com/libp2p/go-libp2p-pubsub => github.com/cskiraly/go-libp2p-pubsub v0.17.1-0.20260916125138-417418e44fe4
