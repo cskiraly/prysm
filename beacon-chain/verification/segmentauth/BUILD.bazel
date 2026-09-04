@@ -1,0 +1,35 @@
+load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "publish.go",
+        "segmentauth.go",
+    ],
+    importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//consensus-types/primitives:go_default_library",
+        "//container/segments:go_default_library",
+        "//math:go_default_library",
+        "//proto/prysm/v1alpha1:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = [
+        "bench_test.go",
+        "publish_test.go",
+        "segmentauth_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//consensus-types/primitives:go_default_library",
+        "//container/segments:go_default_library",
+        "//proto/engine/v1:go_default_library",
+        "//proto/prysm/v1alpha1:go_default_library",
+        "//testing/require:go_default_library",
+    ],
+)
