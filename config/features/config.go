@@ -42,6 +42,7 @@ type Flags struct {
 	EnablePeerScorer                    bool // EnablePeerScorer enables experimental peer scoring in p2p.
 	EnableLightClient                   bool // EnableLightClient enables light client APIs.
 	EnableQUIC                          bool // EnableQUIC specifies whether to enable QUIC transport for libp2p.
+	EnableSegmentedPayloadGossip        bool // EnableSegmentedPayloadGossip publishes and reassembles execution payload envelopes as gossip segments.
 	WriteWalletPasswordOnWebOnboarding  bool // WriteWalletPasswordOnWebOnboarding writes the password to disk after Prysm web signup.
 	EnableDoppelGanger                  bool // EnableDoppelGanger enables doppelganger protection on startup for the validator.
 	EnableHistoricalSpaceRepresentation bool // EnableHistoricalSpaceRepresentation enables the saving of registry validators in separate buckets to save space
@@ -256,6 +257,10 @@ func ConfigureBeaconChain(ctx *cli.Context) error {
 	if ctx.IsSet(disableResourceManager.Name) {
 		logEnabled(disableResourceManager)
 		cfg.DisableResourceManager = true
+	}
+	if ctx.IsSet(EnableSegmentedPayloadGossip.Name) {
+		logEnabled(EnableSegmentedPayloadGossip)
+		cfg.EnableSegmentedPayloadGossip = true
 	}
 	if ctx.IsSet(EnableLightClient.Name) {
 		logEnabled(EnableLightClient)

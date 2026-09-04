@@ -147,6 +147,12 @@ var (
 		Name:  "prepare-all-payloads",
 		Usage: "Informs the engine to prepare all local payloads. Useful for relayers and builders.",
 	}
+	EnableSegmentedPayloadGossip = &cli.BoolFlag{
+		Name: "enable-segmented-payload-gossip",
+		Usage: "Publishes execution payload envelopes as authenticated gossip segments on their own topic, " +
+			"and reassembles segments received from peers. Experimental: the segment commitment is not yet " +
+			"carried in the execution payload bid.",
+	}
 	EnableLightClient = &cli.BoolFlag{
 		Name:  "enable-light-client",
 		Usage: "Enables the light client support in the beacon node",
@@ -295,6 +301,7 @@ var BeaconChainFlags = combinedFlags([]cli.Flag{
 	disableResourceManager,
 	DisableRegistrationCache,
 	EnableLightClient,
+	EnableSegmentedPayloadGossip,
 	BlobSaveFsync,
 	DisableQUIC,
 	EnableDiscoveryReboot,
