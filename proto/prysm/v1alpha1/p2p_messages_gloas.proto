@@ -34,3 +34,21 @@ message ExecutionPayloadEnvelopesByRangeRequest {
   ];
   uint64 count = 2;
 }
+
+// ExecutionPayloadSegment carries one segment of a segmented execution payload
+// envelope.
+//
+// Prysm-local: this is NOT a spec type, unlike the RPC messages above. The segment
+// field is an opaque blob in the container/segments wire format, which carries its
+// own version byte and descriptor. SSZ only frames it, so a segment can travel
+// through the normal gossip pipeline (which decodes into a proto message) while the
+// real format stays free to change without touching consensus types.
+//
+// ssz_max is the largest message container/segments can produce:
+//   descriptor 50 + index 4 + proof count 1 + proof 448 (32 * ceil(log2 MaxSegments))
+//   + data length 4 + data 1048576 (MaxSegmentSize) = 1049083
+// segments.MaxSegmentMessageSize holds the same value and is asserted against this
+// bound by a test, so the two cannot drift apart silently.
+message ExecutionPayloadSegment {
+  bytes segment = 1 [(ethereum.eth.ext.ssz_max) = "1049083"];
+}

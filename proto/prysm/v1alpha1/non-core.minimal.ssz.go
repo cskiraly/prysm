@@ -606,6 +606,83 @@ func (c *ExecutionPayloadEnvelopesByRangeRequest) HashTreeRootWith(hh *ssz.Hashe
 	return nil
 }
 
+func (c *ExecutionPayloadSegment) SizeSSZ() int {
+	size := 4
+	size += len(c.Segment)
+	return size
+}
+
+func (c *ExecutionPayloadSegment) MarshalSSZ() ([]byte, error) {
+	buf := make([]byte, c.SizeSSZ())
+	return c.MarshalSSZTo(buf[:0])
+}
+
+func (c *ExecutionPayloadSegment) MarshalSSZTo(dst []byte) ([]byte, error) {
+	var err error
+	offset := 4
+
+	// Field 0: Segment
+	dst = ssz.WriteOffset(dst, offset)
+	offset += len(c.Segment)
+
+	// Field 0: Segment
+	if len(c.Segment) > 1049083 {
+		return nil, ssz.ErrListTooBig
+	}
+	dst = append(dst, c.Segment...)
+	return dst, err
+}
+
+func (c *ExecutionPayloadSegment) UnmarshalSSZ(buf []byte) error {
+	var err error
+	size := uint64(len(buf))
+	if size < 4 {
+		return ssz.ErrSize
+	}
+
+	sszVarOffset0 := ssz.ReadOffset(buf[0:4]) // c.Segment
+	if sszVarOffset0 != 4 {
+		return ssz.ErrInvalidVariableOffset
+	}
+	if sszVarOffset0 > size {
+		return ssz.ErrOffset
+	}
+	sszSlice0 := buf[sszVarOffset0:] // c.Segment
+
+	// Field 0: Segment
+	c.Segment = append([]byte{}, sszSlice0...)
+	return err
+}
+
+func (c *ExecutionPayloadSegment) HashTreeRoot() ([32]byte, error) {
+	hh := ssz.DefaultHasherPool.Get()
+	if err := c.HashTreeRootWith(hh); err != nil {
+		ssz.DefaultHasherPool.Put(hh)
+		return [32]byte{}, err
+	}
+	root, err := hh.HashRoot()
+	ssz.DefaultHasherPool.Put(hh)
+	return root, err
+}
+
+func (c *ExecutionPayloadSegment) HashTreeRootWith(hh *ssz.Hasher) (err error) {
+	indx := hh.Index()
+	// Field 0: Segment
+
+	{
+		if len(c.Segment) > 1049083 {
+			return ssz.ErrBytesLength
+		}
+		subIndx := hh.Index()
+		hh.AppendBytes32(c.Segment)
+		numItems := uint64(len(c.Segment))
+		hh.MerkleizeWithMixin(subIndx, numItems, (1049083*1+31)/32)
+	}
+
+	hh.Merkleize(indx)
+	return nil
+}
+
 func (c *MetaDataV0) SizeSSZ() int {
 	size := 16
 
