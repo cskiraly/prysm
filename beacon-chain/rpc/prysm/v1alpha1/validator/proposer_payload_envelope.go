@@ -9,6 +9,8 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	consensusblocks "github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
@@ -180,6 +182,13 @@ func (vs *Server) PublishExecutionPayloadEnvelope(
 	// Import in the background so the reveal is not delayed past the PTC deadline.
 	go vs.importPublishedEnvelope(log, verifiedSidecars, roSigned)
 
+	// Segments go out in addition to the whole envelope, never instead of it. Peers that do
+	// not subscribe to the segment topic must still receive the payload, and the feature can
+	// be turned off network-wide without stranding anyone. Off the RPC path, so a slow
+	// segment publish cannot hold the validator's call; the context keeps the request's
+	// values but not its cancellation, which fires when this handler returns.
+	go vs.publishEnvelopeSegments(context.WithoutCancel(ctx), log, signed)
+
 	log.WithField("duration", time.Since(start)).Info("Published execution payload envelope")
 
 	return &emptypb.Empty{}, nil
@@ -311,4 +320,33 @@ func (vs *Server) setParentExecutionRequests(ctx context.Context, sBlk interface
 		return errors.Wrap(err, "could not get parent execution payload envelope")
 	}
 	return sBlk.SetParentExecutionRequests(signedEnvelope.Message.ExecutionRequests)
+}
+
+// publishEnvelopeSegments broadcasts the envelope as authenticated gossip segments.
+//
+// Runs in its own goroutine, after the whole envelope has gone out and the local import has
+// started. Every failure here is logged and swallowed: a node that cannot segment is merely
+// not helping, and failing the publish call would turn an optimisation into a proposal
+// failure.
+func (vs *Server) publishEnvelopeSegments(
+	ctx context.Context,
+	log *logrus.Entry,
+	signed *ethpb.SignedExecutionPayloadEnvelope,
+) {
+	if !features.Get().EnableSegmentedPayloadGossip {
+		return
+	}
+	// The default segmentation, until the bid carries the one the builder committed to.
+	segs, err := segmentauth.SegmentMessagesForEnvelope(signed, segmentauth.DefaultParams())
+	if err != nil {
+		// Segmentation that fails here would also fail on every peer, so publishing the
+		// segments anyway would only earn us invalid-message penalties.
+		log.WithError(err).Warn("Could not derive payload segments, publishing envelope unsegmented")
+		return
+	}
+	if err := vs.P2P.BroadcastSegments(ctx, segs); err != nil {
+		log.WithError(err).Warn("Could not broadcast execution payload segments")
+		return
+	}
+	log.WithField("segments", len(segs)).Debug("Broadcast execution payload segments")
 }

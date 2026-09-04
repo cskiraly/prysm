@@ -83,6 +83,7 @@ go_library(
         "//beacon-chain/state/stategen:go_default_library",
         "//beacon-chain/sync:go_default_library",
         "//beacon-chain/verification:go_default_library",
+        "//beacon-chain/verification/segmentauth:go_default_library",
         "//config/features:go_default_library",
         "//config/fieldparams:go_default_library",
         "//config/params:go_default_library",
@@ -241,6 +242,7 @@ go_test(
         "proposer_gloas_test.go",
         "proposer_payload_attestation_test.go",
         "proposer_payload_envelope_test.go",
+        "proposer_payload_segments_test.go",
         "proposer_preferences_test.go",
         "proposer_slashings_test.go",
         "proposer_submit_bid_test.go",
@@ -274,5 +276,6 @@ go_test(
     embed = [":go_default_library"],
     deps = common_deps + [
         "//proto/prysm/v1alpha1/attestation/aggregation/testing:go_default_library",
+        "//beacon-chain/verification/segmentauth:go_default_library",
     ],
 )
