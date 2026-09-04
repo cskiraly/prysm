@@ -43,6 +43,7 @@ import (
 	payloadattestationtypes "github.com/OffchainLabs/prysm/v7/consensus-types/payload-attestation"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	leakybucket "github.com/OffchainLabs/prysm/v7/container/leaky-bucket"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/crypto/rand"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime"
@@ -209,6 +210,8 @@ type Service struct {
 	subscriptionSpawner                  func(func()) // see Service.spawn for details
 	newExecutionPayloadEnvelopeVerifier  verification.NewExecutionPayloadEnvelopeVerifier
 	pendingPayloadEnvelopes              map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope
+	segmentReassembler                   *segments.Reassembler
+	segmentAuthLimiter                   *leakybucket.Collector
 	pendingEnvelopeLock                  sync.RWMutex
 	selfBuildSigFailures                 int
 	selfBuildSigFailSlot                 primitives.Slot
@@ -319,6 +322,13 @@ func (s *Service) Start() {
 
 	go s.verifierRoutine()
 
+	// Must run before registerSubscribers: the segment subscription is registered only when
+	// reassembly is enabled, so the reassembler has to exist by then.
+	if err := s.initSegmentReassembly(); err != nil {
+		log.WithError(err).Error("Could not initialise payload segment reassembly")
+		return
+	}
+
 	if broadcaster := s.cfg.p2p.PartialColumnBroadcaster(); broadcaster != nil {
 		go broadcaster.Start(&partialColumnCallbacks{service: s})
 	}
@@ -364,6 +374,9 @@ func (s *Service) Stop() error {
 
 		if s.rateLimiter != nil {
 			s.rateLimiter.free()
+		}
+		if s.segmentAuthLimiter != nil {
+			s.segmentAuthLimiter.Free()
 		}
 	}()
 

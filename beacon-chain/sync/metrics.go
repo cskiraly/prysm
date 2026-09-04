@@ -370,3 +370,14 @@ func (s *Service) collectMetricForSubnet(topic string, digest [4]byte, index uin
 	formattedTopic := fmt.Sprintf(topic, digest, index)
 	topicPeerCount.WithLabelValues(formattedTopic).Set(float64(len(s.cfg.p2p.PubSub().ListPeers(formattedTopic))))
 }
+
+var (
+	segmentAuthThrottledCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "execution_payload_segment_auth_throttled_total",
+		Help: "Number of payload segments dropped because the sending peer exhausted its descriptor authentication budget.",
+	})
+	segmentReassembledCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "execution_payload_segment_reassembled_total",
+		Help: "Number of execution payload envelopes fully reassembled from gossip segments.",
+	})
+)

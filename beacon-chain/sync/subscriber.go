@@ -367,6 +367,17 @@ func (s *Service) registerSubscribers(nse params.NetworkScheduleEntry) bool {
 			)
 		})
 
+		if s.segmentReassembler != nil {
+			s.spawn(func() {
+				s.subscribe(
+					p2p.ExecutionPayloadSegmentTopicFormat,
+					s.validateExecutionPayloadSegment,
+					s.executionPayloadSegmentSubscriber,
+					nse,
+				)
+			})
+		}
+
 		s.spawn(func() {
 			s.subscribe(
 				p2p.ExecutionPayloadBidTopicFormat,
