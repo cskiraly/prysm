@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	pbrpc "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
@@ -189,6 +191,9 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 	if s.partialColumnBroadcaster != nil {
 		psOpts = s.partialColumnBroadcaster.AppendPubSubOpts(psOpts)
 	}
+	if features.Get().EnableSegmentedPayloadGossip {
+		psOpts = append(psOpts, segmentgossip.Options(GossipExecutionPayloadSegmentMessage)...)
+	}
 
 	return psOpts
 }
@@ -218,6 +223,9 @@ func pubsubGossipParam() pubsub.GossipSubParams {
 	gParams.HeartbeatInterval = gossipSubHeartbeatInterval
 	gParams.HistoryLength = gossipSubMcacheLen
 	gParams.HistoryGossip = gossipSubMcacheGossip
+	if features.Get().EnableSegmentedPayloadGossip {
+		gParams.MaxIHaveMessages = segmentgossip.MaxIHaveMessages
+	}
 	return gParams
 }
 

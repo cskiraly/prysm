@@ -2,17 +2,26 @@ load("@prysm//tools/go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "go_default_library",
-    srcs = ["msgid.go"],
+    srcs = [
+        "msgid.go",
+        "segmentgossip.go",
+    ],
     importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip",
     visibility = ["//beacon-chain/p2p:__subpackages__"],
+    deps = ["@com_github_libp2p_go_libp2p_pubsub//:go_default_library"],
 )
 
 go_test(
     name = "go_default_test",
-    srcs = ["msgid_test.go"],
+    srcs = [
+        "msgid_test.go",
+        "segmentgossip_test.go",
+    ],
     deps = [
         ":go_default_library",
+        "//beacon-chain/p2p/testing:go_default_library",
         "//proto/prysm/v1alpha1:go_default_library",
         "//testing/require:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
     ],
 )
