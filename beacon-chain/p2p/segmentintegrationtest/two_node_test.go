@@ -21,8 +21,10 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/container/segments"
+	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
+	"github.com/golang/snappy"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -205,6 +207,98 @@ func exchange(t *testing.T, opts []pubsub.Option) {
 		first, h, err := segments.FromProto(segs[0])
 		require.NoError(t, err)
 		require.Equal(t, true, reassembler.Complete(first.Descriptor.GroupID(h)), "the group should be marked complete")
+	})
+}
+
+// TestTwoNodeCodedExchange is the third tier over a real mesh: a compress-first, coded group
+// under the segment topic policy with the pull gate installed. The receiver completes at
+// half the group, the parity half here, recovers the payload and decompresses it; the rest of
+// the group arrives, is verified and changes nothing; and once the receiver reports the group
+// complete, the gate declines the ids the rest of the group was delivered under.
+func TestTwoNodeCodedExchange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		params.SetupTestConfigCleanup(t)
+		gate := segmentgossip.NewPullGate()
+		ps1, ps2, stop := twoNodes(t, segmentgossip.Options(p2p.GossipExecutionPayloadSegmentMessage, gate)...)
+		defer stop()
+
+		payload := deterministicPayload(payloadLen)
+		// The publisher's default shape: as many data segments as 16 KiB gives the raw bytes,
+		// the compressed bytes cut into that many, and as many parity segments again.
+		compressed := snappy.Encode(nil, payload)
+		k := (len(payload) + segmentauth.DefaultSegmentSize - 1) / segmentauth.DefaultSegmentSize
+		h, err := segments.HasherByID(segments.HashSHA256)
+		require.NoError(t, err)
+		built, err := segments.Build(compressed, segments.Layout{
+			SegmentSize: (len(compressed) + k - 1) / k,
+			Hasher:      h,
+			Encoding:    segments.EncodingSnappy,
+			Parity:      k,
+		})
+		require.NoError(t, err)
+		d := built[0].Descriptor
+		require.Equal(t, segments.VersionCoded, d.Version)
+		require.Equal(t, uint32(k), d.Required())
+		require.Equal(t, 2*k, len(built))
+		groupID := d.GroupID(h)
+		segs := make([]*ethpb.ExecutionPayloadSegment, len(built))
+		for i, m := range built {
+			segs[i], err = m.ToProto()
+			require.NoError(t, err)
+		}
+
+		topicStr := segmentTopic()
+		topic1, err := ps1.Join(topicStr)
+		require.NoError(t, err)
+		topic2, err := ps2.Join(topicStr)
+		require.NoError(t, err)
+		sub2, err := topic2.Subscribe()
+		require.NoError(t, err)
+		defer sub2.Cancel()
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+
+		reassembler, err := segments.NewReassembler(segments.ReassemblerConfig{
+			Auth: segmentauth.New(func(g []byte) bool { return bytes.Equal(g, groupID) }),
+		})
+		require.NoError(t, err)
+
+		// Parity first, so completion is a recovery and not a join.
+		publishAll(t, topic1, segs[k:])
+		publishAll(t, topic1, segs[:k])
+
+		var recovered []byte
+		received := 0
+		recvCtx, cancelRecv := context.WithTimeout(context.Background(), receiveDeadline)
+		defer cancelRecv()
+		for received < len(segs) {
+			msg, err := sub2.Next(recvCtx)
+			require.NoError(t, err, "a segment never arrived: %d of %d received", received, len(segs))
+			received++
+			pb := decodeSegment(t, msg.Data)
+			requireClaim(t, msg.ID, pb)
+			out := feed(t, reassembler, pb)
+			switch {
+			case recovered == nil && out != nil:
+				require.Equal(t, k, received, "should complete at exactly the required count")
+				recovered = out
+				// What the sync layer does on completion; from here the gate declines the
+				// group's remaining ids, which is what stop-pull is.
+				gate.MarkComplete(bytesutil.ToBytes32(d.Root))
+			case recovered != nil:
+				require.Equal(t, true, out == nil, "a completed group must not deliver again")
+				require.Equal(t, false, gate.Allow(msg.ReceivedFrom, topicStr, msg.ID), "the gate should decline a completed group's segment")
+			default:
+				require.Equal(t, true, gate.Allow(msg.ReceivedFrom, topicStr, msg.ID), "the gate should allow an incomplete group's segment")
+			}
+		}
+
+		require.Equal(t, true, bytes.Equal(compressed, recovered), "recovered bytes differ from the committed ones")
+		back, err := snappy.Decode(nil, recovered)
+		require.NoError(t, err)
+		require.Equal(t, true, bytes.Equal(payload, back), "decompressed payload differs from the original")
+		require.Equal(t, true, reassembler.Complete(groupID))
+		require.Equal(t, 0, reassembler.Bytes(), "completion should release the buffer")
 	})
 }
 
