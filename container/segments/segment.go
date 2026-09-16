@@ -8,7 +8,8 @@ import (
 	"github.com/OffchainLabs/prysm/v7/math"
 )
 
-// Format version for the descriptor encoding. Bump on any layout change.
+// Version marks a plain group: the message split into Count segments, every one of them
+// needed. VersionCoded, in rs.go, marks a Reed-Solomon coded group. Bump on any layout change.
 const Version uint8 = 1
 
 // Bounds on segmentation, enforced on both the producing and consuming side so a peer
@@ -44,6 +45,10 @@ var (
 // Every field that affects reassembly lives here, so pinning the first descriptor seen for
 // a group is enough to reject peers that later contradict it. Authenticating the descriptor
 // is the caller's responsibility: a Merkle root alone proves only internal consistency.
+//
+// Count is the number of segments on the wire. For a plain group that is also the number
+// needed to reassemble the message; for a coded group Required() of them are, and the rest
+// are parity.
 type Descriptor struct {
 	Version     uint8
 	HashID      HashID
@@ -107,10 +112,19 @@ func Split(msg []byte, segmentSize int) ([][]byte, error) {
 	return segs, nil
 }
 
+// Required returns the number of segments needed to reassemble the message: every one of
+// them for a plain group, the systematic count for a coded one.
+func (d *Descriptor) Required() uint32 {
+	if d.Version == VersionCoded {
+		return uint32((d.TotalLength + uint64(d.SegmentSize) - 1) / uint64(d.SegmentSize))
+	}
+	return d.Count
+}
+
 // Validate checks that a descriptor is self-consistent and within bounds.
 func (d *Descriptor) Validate(h Hasher) error {
-	if d.Version != Version {
-		return fmt.Errorf("%w: version %d, want %d", ErrDescriptorMismatch, d.Version, Version)
+	if d.Version != Version && d.Version != VersionCoded {
+		return fmt.Errorf("%w: version %d, want %d or %d", ErrDescriptorMismatch, d.Version, Version, VersionCoded)
 	}
 	if d.HashID != h.ID() {
 		return fmt.Errorf("%w: hash id %d, hasher %d", ErrDescriptorMismatch, d.HashID, h.ID())
@@ -128,8 +142,15 @@ func (d *Descriptor) Validate(h Hasher) error {
 		return fmt.Errorf("%w: %d", ErrTotalLength, d.TotalLength)
 	}
 	// The count must be exactly the count implied by the length and segment size, so a peer
-	// cannot pad the tree with extra leaves or truncate it.
+	// cannot pad the tree with extra leaves or truncate it. A coded group's count exceeds the
+	// implied count by its parity, bounded by the code's field size instead.
 	want := (d.TotalLength + uint64(d.SegmentSize) - 1) / uint64(d.SegmentSize)
+	if d.Version == VersionCoded {
+		if uint64(d.Count) <= want || d.Count > MaxCodedSegments {
+			return fmt.Errorf("%w: coded count %d, implied %d, max %d", ErrDescriptorMismatch, d.Count, want, MaxCodedSegments)
+		}
+		return nil
+	}
 	if uint64(d.Count) != want {
 		return fmt.Errorf("%w: count %d, implied %d", ErrDescriptorMismatch, d.Count, want)
 	}
@@ -137,13 +158,13 @@ func (d *Descriptor) Validate(h Hasher) error {
 }
 
 // SegmentLength returns the expected byte length of the segment at index. Only the final
-// segment may be short.
+// systematic segment may be short; a coded group's parity segments are always full length.
 func (d *Descriptor) SegmentLength(index int) (int, error) {
 	if index < 0 || uint32(index) >= d.Count {
 		return 0, fmt.Errorf("%w: %d not in [0,%d)", ErrIndexOutOfRange, index, d.Count)
 	}
-	if uint32(index) == d.Count-1 {
-		last := d.TotalLength - uint64(d.Count-1)*uint64(d.SegmentSize)
+	if uint32(index) == d.Required()-1 {
+		last := d.TotalLength - uint64(d.Required()-1)*uint64(d.SegmentSize)
 		// Checked conversion: TotalLength is attacker-influenced and int is 32-bit on some
 		// platforms, so a raw cast could wrap.
 		n, err := math.Int(last)
@@ -197,10 +218,14 @@ func VerifySegment(d *Descriptor, h Hasher, index int, seg []byte, proof [][]byt
 	return VerifyProof(h, d.Root, seg, index, int(d.Count), proof)
 }
 
-// Join reassembles the original message from a complete, ordered set of segments.
+// Join reassembles the original message from a complete, ordered set of segments. A coded
+// group is reassembled by RecoverAndVerify instead, from any Required of its segments.
 func Join(d *Descriptor, h Hasher, segs [][]byte) ([]byte, error) {
 	if err := d.Validate(h); err != nil {
 		return nil, err
+	}
+	if d.Version == VersionCoded {
+		return nil, fmt.Errorf("%w: coded group, use RecoverAndVerify", ErrDescriptorMismatch)
 	}
 	if uint32(len(segs)) != d.Count {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIncompleteSegments, len(segs), d.Count)
