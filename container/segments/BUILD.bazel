@@ -1,0 +1,38 @@
+load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "authenticator.go",
+        "codec.go",
+        "gf256.go",
+        "hasher.go",
+        "partial.go",
+        "reassembler.go",
+        "rs.go",
+        "segment.go",
+        "tree.go",
+    ],
+    importpath = "github.com/OffchainLabs/prysm/v7/container/segments",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crypto/hash:go_default_library",
+        "//math:go_default_library",
+        "@com_github_golang_snappy//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = [
+        "codec_test.go",
+        "overhead_test.go",
+        "partial_test.go",
+        "reassembler_test.go",
+        "rs_test.go",
+        "segments_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = ["//testing/require:go_default_library"],
+)

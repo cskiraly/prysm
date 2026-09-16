@@ -1,0 +1,14 @@
+syntax = "proto2";
+
+package compat.pb;
+
+option go_package = "github.com/libp2p/go-libp2p-pubsub/compat;compat_pb";
+
+message Message {
+	optional bytes from = 1;
+	optional bytes data = 2;
+	optional bytes seqno = 3;
+	repeated string topicIDs = 4;
+	optional bytes signature = 5;
+	optional bytes key = 6;
+}

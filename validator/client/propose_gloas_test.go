@@ -81,7 +81,7 @@ func TestProposeSelfBuildEnvelope(t *testing.T) {
 		Return(&ethpb.DomainResponse{SignatureDomain: builderDomain}, nil)
 
 	m.validatorClient.EXPECT().
-		PublishExecutionPayloadEnvelope(gomock.Any(), gomock.AssignableToTypeOf(&ethpb.SignedExecutionPayloadEnvelope{})).
+		PublishExecutionPayloadEnvelope(gomock.Any(), gomock.AssignableToTypeOf(&ethpb.SignedExecutionPayloadEnvelope{}), gomock.Any()).
 		Return(&emptypb.Empty{}, nil)
 
 	signedBlock := signedGloasBlock(t, slot, builderIndex)
@@ -303,7 +303,7 @@ func TestProposeBlock_Gloas_EnvelopeAfterBlock(t *testing.T) {
 		After(getEnvelopeCall)
 
 	m.validatorClient.EXPECT().
-		PublishExecutionPayloadEnvelope(gomock.Any(), gomock.AssignableToTypeOf(&ethpb.SignedExecutionPayloadEnvelope{})).
+		PublishExecutionPayloadEnvelope(gomock.Any(), gomock.AssignableToTypeOf(&ethpb.SignedExecutionPayloadEnvelope{}), gomock.Any()).
 		Return(&emptypb.Empty{}, nil)
 
 	validator.ProposeBlock(t.Context(), 1, pubKey)

@@ -54,6 +54,12 @@ const (
 	GossipExecutionPayloadBidMessage = "execution_payload_bid"
 	// GossipSignedProposerPreferencesMessage is the name for the proposer preferences message type.
 	GossipSignedProposerPreferencesMessage = "proposer_preferences"
+	// GossipExecutionPayloadSegmentMessage is the name for one segment of a segmented execution payload envelope.
+	GossipExecutionPayloadSegmentMessage = "execution_payload_segment"
+	// GossipDataRowMessage is the name for the RowDAS (EIP-8371) row subnets. These carry
+	// gossipsub partial messages only -- the cells of one blob across all columns -- and have
+	// no full-message form, which is why there is no entry for them in gossipTopicMappings.
+	GossipDataRowMessage = "data_row"
 
 	// Topic Formats
 	//
@@ -91,6 +97,10 @@ const (
 	ExecutionPayloadBidTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadBidMessage
 	// SignedProposerPreferencesTopicFormat is the topic format for signed proposer preferences.
 	SignedProposerPreferencesTopicFormat = GossipProtocolAndDigest + GossipSignedProposerPreferencesMessage
+	// ExecutionPayloadSegmentTopicFormat is the topic format for execution payload segments.
+	ExecutionPayloadSegmentTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadSegmentMessage
+	// DataRowSubnetTopicFormat is the topic format for a RowDAS row subnet.
+	DataRowSubnetTopicFormat = GossipProtocolAndDigest + GossipDataRowMessage + "_%d"
 )
 
 // topic is a struct representing a single gossipsub topic.
@@ -178,6 +188,15 @@ func (s *Service) allTopics() []topic {
 		newTopic(gloas, future, empty, GossipExecutionPayloadEnvelopeMessage),
 		newTopic(gloas, future, empty, GossipExecutionPayloadBidMessage),
 		newTopic(gloas, future, empty, GossipSignedProposerPreferencesMessage),
+		newTopic(gloas, future, empty, GossipExecutionPayloadSegmentMessage),
+	}
+	// RowDAS row subnets, from Fulu. Registered whenever the configuration defines any, and not
+	// gated on --row-das: the allow-list decides what a subscription *may* name, while the flag
+	// decides what this node actually joins. ROW_SUBNET_COUNT of zero means RowDAS is off for
+	// this configuration, and newSubnetTopic would then produce an unindexed "data_row" topic.
+	if cfg.RowSubnetCount > 0 {
+		templates = append(templates,
+			newSubnetTopic(fulu, future, empty, GossipDataRowMessage, cfg.RowSubnetCount))
 	}
 	last := params.GetNetworkScheduleEntry(genesis)
 	schedule := []params.NetworkScheduleEntry{last}

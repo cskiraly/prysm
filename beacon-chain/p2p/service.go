@@ -14,6 +14,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers/scorers"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
 	"github.com/OffchainLabs/prysm/v7/config/features"
@@ -79,6 +80,7 @@ type Service struct {
 	metaData                 metadata.Metadata
 	pubsub                   *pubsub.PubSub
 	partialColumnBroadcaster partialdatacolumnbroadcaster.Broadcaster
+	segmentBroadcaster       *segmentbroadcaster.Broadcaster
 	joinedTopics             map[string]*pubsub.Topic
 	joinedTopicsLock         sync.RWMutex
 	subnetsLock              map[uint64]*sync.RWMutex
@@ -150,7 +152,43 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	}
 
 	if cfg.PartialDataColumns {
-		s.partialColumnBroadcaster = partialdatacolumnbroadcaster.NewBroadcaster(ctx, log.Logger)
+		broadcaster := partialdatacolumnbroadcaster.NewBroadcaster(ctx, log.Logger)
+		s.partialColumnBroadcaster = broadcaster
+		// RowDAS cross-forwarding pushes a recovered row's cells into column topics this node
+		// does not custody, which means joining those topics without subscribing to them.
+		// Joining goes through the service because it owns the topic-handle cache: a bare
+		// pubsub.Join would take the handle the subscription path later needs and fail it with
+		// "topic already exists".
+		broadcaster.SetTopicPushHooks(partialdatacolumnbroadcaster.TopicPushHooks{
+			Join: func(topic string) error {
+				_, err := s.JoinTopic(topic)
+				return err
+			},
+			Leave: s.LeaveTopic,
+			SetPartialInterest: func(topic string, want bool) error {
+				// The pull direction. Joining gives the local half; this is the announcement that
+				// makes peers see us as a valid recipient of partial messages on a topic we have
+				// not subscribed to. Needs the vendored fork's Topic.SetPartialInterest.
+				handle, err := s.JoinTopic(topic)
+				if err != nil {
+					return err
+				}
+				return handle.SetPartialInterest(s.ctx, want)
+			},
+		})
+	}
+	if features.Get().SegmentedPayloadGossip == features.SegmentedPayloadPartial {
+		// Both broadcasters install a partial-messages extension, and gossipsub holds exactly
+		// one -- with one PeerState type. Refusing is the honest response; a union PeerState
+		// covering both applications is recorded in notes/TODO.md.
+		if s.partialColumnBroadcaster != nil {
+			return nil, errors.New(
+				"--segmented-payload-gossip=partial cannot run alongside --partial-data-columns: " +
+					"gossipsub holds one partial-messages extension")
+		}
+		s.segmentBroadcaster = segmentbroadcaster.New(ctx, log.Logger, segmentbroadcaster.Config{
+			Policy: segmentbroadcaster.PushSplit,
+		})
 	}
 
 	ipAddr := prysmnetwork.IPAddr()
@@ -355,6 +393,22 @@ func (*Service) Encoding() encoder.NetworkEncoding {
 // PubSub returns the p2p pubsub framework.
 func (s *Service) PubSub() *pubsub.PubSub {
 	return s.pubsub
+}
+
+// SegmentBroadcaster returns the variant B segment broadcaster, or nil when it is not in use.
+func (s *Service) SegmentBroadcaster() *segmentbroadcaster.Broadcaster {
+	return s.segmentBroadcaster
+}
+
+// RowDASEnabled reports whether this node serves RowDAS row topics.
+func (s *Service) RowDASEnabled() bool {
+	return s.cfg.RowDAS && s.partialColumnBroadcaster != nil
+}
+
+// RowDASPullEnabled reports whether this node asks non-custodied column subnets for the cells a
+// row is missing -- EIP-8371's optional pull direction.
+func (s *Service) RowDASPullEnabled() bool {
+	return s.cfg.RowDASPull && s.RowDASEnabled()
 }
 
 func (s *Service) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {

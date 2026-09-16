@@ -474,6 +474,11 @@ func getSignRequestJson(ctx context.Context, validator *validator.Validate, requ
 	case *validatorpb.SignRequest_RequestAuth:
 		// TODO: Implement builder request auth signing for web3signer.
 		return nil, fmt.Errorf("web3signer request auth signing not yet implemented")
+	case *validatorpb.SignRequest_PayloadSegmentDescriptor:
+		// Refused rather than unimplemented: the descriptor signature is a Prysm-local
+		// scheme with no web3signer request type, and it is meant to disappear once the
+		// commitment moves into the execution payload bid.
+		return nil, fmt.Errorf("web3signer cannot sign payload segment descriptors")
 
 	// We do not support "DEPOSIT" type.
 	/*

@@ -3,9 +3,12 @@ package testing
 import (
 	"context"
 
+	"github.com/OffchainLabs/prysm/v7/container/segments"
+
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentbroadcaster"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
@@ -107,6 +110,21 @@ func (*FakeP2P) Send(_ context.Context, _ any, _ string, _ peer.ID) (network.Str
 // PubSub -- fake.
 func (*FakeP2P) PubSub() *pubsub.PubSub {
 	return nil
+}
+
+// SegmentBroadcaster -- fuzz target, no-op.
+func (*FakeP2P) SegmentBroadcaster() *segmentbroadcaster.Broadcaster {
+	return nil
+}
+
+// RowDASEnabled -- fake.
+func (*FakeP2P) RowDASEnabled() bool {
+	return false
+}
+
+// RowDASPullEnabled implements the p2p interface. The pull arm is off in tests.
+func (*FakeP2P) RowDASPullEnabled() bool {
+	return false
 }
 
 func (*FakeP2P) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {
@@ -231,4 +249,9 @@ func (*FakeP2P) UpdateEarliestAvailableSlot(earliestAvailableSlot primitives.Slo
 // CustodyGroupCountFromPeer -- fake.
 func (*FakeP2P) CustodyGroupCountFromPeer(peer.ID) uint64 {
 	return 0
+}
+
+// BroadcastSegments -- fuzz target, no-op.
+func (p *FakeP2P) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	return nil
 }

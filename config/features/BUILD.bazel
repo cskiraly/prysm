@@ -8,6 +8,7 @@ go_library(
         "filter_flags.go",
         "flags.go",
         "log.go",
+        "segments.go",
     ],
     importpath = "github.com/OffchainLabs/prysm/v7/config/features",
     visibility = ["//visibility:public"],
@@ -29,6 +30,7 @@ go_test(
     srcs = [
         "config_test.go",
         "deprecated_flags_test.go",
+        "segments_test.go",
     ],
     embed = [":go_default_library"],
     deps = [

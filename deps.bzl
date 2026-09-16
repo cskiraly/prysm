@@ -609,6 +609,12 @@ def prysm_deps():
         version = "v1.5.7",
     )
     go_repository(
+        name = "com_github_dave_jennifer",
+        importpath = "github.com/dave/jennifer",
+        sum = "h1:B4jJJDHelWcDhlRQxWeo0Npa/pYKBLrirAQoTN45txo=",
+        version = "v1.7.1",
+    )
+    go_repository(
         name = "com_github_davecgh_go_spew",
         importpath = "github.com/davecgh/go-spew",
         sum = "h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=",
@@ -2009,6 +2015,29 @@ def prysm_deps():
         patch_args = ["-p1"],
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
+            # Phase forwarding (design-space dimension 9 on variant A). Same diff as the
+            # go.mod replace to ./third_party/go-libp2p-pubsub; regenerate with
+            # diff -u <modcache>/gossipsub.go third_party/go-libp2p-pubsub/gossipsub.go etc.
+            "//third_party:com_github_libp2p_go_libp2p_pubsub-phaseforward.patch",
+            # Partial-message interest in a topic we joined but did not subscribe to, which
+            # EIP-8371's pull direction needs (notes/rowdas/TODO.md F1). Applied on top of the
+            # patch above, so it is a diff against the already-patched tree: regenerate with
+            # git diff --relative=third_party/go-libp2p-pubsub -- third_party/go-libp2p-pubsub
+            # against the last commit of the fork.
+            "//third_party:com_github_libp2p_go_libp2p_pubsub-partialinterest.patch",
+            # sendRPC reports whether the RPC was admitted to the peer's queue, and the
+            # partial-messages extension passes it to PublishAction.OnSent, so the
+            # application records only what actually went out (plan-repair.md item 3).
+            # Also carries the extension's per-topic counter cleanup from e4b789012c, which
+            # never had a patch: the fork and this list had drifted before this entry.
+            #
+            # Generated as base-tree-to-fork rather than commit-to-commit, so it cannot drift
+            # the same way: copy <modcache>/go-libp2p-pubsub@v0.17.0, apply the patches above
+            # in order (patch -p1 -N -f; the BUILD hunk is skipped), then
+            # diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base third_party/go-libp2p-pubsub.
+            # sign.go is excluded because the cloneof patch above is Bazel-only. Verify by
+            # applying the result to a fresh base copy and diffing against the fork: empty.
+            "//third_party:com_github_libp2p_go_libp2p_pubsub-admission.patch",
         ],
         sum = "h1:SNdvB6V0eYMXLRR95n+4vpxJKbFsbHhgjPdDiTpGoo0=",
         version = "v0.17.0",
@@ -2112,6 +2141,17 @@ def prysm_deps():
     go_repository(
         name = "com_github_marcopolo_simnet",
         importpath = "github.com/marcopolo/simnet",
+        patch_args = ["-p1"],
+        patches = [
+            # LinkSettings.BurstWindow: how much line time the token bucket may accumulate.
+            # Zero keeps upstream's one-MTU burst, which is exact under a virtual clock; on the
+            # real clock every timer wake-up overshoots, so one-MTU pacing lost capacity (a
+            # 50 Mbps link delivered ~21) and wall-clock links set a few milliseconds
+            # (gossipsim.RealClockBurstWindow). Same diff as the go.mod replace to
+            # ./third_party/simnet; regenerate with
+            # diff -ruN -x '*.orig' -x BUILD.bazel -x .github <modcache>/simnet@v0.0.7 third_party/simnet.
+            "//third_party:com_github_marcopolo_simnet-burst.patch",
+        ],
         sum = "h1:DpH8BMGsF9+1w13L8rvCaAhb6nYJdY+dIXncDrssvUs=",
         version = "v0.0.7",
     )
@@ -2480,6 +2520,12 @@ def prysm_deps():
         patches = ["//third_party:com_github_offchainlabs_hashtree.patch"],
         sum = "h1:nM8dBAQZzHLzzM14FaAHXnHTAXZIst69v5xWuS48y/c=",
         version = "v0.2.3",
+    )
+    go_repository(
+        name = "com_github_offchainlabs_methodical_ssz",
+        importpath = "github.com/OffchainLabs/methodical-ssz",
+        sum = "h1:X7Rtbyy16t/ruqtADWyYg8GSfJlO9gfXyxmHpB3oYvQ=",
+        version = "v0.0.0-20260703104215-9be4f5c6a334",
     )
     go_repository(
         name = "com_github_oklog_oklog",
@@ -4599,14 +4645,14 @@ def prysm_deps():
     go_repository(
         name = "org_golang_google_genproto_googleapis_api",
         importpath = "google.golang.org/genproto/googleapis/api",
-        sum = "h1:tu/dtnW1o3wfaxCOjSLn5IRX4YDcJrtlpzYkhHhGaC4=",
-        version = "v0.0.0-20260226221140-a57be14db171",
+        sum = "h1:Kjn0N0tCrDgiAFW+lGO4JZ3ck44CehvJQMAwj9QF0G8=",
+        version = "v0.0.0-20260526163538-3dc84a4a5aaa",
     )
     go_repository(
         name = "org_golang_google_genproto_googleapis_rpc",
         importpath = "google.golang.org/genproto/googleapis/rpc",
-        sum = "h1:ggcbiqK8WWh6l1dnltU4BgWGIGo+EVYxCaAPih/zQXQ=",
-        version = "v0.0.0-20260226221140-a57be14db171",
+        sum = "h1:mZHHdPZl0dbGHCflZgAq/Q468DWVFcU2whhB2KAo8fk=",
+        version = "v0.0.0-20260526163538-3dc84a4a5aaa",
     )
     go_repository(
         name = "org_golang_google_grpc",

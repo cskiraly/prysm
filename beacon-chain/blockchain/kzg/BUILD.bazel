@@ -24,6 +24,7 @@ go_test(
     name = "go_default_test",
     srcs = [
         "kzg_test.go",
+        "recover_bench_test.go",
         "trusted_setup_test.go",
         "validation_test.go",
     ],

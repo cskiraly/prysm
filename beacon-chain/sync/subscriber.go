@@ -347,6 +347,56 @@ func (s *Service) registerSubscribers(nse params.NetworkScheduleEntry) bool {
 		})
 	}
 
+	// RowDAS row gossip topics (Fulu onwards), behind --row-das.
+	//
+	// Gated on the broadcaster rather than only on the flag: rows travel on the same
+	// partial-messages extension the column path installs, so without --partial-data-columns
+	// there is nothing for them to travel on. The node refuses that combination at startup, so
+	// reaching here with a nil broadcaster would be a bug.
+	if params.BeaconConfig().FuluForkEpoch <= nse.Epoch && s.cfg.p2p.RowDASEnabled() {
+		broadcaster := s.cfg.p2p.PartialColumnBroadcaster()
+		if broadcaster == nil {
+			log.Error("RowDAS is enabled without a partial column broadcaster; not subscribing to row topics")
+		} else {
+			s.spawn(func() {
+				s.subscribeWithParameters(subscribeParameters{
+					topicFormat:              p2p.DataRowSubnetTopicFormat,
+					validate:                 s.validateDataRow,
+					handle:                   s.dataRowSubscriber,
+					nse:                      nse,
+					getSubnetsToJoin:         s.rowSubnetIndices,
+					getSubnetsRequiringPeers: s.allRowSubnets,
+					partial:                  &partialSubscribeParameters{broadcaster: broadcaster},
+				})
+			})
+		}
+	}
+
+	// RowDAS row gossip topics (Fulu onwards), behind --row-das.
+	//
+	// Gated on the broadcaster rather than only on the flag: rows travel on the same
+	// partial-messages extension the column path installs, so without --partial-data-columns
+	// there is nothing for them to travel on. The node refuses that combination at startup, so
+	// reaching here with a nil broadcaster would be a bug.
+	if params.BeaconConfig().FuluForkEpoch <= nse.Epoch && s.cfg.p2p.RowDASEnabled() {
+		broadcaster := s.cfg.p2p.PartialColumnBroadcaster()
+		if broadcaster == nil {
+			log.Error("RowDAS is enabled without a partial column broadcaster; not subscribing to row topics")
+		} else {
+			s.spawn(func() {
+				s.subscribeWithParameters(subscribeParameters{
+					topicFormat:              p2p.DataRowSubnetTopicFormat,
+					validate:                 s.validateDataRow,
+					handle:                   s.dataRowSubscriber,
+					nse:                      nse,
+					getSubnetsToJoin:         s.rowSubnetIndices,
+					getSubnetsRequiringPeers: s.allRowSubnets,
+					partial:                  &partialSubscribeParameters{broadcaster: broadcaster},
+				})
+			})
+		}
+	}
+
 	// New gossip topic in Gloas.
 	if params.BeaconConfig().GloasForkEpoch <= nse.Epoch {
 		s.spawn(func() {
@@ -366,6 +416,17 @@ func (s *Service) registerSubscribers(nse params.NetworkScheduleEntry) bool {
 				nse,
 			)
 		})
+
+		if s.segmentReassembler != nil {
+			s.spawn(func() {
+				s.subscribe(
+					p2p.ExecutionPayloadSegmentTopicFormat,
+					s.validateExecutionPayloadSegment,
+					s.executionPayloadSegmentSubscriber,
+					nse,
+				)
+			})
+		}
 
 		s.spawn(func() {
 			s.subscribe(

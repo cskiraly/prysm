@@ -39,9 +39,13 @@ const disabledFeatureFlag = "Disabled feature flag"
 // Flags is a struct to represent which features the client will perform on runtime.
 type Flags struct {
 	// Feature related flags.
-	EnablePeerScorer                    bool // EnablePeerScorer enables experimental peer scoring in p2p.
-	EnableLightClient                   bool // EnableLightClient enables light client APIs.
-	EnableQUIC                          bool // EnableQUIC specifies whether to enable QUIC transport for libp2p.
+	EnablePeerScorer  bool // EnablePeerScorer enables experimental peer scoring in p2p.
+	EnableLightClient bool // EnableLightClient enables light client APIs.
+	EnableQUIC        bool // EnableQUIC specifies whether to enable QUIC transport for libp2p.
+
+	// SegmentedPayloadGossip selects the segmented execution payload gossip variant. See
+	// SegmentedPayloadMode for what the variants are and why this is a switch, not a bool.
+	SegmentedPayloadGossip              SegmentedPayloadMode
 	WriteWalletPasswordOnWebOnboarding  bool // WriteWalletPasswordOnWebOnboarding writes the password to disk after Prysm web signup.
 	EnableDoppelGanger                  bool // EnableDoppelGanger enables doppelganger protection on startup for the validator.
 	EnableHistoricalSpaceRepresentation bool // EnableHistoricalSpaceRepresentation enables the saving of registry validators in separate buckets to save space
@@ -50,7 +54,7 @@ type Flags struct {
 	DisableDutiesV2                     bool // DisableDutiesV2 sets validator client to use the get Duties endpoint
 	EnableWeb                           bool // EnableWeb enables the webui on the validator client
 	EnableStateDiff                     bool // EnableStateDiff enables the experimental state diff feature for the beacon node.
-	EnableProgressiveSSZ                bool // EnableProgressiveSSZ enables experimental progressive SSZ merkleization for converted consensus types.
+	DisableProgressiveSSZ               bool // DisableProgressiveSSZ turns off progressive SSZ merkleization for Gloas consensus types.
 	ReorgLatePayloads                   bool // ReorgLatePayloads enables reorging late payloads in the beacon node.
 
 	// Logging related toggles.
@@ -113,7 +117,7 @@ func Get() *Flags {
 // ProgressiveSSZEnabled reports whether progressive SSZ is enabled for the
 // supplied state version.
 func ProgressiveSSZEnabled(stateVersion int) bool {
-	return stateVersion >= version.Gloas && Get().EnableProgressiveSSZ
+	return stateVersion >= version.Gloas && !Get().DisableProgressiveSSZ
 }
 
 // Init sets the global config equal to the config that is passed in.
@@ -256,6 +260,21 @@ func ConfigureBeaconChain(ctx *cli.Context) error {
 		logEnabled(disableResourceManager)
 		cfg.DisableResourceManager = true
 	}
+	// The deprecated boolean is honoured first so the explicit mode flag always wins.
+	if ctx.Bool(EnableSegmentedPayloadGossip.Name) {
+		logEnabled(EnableSegmentedPayloadGossip)
+		cfg.SegmentedPayloadGossip = SegmentedPayloadMessages
+	}
+	if ctx.IsSet(SegmentedPayloadGossip.Name) {
+		mode, err := ParseSegmentedPayloadMode(ctx.String(SegmentedPayloadGossip.Name))
+		if err != nil {
+			return err
+		}
+		cfg.SegmentedPayloadGossip = mode
+		if mode.Enabled() {
+			log.WithField("mode", mode.String()).Warn("Enabled segmented execution payload gossip")
+		}
+	}
 	if ctx.IsSet(EnableLightClient.Name) {
 		logEnabled(EnableLightClient)
 		cfg.EnableLightClient = true
@@ -305,9 +324,9 @@ func ConfigureBeaconChain(ctx *cli.Context) error {
 			cfg.EnableHistoricalSpaceRepresentation = false
 		}
 	}
-	if ctx.IsSet(EnableProgressiveSSZ.Name) {
-		logEnabled(EnableProgressiveSSZ)
-		cfg.EnableProgressiveSSZ = true
+	if ctx.IsSet(DisableProgressiveSSZ.Name) {
+		logDisabled(DisableProgressiveSSZ)
+		cfg.DisableProgressiveSSZ = true
 	}
 	if ctx.Bool(reorgLatePayloads.Name) {
 		logEnabled(reorgLatePayloads)

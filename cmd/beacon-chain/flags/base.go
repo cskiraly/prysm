@@ -381,6 +381,19 @@ var (
 		Name:  "partial-data-columns",
 		Usage: "Enable cell-level dissemination for PeerDAS data columns",
 	}
+	// RowDAS is the EIP-8371 row topics. It requires --partial-data-columns, because rows are
+	// carried by the same gossipsub partial-messages extension the column path installs.
+	RowDAS = &cli.BoolFlag{
+		Name:  "row-das",
+		Usage: "Enable RowDAS (EIP-8371) row subnets for distributed blob reconstruction. Requires --partial-data-columns",
+	}
+	// RowDASPull enables EIP-8371's optional pull direction. Off by default: it costs bandwidth
+	// on subnets this node does not custody, and whether it pays for itself is exactly what
+	// experiment R9 in notes/rowdas/ is meant to settle.
+	RowDASPull = &cli.BoolFlag{
+		Name:  "row-das-pull",
+		Usage: "Ask non-custodied column subnets for the cells a row is missing (EIP-8371 optional pull direction). Requires --row-das",
+	}
 	// DisableGraffitiClientAppend disables appending consensus and execution client version info to the block graffiti.
 	DisableGraffitiClientAppend = &cli.BoolFlag{
 		Name:  "disable-graffiti-client-append",

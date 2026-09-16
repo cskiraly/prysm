@@ -11,11 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OffchainLabs/prysm/v7/container/segments"
+
+	"github.com/OffchainLabs/methodical-ssz/ssz"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers/scorers"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentbroadcaster"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
@@ -37,7 +41,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
 	"github.com/multiformats/go-multiaddr"
-	ssz "github.com/prysmaticlabs/fastssz"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 )
@@ -52,15 +55,18 @@ const (
 
 // TestP2P represents a p2p implementation that can be used for testing.
 type TestP2P struct {
-	mu                    sync.Mutex
-	t                     *testing.T
-	BHost                 host.Host
-	EnodeID               enode.ID
-	pubsub                *pubsub.PubSub
-	joinedTopics          map[string]*pubsub.Topic
-	BroadcastCalled       atomic.Bool
-	broadcastedPartials   []blocks.PartialDataColumn
-	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
+	mu                  sync.Mutex
+	t                   *testing.T
+	BHost               host.Host
+	EnodeID             enode.ID
+	pubsub              *pubsub.PubSub
+	joinedTopics        map[string]*pubsub.Topic
+	BroadcastCalled     atomic.Bool
+	broadcastedPartials []blocks.PartialDataColumn
+	broadcastedSegments []*segments.SegmentMessage
+	partialBroadcaster  partialdatacolumnbroadcaster.Broadcaster
+	// RowDAS enables the RowDAS row topics for this test node.
+	RowDAS                bool
 	DelaySend             bool
 	Digest                [4]byte
 	peers                 *peers.Status
@@ -265,6 +271,28 @@ func (p *TestP2P) BroadcastDataColumnSidecars(_ context.Context, _ []blocks.Veri
 	return nil
 }
 
+// BroadcastSegments records the segments passed to it.
+func (p *TestP2P) BroadcastSegments(_ context.Context, segs []*segments.SegmentMessage) error {
+	p.BroadcastCalled.Store(true)
+	p.mu.Lock()
+	p.broadcastedSegments = segs
+	p.mu.Unlock()
+	return nil
+}
+
+// SegmentBroadcaster returns nil: the test double publishes segments by recording them, so
+// there is no variant B broadcaster to hand out.
+func (*TestP2P) SegmentBroadcaster() *segmentbroadcaster.Broadcaster {
+	return nil
+}
+
+// BroadcastedSegments returns the segments passed to the most recent BroadcastSegments call.
+func (p *TestP2P) BroadcastedSegments() []*segments.SegmentMessage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.broadcastedSegments
+}
+
 // BroadcastedPartialColumns returns the partial data columns passed to the most recent
 // BroadcastDataColumnSidecars call.
 func (p *TestP2P) BroadcastedPartialColumns() []blocks.PartialDataColumn {
@@ -341,6 +369,17 @@ func (p *TestP2P) PubSub() *pubsub.PubSub {
 
 func (p *TestP2P) PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster {
 	return p.partialBroadcaster
+}
+
+// RowDASEnabled reports whether this test node serves RowDAS row topics. Rows need the partial
+// broadcaster, so enabling one without the other is not a state a test can reach.
+func (p *TestP2P) RowDASEnabled() bool {
+	return p.RowDAS && p.partialBroadcaster != nil
+}
+
+// RowDASPullEnabled implements the p2p interface. The pull arm is off in tests.
+func (p *TestP2P) RowDASPullEnabled() bool {
+	return false
 }
 
 // Disconnect from a peer.

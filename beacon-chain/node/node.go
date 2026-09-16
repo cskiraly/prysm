@@ -671,6 +671,19 @@ func (b *BeaconNode) registerP2P(cliCtx *cli.Context) error {
 		return errors.Wrapf(err, "could not register p2p service")
 	}
 
+	// Refuse the combination rather than silently ignoring the flag. RowDAS rides the gossipsub
+	// partial-messages extension that --partial-data-columns installs, so --row-das alone would
+	// start a node that subscribes to row topics nothing can be exchanged on.
+	if cliCtx.Bool(flags.RowDAS.Name) && !cliCtx.Bool(flags.PartialDataColumns.Name) {
+		return errors.Errorf("--%s requires --%s", flags.RowDAS.Name, flags.PartialDataColumns.Name)
+	}
+	if cliCtx.Bool(flags.RowDASPull.Name) && !cliCtx.Bool(flags.RowDAS.Name) {
+		return errors.Errorf("--%s requires --%s", flags.RowDASPull.Name, flags.RowDAS.Name)
+	}
+	if cliCtx.Bool(flags.RowDAS.Name) && params.BeaconConfig().RowSubnetCount == 0 {
+		return errors.Errorf("--%s requires a non-zero ROW_SUBNET_COUNT in the chain config", flags.RowDAS.Name)
+	}
+
 	colocationWhitelist, err := parseIPNetStrings(slice.SplitCommaSeparated(cliCtx.StringSlice(cmd.P2PColocationWhitelist.Name)))
 	if err != nil {
 		return fmt.Errorf("failed to register p2p service: %w", err)
@@ -702,6 +715,8 @@ func (b *BeaconNode) registerP2P(cliCtx *cli.Context) error {
 		StateGen:              b.stateGen,
 		ClockWaiter:           b.ClockWaiter,
 		PartialDataColumns:    b.cliCtx.Bool(flags.PartialDataColumns.Name),
+		RowDAS:                b.cliCtx.Bool(flags.RowDAS.Name),
+		RowDASPull:            b.cliCtx.Bool(flags.RowDASPull.Name),
 	})
 	if err != nil {
 		return err

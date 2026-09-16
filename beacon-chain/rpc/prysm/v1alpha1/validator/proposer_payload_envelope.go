@@ -9,6 +9,8 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	consensusblocks "github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
@@ -63,9 +65,20 @@ func (vs *Server) storeExecutionPayloadEnvelope(
 		}
 	}
 
+	var partialColumns []consensusblocks.PartialDataColumn
+	if len(roSidecars) > 0 && vs.ExecutionEngineCaller.PartialColumnsSupported() {
+		commitments, err := sBlk.Block().Body().BlobKzgCommitments()
+		if err != nil {
+			log.WithError(err).Error("Failed to get blob kzg commitments for partial columns")
+		} else if partialColumns, err = partialColumnsFromSidecars(roSidecars, commitments); err != nil {
+			log.WithError(err).Error("Failed to build partial columns")
+		}
+	}
+
 	vs.ExecutionPayloadEnvelopeCache.Set(&cache.ExecutionPayloadContents{
-		Envelope:    envelope,
-		DataColumns: roSidecars,
+		Envelope:       envelope,
+		DataColumns:    roSidecars,
+		PartialColumns: partialColumns,
 	})
 	return envelope, nil
 }
@@ -147,13 +160,15 @@ func (vs *Server) PublishExecutionPayloadEnvelope(
 
 	// KZG verification stays synchronous, never gossip unverified sidecars.
 	var sidecars []consensusblocks.RODataColumn
+	var partialColumns []consensusblocks.PartialDataColumn
 	if len(blobs) > 0 {
-		sidecars, err = vs.sidecarsFromContents(blobs, kzgProofs, envSlot, beaconBlockRoot)
+		sidecars, partialColumns, err = vs.sidecarsFromContents(blobs, kzgProofs, envSlot, beaconBlockRoot)
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid execution payload envelope contents: %v", err)
 		}
 	} else if cached, ok := vs.ExecutionPayloadEnvelopeCache.Contents(); ok && cached.Envelope.Payload.SlotNumber == envSlot {
 		sidecars = cached.DataColumns
+		partialColumns = cached.PartialColumns
 	}
 
 	roSigned, err := consensusblocks.WrappedROSignedExecutionPayloadEnvelope(signed)
@@ -167,7 +182,11 @@ func (vs *Server) PublishExecutionPayloadEnvelope(
 		verifiedSidecars = append(verifiedSidecars, consensusblocks.NewVerifiedRODataColumn(sidecar))
 	}
 	if len(verifiedSidecars) > 0 {
-		if err := vs.P2P.BroadcastDataColumnSidecars(ctx, verifiedSidecars, nil); err != nil {
+		log.WithFields(logrus.Fields{
+			"columns":  len(sidecars),
+			"partials": len(partialColumns),
+		}).Debug("Broadcasting Gloas data column sidecars")
+		if err := vs.P2P.BroadcastDataColumnSidecars(ctx, verifiedSidecars, partialColumns); err != nil {
 			log.WithError(err).Error("Failed to broadcast Gloas data column sidecars")
 		}
 	}
@@ -175,6 +194,11 @@ func (vs *Server) PublishExecutionPayloadEnvelope(
 	if err := vs.P2P.Broadcast(ctx, signed); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to broadcast execution payload envelope: %v", err)
 	}
+
+	// Segments go out in addition to the whole envelope, never instead of it. Peers that do
+	// not subscribe to the segment topic must still receive the payload, and the feature can
+	// be turned off network-wide without stranding anyone.
+	vs.publishEnvelopeSegments(ctx, log, signed, req.SegmentAuth)
 
 	// Import in the background so the reveal is not delayed past the PTC deadline.
 	go vs.importPublishedEnvelope(log, verifiedSidecars, roSigned)
@@ -237,35 +261,66 @@ func (vs *Server) resolveEnvelopeToPublish(req *ethpb.GenericSignedExecutionPayl
 }
 
 // sidecarsFromContents verifies caller-supplied blobs+KZG proofs (stateless publish) and builds the
-// data column sidecars for the slot. Verification matters because broadcastAndReceiveDataColumns
+// data column sidecars for the slot, plus partial columns when partial-column support is enabled.
+// Verification matters because broadcastAndReceiveDataColumns
 // upgrades the sidecars to "verified" without re-checking.
-func (vs *Server) sidecarsFromContents(blobs, kzgProofs [][]byte, slot primitives.Slot, blockRoot [32]byte) ([]consensusblocks.RODataColumn, error) {
-	if err := verifyCellProofs(blobs, kzgProofs); err != nil {
-		return nil, errors.Wrap(err, "kzg verification failed")
+func (vs *Server) sidecarsFromContents(blobs, kzgProofs [][]byte, slot primitives.Slot, blockRoot [32]byte) ([]consensusblocks.RODataColumn, []consensusblocks.PartialDataColumn, error) {
+	commitments, err := verifyCellProofs(blobs, kzgProofs)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "kzg verification failed")
 	}
 	cellsPerBlob, proofsPerBlob, err := peerdas.ComputeCellsAndProofsFromFlat(blobs, kzgProofs)
 	if err != nil {
-		return nil, errors.Wrap(err, "compute cells and proofs")
+		return nil, nil, errors.Wrap(err, "compute cells and proofs")
 	}
-	return peerdas.DataColumnSidecarsGloas(cellsPerBlob, proofsPerBlob, slot, blockRoot)
+	sidecars, err := peerdas.DataColumnSidecarsGloas(cellsPerBlob, proofsPerBlob, slot, blockRoot)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "DataColumnSidecarsGloas")
+	}
+
+	var partialColumns []consensusblocks.PartialDataColumn
+	if vs.ExecutionEngineCaller.PartialColumnsSupported() {
+		partialColumns, err = partialColumnsFromSidecars(sidecars, commitments)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "partialColumnsFromSidecars")
+		}
+	}
+	return sidecars, partialColumns, nil
 }
 
-// verifyCellProofs batch-verifies cell proofs against commitments derived from the blobs.
-func verifyCellProofs(blobs [][]byte, flatProofs [][]byte) error {
+// verifyCellProofs derives the KZG commitment for each blob and batch-verifies the cell proofs
+// against them, returning the commitments so callers can seed Gloas sidecars (which carry none inline).
+func verifyCellProofs(blobs, flatProofs [][]byte) ([][]byte, error) {
 	commitments := make([][]byte, len(blobs))
 	for i, blob := range blobs {
 		if len(blob) != kzg.BytesPerBlob {
-			return errors.Errorf("blob %d has wrong size %d", i, len(blob))
+			return nil, errors.Errorf("blob %d has wrong size %d", i, len(blob))
 		}
 		var b kzg.Blob
 		copy(b[:], blob)
 		c, err := kzg.BlobToKZGCommitment(&b)
 		if err != nil {
-			return errors.Wrapf(err, "compute kzg commitment for blob %d", i)
+			return nil, errors.Wrapf(err, "compute kzg commitment for blob %d", i)
 		}
 		commitments[i] = c[:]
 	}
-	return kzg.VerifyCellKZGProofBatchFromBlobData(blobs, commitments, flatProofs, fieldparams.NumberOfColumns)
+	if err := kzg.VerifyCellKZGProofBatchFromBlobData(blobs, commitments, flatProofs, fieldparams.NumberOfColumns); err != nil {
+		return nil, errors.Wrap(err, "VerifyCellKZGProofBatchFromBlobData")
+	}
+	return commitments, nil
+}
+
+func partialColumnsFromSidecars(sidecars []consensusblocks.RODataColumn, commitments [][]byte) ([]consensusblocks.PartialDataColumn, error) {
+	partialColumns := make([]consensusblocks.PartialDataColumn, 0, len(sidecars))
+	for i := range sidecars {
+		sidecars[i].SetBidCommitments(commitments)
+		pc, err := consensusblocks.NewPartialDataColumnFromVerifiedRODataColumn(consensusblocks.NewVerifiedRODataColumn(sidecars[i]))
+		if err != nil {
+			return nil, errors.Wrap(err, "partial column from verified ro data column")
+		}
+		partialColumns = append(partialColumns, pc)
+	}
+	return partialColumns, nil
 }
 
 // setParentExecutionRequests populates the parent_execution_requests field
@@ -290,4 +345,34 @@ func (vs *Server) setParentExecutionRequests(ctx context.Context, sBlk interface
 		return errors.Wrap(err, "could not get parent execution payload envelope")
 	}
 	return sBlk.SetParentExecutionRequests(signedEnvelope.Message.ExecutionRequests)
+}
+
+// publishEnvelopeSegments broadcasts the envelope as authenticated gossip segments.
+//
+// Every failure here is logged and swallowed. The whole envelope has already gone out by
+// this point, so a node that cannot segment is merely not helping -- failing the publish
+// call would turn an optimisation into a proposal failure.
+func (vs *Server) publishEnvelopeSegments(
+	ctx context.Context,
+	log *logrus.Entry,
+	signed *ethpb.SignedExecutionPayloadEnvelope,
+	auth *ethpb.PayloadSegmentAuth,
+) {
+	if auth == nil || !features.Get().SegmentedPayloadGossip.Enabled() {
+		return
+	}
+	// No builder pubkey lookup: authority comes from the block the envelope names, and the
+	// anchor is derived from the envelope itself rather than asserted by the caller.
+	segs, err := segmentauth.SegmentMessagesForEnvelope(signed, auth)
+	if err != nil {
+		// Segmentation that fails here would also fail on every peer, so publishing the
+		// segments anyway would only earn us invalid-message penalties.
+		log.WithError(err).Warn("Could not derive payload segments, publishing envelope unsegmented")
+		return
+	}
+	if err := vs.P2P.BroadcastSegments(ctx, segs); err != nil {
+		log.WithError(err).Warn("Could not broadcast execution payload segments")
+		return
+	}
+	log.WithField("segments", len(segs)).Debug("Broadcast execution payload segments")
 }

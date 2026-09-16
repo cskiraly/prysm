@@ -270,7 +270,10 @@ func TestListenForNewNodes(t *testing.T) {
 }
 
 func TestPeer_Disconnect(t *testing.T) {
-	h1, _, _ := createHost(t, 5000)
+	// Port 0, so the kernel picks a free one. The fixed 5000/5001 this used before collided with
+	// anything already bound -- a docker-proxy on 5001 is enough to fail the test -- and nothing
+	// here needs a known port: the address is read back from the host below.
+	h1, _, _ := createHost(t, 0)
 	defer func() {
 		if err := h1.Close(); err != nil {
 			t.Log(err)
@@ -281,14 +284,15 @@ func TestPeer_Disconnect(t *testing.T) {
 		host: h1,
 	}
 
-	h2, _, ipaddr := createHost(t, 5001)
+	h2, _, _ := createHost(t, 0)
 	defer func() {
 		if err := h2.Close(); err != nil {
 			t.Log(err)
 		}
 	}()
 
-	h2Addr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", ipaddr, 5001, h2.ID()))
+	require.Equal(t, true, len(h2.Addrs()) > 0, "host should be listening on at least one address")
+	h2Addr, err := multiaddr.NewMultiaddr(fmt.Sprintf("%s/p2p/%s", h2.Addrs()[0], h2.ID()))
 	require.NoError(t, err)
 	addrInfo, err := peer.AddrInfoFromP2pAddr(h2Addr)
 	require.NoError(t, err)

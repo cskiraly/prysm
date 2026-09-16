@@ -567,6 +567,39 @@ message GenericSignedExecutionPayloadEnvelope {
     SignedExecutionPayloadEnvelopeContents contents = 1;
     SignedExecutionPayloadEnvelope signed_envelope = 2;
   }
+  // Optional. Present when the signer also committed to a segmentation of this
+  // envelope, letting the beacon node publish authenticated segments for an
+  // envelope it did not sign itself.
+  PayloadSegmentAuth segment_auth = 3;
+}
+
+// PayloadSegmentDescriptor is what a builder signs to commit to a segmentation.
+//
+// Prysm-local, not a spec type. It exists as a distinct signing object so a remote
+// signer cannot be handed a descriptor root under the envelope object type and
+// silently sign the envelope instead.
+message PayloadSegmentDescriptor {
+  bytes group_id = 1 [ (ethereum.eth.ext.ssz_size) = "32" ];
+  uint64 slot = 2 [
+    (ethereum.eth.ext.cast_type) =
+        "github.com/OffchainLabs/prysm/v7/consensus-types/primitives.Slot"
+  ];
+}
+
+// PayloadSegmentAuth carries a builder's commitment to a segmentation of an envelope.
+//
+// The group id is deliberately absent: the beacon node re-derives the descriptor from
+// the envelope bytes it already holds using segment_size and hash_id, and the signature
+// verifying is what proves signer and node agree on the segmentation. Sending the group
+// id instead would let a mismatch pass unnoticed.
+message PayloadSegmentAuth {
+  uint32 segment_size = 1;
+  uint32 hash_id = 2;
+  uint64 slot = 3 [
+    (ethereum.eth.ext.cast_type) =
+        "github.com/OffchainLabs/prysm/v7/consensus-types/primitives.Slot"
+  ];
+  bytes signature = 4 [ (ethereum.eth.ext.ssz_size) = "96" ];
 }
 
 // Builder represents a builder in the Gloas fork.

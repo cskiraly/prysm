@@ -232,6 +232,11 @@ func (s *Service) validateBeaconBlockPubSub(ctx context.Context, pid peer.ID, ms
 		}
 	}
 
+	// The block root of a valid block for the slot: EIP-8371's reference instant for the RowDAS
+	// reconstruction phase delays, and the root the slot's duties attach to if no earlier path
+	// claimed it. A no-op unless RowDAS is on.
+	s.noteRowDutyRoot(blk.Block().Slot(), blockRoot)
+
 	// Record attribute of valid block.
 	span.SetAttributes(trace.Int64Attribute("slotInEpoch", int64(blk.Block().Slot()%params.BeaconConfig().SlotsPerEpoch)))
 	blkPb, err := blk.Proto()

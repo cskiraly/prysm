@@ -73,6 +73,15 @@ func VerifyDataColumnSidecar(sidecar blocks.RODataColumn) error {
 //
 // https://github.com/ethereum/consensus-specs/blob/master/specs/gloas/p2p-interface.md#modified-verify_data_column_sidecar_kzg_proofs
 func VerifyDataColumnsCellsKZGProofs(cellProofs []blocks.CellProofBundle) error {
+	return VerifyCellsKZGProofs(cellProofs)
+}
+
+// VerifyCellsKZGProofs batch-verifies (commitment, cell index, cell, proof) bundles.
+//
+// Both DAS axes reduce to this call, which is why there is no row-specific variant: a column's
+// bundles share a cell index and vary in commitment, while a RowDAS row's share a commitment
+// and vary in cell index. CellProofBundle.ColumnIndex is the KZG cell index either way.
+func VerifyCellsKZGProofs(cellProofs []blocks.CellProofBundle) error {
 	commitments := make([]kzg.Bytes48, 0, len(cellProofs))
 	indices := make([]uint64, 0, len(cellProofs))
 	cells := make([]kzg.Cell, 0, len(cellProofs))

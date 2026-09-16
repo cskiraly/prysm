@@ -42,7 +42,10 @@ mainnet = {
     "field_elements_per_cell.size": "64",
     "field_elements_per_ext_blob.size": "8192",
     "bytes_per_cell.size": "2048",  # FIELD_ELEMENTS_PER_CELL * BYTES_PER_FIELD_ELEMENT
-    "cells_per_blob.size": "128",
+    # NUMBER_OF_COLUMNS. Not "cells_per_blob.size": expand_template applies these as plain
+    # string replacements in dict order, and "blob.size" above is a substring of it -- the
+    # row container generated as ssz-max:"cells_per_131072" and methodical refused it.
+    "number_of_columns.size": "128",
     "kzg_commitments_inclusion_proof_depth.size": "4",
     "proposer_lookahead_size": "64",  # (MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH
     "ptc_window.size": "96",  # (2 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH
@@ -91,7 +94,10 @@ minimal = {
     "field_elements_per_cell.size": "64",
     "field_elements_per_ext_blob.size": "8192",
     "bytes_per_cell.size": "2048",  # FIELD_ELEMENTS_PER_CELL * BYTES_PER_FIELD_ELEMENT
-    "cells_per_blob.size": "128",
+    # NUMBER_OF_COLUMNS. Not "cells_per_blob.size": expand_template applies these as plain
+    # string replacements in dict order, and "blob.size" above is a substring of it -- the
+    # row container generated as ssz-max:"cells_per_131072" and methodical refused it.
+    "number_of_columns.size": "128",
     "kzg_commitments_inclusion_proof_depth.size": "4",
     "proposer_lookahead_size": "16",  # (MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH
     "ptc_window.size": "24",  # (2 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH

@@ -7,8 +7,6 @@ import (
 
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
-	"github.com/OffchainLabs/prysm/v7/crypto/hash"
-	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/holiman/uint256"
 	"github.com/pkg/errors"
@@ -49,14 +47,9 @@ func CustodyGroups(nodeId enode.ID, custodyGroupCount uint64) ([]uint64, error) 
 	custodyGroupsMap := make(map[uint64]bool, custodyGroupCount)
 	custodyGroups := make([]uint64, 0, custodyGroupCount)
 	for currentId := new(uint256.Int).SetBytes(nodeId.Bytes()); uint64(len(custodyGroups)) < custodyGroupCount; {
-		// Convert to big endian bytes.
-		currentIdBytesBigEndian := currentId.Bytes32()
-
-		// Convert to little endian.
-		currentIdBytesLittleEndian := bytesutil.ReverseByteOrder(currentIdBytesBigEndian[:])
-
-		// Hash the result.
-		hashedCurrentId := hash.Hash(currentIdBytesLittleEndian)
+		// Hash the little-endian node ID. Bytes [0:8] are the custody domain; bytes
+		// [8:16] of the same hash are the RowDAS row-subnet domain, see RowSubnetForNode.
+		hashedCurrentId := hashNodeID(currentId)
 
 		// Get the custody group ID.
 		custodyGroup := binary.LittleEndian.Uint64(hashedCurrentId[:8]) % numberOfCustodyGroups

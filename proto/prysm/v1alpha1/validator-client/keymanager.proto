@@ -89,6 +89,7 @@ message SignRequest {
     ethereum.eth.v1alpha1.PayloadAttestationData payload_attestation_data = 125;
     ethereum.eth.v1alpha1.ProposerPreferences proposer_preference = 126;
     ethereum.eth.v1alpha1.RequestAuthV1 request_auth = 127;
+    ethereum.eth.v1alpha1.PayloadSegmentDescriptor payload_segment_descriptor = 128;
   }
 
   reserved 4, 5; // Reserving old, deleted fields.

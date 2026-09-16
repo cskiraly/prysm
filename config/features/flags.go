@@ -97,8 +97,8 @@ var (
 	}
 	enableDoppelGangerProtection = &cli.BoolFlag{
 		Name: "enable-doppelganger",
-		Usage: `Enables the validator to perform a doppelganger check. 
-		This is not a foolproof method to find duplicate instances in the network. 
+		Usage: `Enables the validator to perform a doppelganger check.
+		This is not a foolproof method to find duplicate instances in the network.
 		Your validator will still be vulnerable if it is being run in unsafe configurations.`,
 	}
 	disableStakinContractCheck = &cli.BoolFlag{
@@ -147,6 +147,18 @@ var (
 		Name:  "prepare-all-payloads",
 		Usage: "Informs the engine to prepare all local payloads. Useful for relayers and builders.",
 	}
+	EnableSegmentedPayloadGossip = &cli.BoolFlag{
+		Name:  "enable-segmented-payload-gossip",
+		Usage: "Deprecated alias for --segmented-payload-gossip=messages.",
+	}
+	SegmentedPayloadGossip = &cli.StringFlag{
+		Name: "segmented-payload-gossip",
+		Usage: "Selects the segmented execution payload gossip variant: " +
+			"'off', 'messages' (segments as ordinary gossip messages on their own topic), or " +
+			"'partial' (segments as partial-message parts on the envelope topic, negotiated per link). " +
+			"Experimental: the commitment is not yet carried in the execution payload bid.",
+		Value: "off",
+	}
 	EnableLightClient = &cli.BoolFlag{
 		Name:  "enable-light-client",
 		Usage: "Enables the light client support in the beacon node",
@@ -182,9 +194,9 @@ var (
 		Name:  "enable-state-diff",
 		Usage: "Enables the experimental state diff feature.",
 	}
-	EnableProgressiveSSZ = &cli.BoolFlag{
-		Name:   "enable-progressive-ssz",
-		Usage:  "Enables experimental progressive SSZ merkleization for converted consensus types.",
+	DisableProgressiveSSZ = &cli.BoolFlag{
+		Name:   "disable-progressive-ssz",
+		Usage:  "Disables progressive SSZ merkleization for Gloas consensus types. Gloas (EIP-7688) mandates it, so this is an escape hatch for debugging only.",
 		Hidden: true,
 	}
 	reorgLatePayloads = &cli.BoolFlag{
@@ -288,12 +300,14 @@ var BeaconChainFlags = combinedFlags([]cli.Flag{
 	disableResourceManager,
 	DisableRegistrationCache,
 	EnableLightClient,
+	EnableSegmentedPayloadGossip,
+	SegmentedPayloadGossip,
 	BlobSaveFsync,
 	DisableQUIC,
 	EnableDiscoveryReboot,
 	enableExperimentalAttestationPool,
 	EnableStateDiff,
-	EnableProgressiveSSZ,
+	DisableProgressiveSSZ,
 	reorgLatePayloads,
 	forceHeadFlag,
 	blacklistRoots,

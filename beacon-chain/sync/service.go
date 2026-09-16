@@ -30,6 +30,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/operations/synccommittee"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/operations/voluntaryexits"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	p2ptypes "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state/stategen"
@@ -43,6 +44,7 @@ import (
 	payloadattestationtypes "github.com/OffchainLabs/prysm/v7/consensus-types/payload-attestation"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	leakybucket "github.com/OffchainLabs/prysm/v7/container/leaky-bucket"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/crypto/rand"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/runtime"
@@ -194,25 +196,30 @@ type Service struct {
 	newExecutionPayloadBidVerifier       verification.NewExecutionPayloadBidVerifier
 	columnSidecarsExecSingleFlight       singleflight.Group
 	reconstructionSingleFlight           singleflight.Group
-	payloadEnvelopeRequestSingleFlight   singleflight.Group
-	availableBlocker                     coverage.AvailableBlocker
-	reconstructionRandGen                *rand.Rand
-	ctxMap                               ContextByteVersions
-	slasherEnabled                       bool
-	lcStore                              *lightClient.Store
-	dataColumnLogCh                      chan dataColumnLogEntry
-	payloadAttestationCache              *cache.PayloadAttestationCache
-	proposerPreferencesCache             *cache.ProposerPreferencesCache
-	subscribedValidatorsCache            *cache.SubscribedValidatorsCache
-	digestActions                        perDigestSet
-	subscriptionSpawner                  func(func()) // see Service.spawn for details
-	newExecutionPayloadEnvelopeVerifier  verification.NewExecutionPayloadEnvelopeVerifier
-	pendingPayloadEnvelopes              map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope
-	pendingEnvelopeLock                  sync.RWMutex
-	selfBuildSigFailures                 int
-	selfBuildSigFailSlot                 primitives.Slot
-	pendingPayloadAttestations           map[[32]byte][]*ethpb.PayloadAttestationMessage
-	pendingPayloadAttestationLock        sync.RWMutex
+	// rowReconstruction and rowDuties are nil unless RowDAS is enabled.
+	rowReconstruction                   *rowReconstructionScheduler
+	rowDuties                           *rowDutyLedger
+	payloadEnvelopeRequestSingleFlight  singleflight.Group
+	availableBlocker                    coverage.AvailableBlocker
+	reconstructionRandGen               *rand.Rand
+	ctxMap                              ContextByteVersions
+	slasherEnabled                      bool
+	lcStore                             *lightClient.Store
+	dataColumnLogCh                     chan dataColumnLogEntry
+	payloadAttestationCache             *cache.PayloadAttestationCache
+	proposerPreferencesCache            *cache.ProposerPreferencesCache
+	subscribedValidatorsCache           *cache.SubscribedValidatorsCache
+	digestActions                       perDigestSet
+	subscriptionSpawner                 func(func()) // see Service.spawn for details
+	newExecutionPayloadEnvelopeVerifier verification.NewExecutionPayloadEnvelopeVerifier
+	pendingPayloadEnvelopes             map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope
+	segmentReassembler                  *segments.Reassembler
+	segmentAuthLimiter                  *leakybucket.Collector
+	pendingEnvelopeLock                 sync.RWMutex
+	selfBuildSigFailures                int
+	selfBuildSigFailSlot                primitives.Slot
+	pendingPayloadAttestations          map[[32]byte][]*ethpb.PayloadAttestationMessage
+	pendingPayloadAttestationLock       sync.RWMutex
 }
 
 // NewService initializes new regular sync service.
@@ -318,8 +325,24 @@ func (s *Service) Start() {
 
 	go s.verifierRoutine()
 
+	// Must run before registerSubscribers: the segment subscription is registered only when
+	// reassembly is enabled, so the reassembler has to exist by then.
+	if err := s.initSegmentReassembly(); err != nil {
+		log.WithError(err).Error("Could not initialise payload segment reassembly")
+		return
+	}
+
 	if broadcaster := s.cfg.p2p.PartialColumnBroadcaster(); broadcaster != nil {
-		go broadcaster.Start(&partialColumnCallbacks{service: s})
+		// Row callbacks only when RowDAS is on. A nil RowCallbacks leaves the row topics inert
+		// in the broadcaster, which is what a node without --row-das wants: it never subscribes
+		// to a row topic, so it should not allocate row state for one either.
+		var rows partialdatacolumnbroadcaster.RowCallbacks
+		if s.cfg.p2p.RowDASEnabled() {
+			s.rowReconstruction = newRowReconstructionScheduler()
+			s.rowDuties = newRowDutyLedger()
+			rows = &rowCallbacks{service: s}
+		}
+		go broadcaster.Start(&partialColumnCallbacks{service: s}, rows)
 	}
 
 	go s.startDiscoveryAndSubscriptions()
@@ -478,12 +501,39 @@ type partialColumnCallbacks struct {
 
 // PartialVerifierFromHeader returns a partial column verifier seeded from an untrusted partial data column header.
 func (c *partialColumnCallbacks) PartialVerifierFromHeader(col *blocks.PartialDataColumn) (*verification.PartialColumnVerifier, pubsub.ValidationResult, error) {
-	return c.service.validatePartialDataColumnHeader(c.service.ctx, col)
+	verifier, result, err := c.service.validatePartialDataColumnHeader(c.service.ctx, col)
+	if err == nil && result == pubsub.ValidationAccept && !col.IsGloas() {
+		// The same header serves both DAS axes, so a header validated here is also the moment
+		// RowDAS measures its reconstruction phase delays from. A no-op unless RowDAS is on.
+		c.service.noteRowDutyRoot(col.Slot(), col.BlockRoot())
+	}
+
+	return verifier, result, err
 }
 
 // PartialVerifierFromTrustedColumn returns a partial column verifier seeded from a trusted data column.
 func (c *partialColumnCallbacks) PartialVerifierFromTrustedColumn(col *blocks.PartialDataColumn) (*verification.PartialColumnVerifier, error) {
 	return c.service.partialVerifierFromTrustedColumn(c.service.ctx, col)
+}
+
+// ValidateGloasGroupID validates a Gloas partial-column group's slot and root against local block state,
+// mirroring the full-column gossip rules: [IGNORE] until a valid block for the group's root has been seen,
+// [REJECT] when that block's slot does not match the group's slot, else [ACCEPT].
+func (c *partialColumnCallbacks) ValidateGloasGroupID(slot primitives.Slot, root [32]byte) pubsub.ValidationResult {
+	// [IGNORE] A valid block for the group's root has not been seen yet.
+	if c.service.cfg.chain == nil || !c.service.cfg.chain.HasBlock(c.service.ctx, root) {
+		return pubsub.ValidationIgnore
+	}
+
+	blockSlot, err := c.service.cfg.chain.RecentBlockSlot(root)
+	if err != nil {
+		return pubsub.ValidationIgnore
+	}
+	// [REJECT] The group's slot must match the slot of the block at beacon_block_root.
+	if blockSlot != slot {
+		return pubsub.ValidationReject
+	}
+	return pubsub.ValidationAccept
 }
 
 // ValidateColumn verifies the KZG proofs for the given cells.
@@ -496,25 +546,32 @@ func (c *partialColumnCallbacks) HandleColumn(topic string, col blocks.VerifiedR
 	ctx, cancel := context.WithTimeout(c.service.ctx, pubsubMessageTimeout)
 	defer cancel()
 
-	slot := col.Slot()
-	proposerIndex, err := col.ProposerIndex()
-	if err != nil {
-		log.WithError(err).Error("Failed to get proposer index from data column")
-		return
-	}
 	commitments, err := col.KzgCommitments()
 	if err != nil {
 		log.WithError(err).Error("Failed to get KZG commitments from data column")
 		return
 	}
-	if c.service.hasSeenDataColumnIndex(slot, proposerIndex, col.Index()) {
-		return
-	}
-
-	c.service.setSeenDataColumnIndex(slot, proposerIndex, col.Index())
 	if len(commitments) == 0 {
 		return
 	}
+
+	if col.IsGloas() {
+		if c.service.hasSeenDataColumnRootIndex(col.BlockRoot(), col.Index()) {
+			return
+		}
+		c.service.setSeenDataColumnRootIndex(col.BlockRoot(), col.Index(), col.Slot())
+	} else {
+		proposerIndex, err := col.ProposerIndex()
+		if err != nil {
+			log.WithError(err).Error("Failed to get proposer index from data column")
+			return
+		}
+		if c.service.hasSeenDataColumnIndex(col.Slot(), proposerIndex, col.Index()) {
+			return
+		}
+		c.service.setSeenDataColumnIndex(col.Slot(), proposerIndex, col.Index())
+	}
+
 	// This column was completed from a partial message.
 	partialMessageColumnCompletionsTotal.WithLabelValues(strconv.FormatUint(col.Index(), 10)).Inc()
 	if err := c.service.verifiedRODataColumnSubscriber(ctx, col); err != nil {

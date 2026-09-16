@@ -427,7 +427,9 @@ func (c *beaconApiValidatorClient) GetExecutionPayloadEnvelope(ctx context.Conte
 	})
 }
 
-func (c *beaconApiValidatorClient) PublishExecutionPayloadEnvelope(ctx context.Context, in *ethpb.SignedExecutionPayloadEnvelope) (*empty.Empty, error) {
+// segmentAuth is ignored: the REST publish endpoint has no field to carry it, so a node
+// reached this way broadcasts the whole envelope only.
+func (c *beaconApiValidatorClient) PublishExecutionPayloadEnvelope(ctx context.Context, in *ethpb.SignedExecutionPayloadEnvelope, _ *ethpb.PayloadSegmentAuth) (*empty.Empty, error) {
 	ctx, span := trace.StartSpan(ctx, "beacon-api.PublishExecutionPayloadEnvelope")
 	defer span.End()
 

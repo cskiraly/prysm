@@ -43,6 +43,7 @@ func TestAllTopics(t *testing.T) {
 		gloasDigest := params.ForkDigest(cfg.GloasForkEpoch)
 		expected = append(expected, "/eth2/"+hex.EncodeToString(gloasDigest[:])+"/execution_payload_bid/ssz_snappy")
 		expected = append(expected, "/eth2/"+hex.EncodeToString(gloasDigest[:])+"/proposer_preferences/ssz_snappy")
+		expected = append(expected, "/eth2/"+hex.EncodeToString(gloasDigest[:])+"/execution_payload_segment/ssz_snappy")
 	}
 	for _, e := range expected {
 		_, ok := tops[e]

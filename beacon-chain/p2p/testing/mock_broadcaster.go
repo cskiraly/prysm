@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/OffchainLabs/prysm/v7/container/segments"
+
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
@@ -90,4 +92,9 @@ func (m *MockBroadcaster) NumAttestations() int {
 	m.attLock.Lock()
 	defer m.attLock.Unlock()
 	return len(m.BroadcastAttestations)
+}
+
+// BroadcastSegments records nothing; the mock only needs to satisfy the interface.
+func (m *MockBroadcaster) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	return nil
 }

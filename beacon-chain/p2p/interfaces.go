@@ -6,10 +6,12 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentbroadcaster"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -56,6 +58,7 @@ type (
 		BroadcastLightClientOptimisticUpdate(ctx context.Context, update interfaces.LightClientOptimisticUpdate) error
 		BroadcastLightClientFinalityUpdate(ctx context.Context, update interfaces.LightClientFinalityUpdate) error
 		BroadcastDataColumnSidecars(ctx context.Context, sidecars []blocks.VerifiedRODataColumn, partialColumns []blocks.PartialDataColumn) error
+		BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error
 	}
 
 	// SetStreamHandler configures p2p to handle streams of a certain topic ID.
@@ -97,7 +100,13 @@ type (
 
 	// PartialColumnBroadcasterProvider provides the broadcaster for partial messages.
 	PartialColumnBroadcasterProvider interface {
+		// RowDASEnabled reports whether this node serves RowDAS row topics.
+		RowDASEnabled() bool
+		// RowDASPullEnabled reports whether this node asks non-custodied column subnets for the
+		// cells a row is missing.
+		RowDASPullEnabled() bool
 		PartialColumnBroadcaster() partialdatacolumnbroadcaster.Broadcaster
+		SegmentBroadcaster() *segmentbroadcaster.Broadcaster
 	}
 
 	// PeerManager abstracts some peer management methods from libp2p.

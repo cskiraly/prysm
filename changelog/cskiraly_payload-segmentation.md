@@ -1,0 +1,64 @@
+### Added
+
+- `container/segments`: split a large message into K segments committed by a Merkle tree over a configurable hash, so each segment can be authenticated on its own.
+- `container/segments`: wire codec for a single segment and a bounded reassembler that verifies before buffering.
+- `container/segments`: pluggable descriptor authentication, required unless unauthenticated operation is opted into explicitly.
+- `beacon-chain/verification/segmentauth`: detached builder signature over a segment descriptor, pending the commitment moving into the execution payload bid.
+- `beacon-chain/p2p`: gloas-gated `execution_payload_segment` gossip topic.
+- `proto/prysm/v1alpha1`: `ExecutionPayloadSegment` gossip wire type framing the segment codec blob.
+- `beacon-chain/verification/segmentauth`: bind the signed descriptor to a slot and reject slots outside an acceptance window, so a recorded descriptor cannot be replayed to occupy reassembly buffers.
+- `beacon-chain/sync`: validate and reassemble execution payload segments from gossip behind `--enable-segmented-payload-gossip`, with a per-peer budget on descriptor authentication.
+- `beacon-chain/p2p`: `BroadcastSegments` publishes all segments of a message as one gossip batch.
+- `proto`: carry a builder-signed segment commitment alongside a published envelope, with its own signing-request object type.
+- `validator`: sign a segment descriptor alongside the execution payload envelope so the beacon node can publish authenticated segments.
+- `beacon-chain/rpc`: publish an execution payload envelope as authenticated gossip segments when the builder supplied a verified segment commitment.
+- `beacon-chain/p2p/segmentintegrationtest`: two-node gossipsub test covering segment exchange, reassembly and rejection.
+- `container/segments`: measure wire overhead rather than computing it, plus benchmarks for commit, verify, decode and reassembly.
+- `notes`: check in the segmentation design doc, measurement plan and code map.
+- `notes`: add a handoff document for follow-up work, separate from the human-facing design docs.
+- `notes`: add an experiment schedule and a list of pluggable versus fork-requiring extension points.
+- `notes`: correct four experiment specs against what the simulated-network harness can actually express.
+- `beacon-chain/p2p/segmentintegrationtest`: topology helpers for the multi-node experiments -- line, star, grid and random regular graphs, per-node link models, per-pair latency and a network builder.
+- `notes`: reorganise the experiment schedule by question rather than topology, and correct the claim that gossipsub has no per-segment recovery path.
+- `beacon-chain/p2p/segmentintegrationtest`: high-entropy payloads and a gossipsub tracer, so a timing measurement records the wire rather than snappy.
+- `beacon-chain/p2p`: export the gossipsub parameters so a test harness can run the node's real overlay configuration.
+- `beacon-chain/p2p/segmentintegrationtest`: run the harness with Prysm's pubsub configuration, and count control traffic and queue drops.
+- `beacon-chain/p2p/segmentintegrationtest`: measure store-and-forward delay across a line, fitting the marginal cost of a hop.
+- `notes`: record the measured store-and-forward result, and correct the experiment plan against an external review.
+- `beacon-chain/p2p/segmentintegrationtest`: measure segmentation overhead at mainnet compressibility, and the segment-size spread that sets the per-hop cost.
+- `beacon-chain/p2p/segmentintegrationtest`: add a wall-clock mode, since virtual time costs more than it saves at high latency.
+- `beacon-chain/p2p/segmentintegrationtest`: compare the virtual and real clocks on one configuration, and bound every wait on a network event.
+- `beacon-chain/p2p/segmentintegrationtest`: measure the shipped whole-then-segments path against segmented-only and whole-only.
+- `notes`: state the design target explicitly, and reconcile the documents against the measured results.
+- `beacon-chain/p2p/segmentintegrationtest`: measure segmentation on a realistic degree-8 mesh up to 150 nodes.
+- `notes`: correct the recovery-fallback, non-subscriber-delay and usable-envelope claims after an external documentation review.
+- `beacon-chain/p2p/segmentintegrationtest`: sweep link rate on the mesh, and measure the duplicate cost that segmentation adds.
+- `beacon-chain/p2p/segmentintegrationtest`: make mesh size, link rate and latency configurable, and measure at 300 nodes.
+- `beacon-chain/p2p/segmentintegrationtest`: adopt 25ms / 50Mbps as the standing operating point, and settle the usable network size at 500 nodes.
+- `notes`: add a design-space document naming the nine dimensions, our position on each, and the unevaluated combinations.
+- `notes`: record link-level representation negotiation as the coexistence design, and correct the partial-message rejection.
+- `notes`: frame the work as a comparative study, separating what the measurements say about segmentation from what they say about the one variant built.
+- `notes`: plan the second variant in three gated phases, starting with the publisher fan-out.
+- `beacon-chain/p2p/segmentintegrationtest`: reconstruct the critical path from tracer events, identifying duplicate reception rather than publisher fan-out as the constraint.
+- `notes`: start a TODO list of defects, harness limitations and provenance debt.
+- `notes`: prepare the handoff for implementing variant B, with concrete entry points into the existing partial-message wiring.
+- `notes`: record that mesh experiments have no non-mesh peers and no connection warm-up, both of which must be fixed before measuring variant B.
+- `container/segments`: parts-metadata and multi-segment partial-message wire formats, with a canonical fixed-width bitmap.
+- `container/segments`: optionally retain a group after completion, and serve its segments back, so a node can answer a peer that is still missing some.
+- `config/features`: replace the segmented-gossip boolean with a variant selector, `--segmented-payload-gossip=off|messages|partial`.
+- `beacon-chain/p2p/segmentbroadcaster`: variant B -- segments as gossipsub partial-message parts on the envelope topic, with the representation negotiated per link and three push policies to compare.
+- `beacon-chain/p2p`: dispatch segment publishing on the selected variant, and join the envelope topic requesting partial messages when variant B is in use.
+- `beacon-chain/sync`: give variant B the same descriptor authenticator and envelope destination variant A uses.
+- `beacon-chain/p2p/segmentintegrationtest`: drive variant B end to end across its three push policies, and count partial-message bytes separately from whole-message bytes.
+- `beacon-chain/p2p/segmentintegrationtest`: run variant B at the standing operating point, and expose its two timing knobs for sweeping.
+- `notes`: record variant B's protocol and algorithm in one place, and the Q13 result -- bandwidth prediction confirmed, latency prediction falsified.
+- `beacon-chain/p2p/segmentintegrationtest`: build the mesh at a connectivity degree above `Dhi` so non-mesh peers exist, and assert the mesh has grafted rather than sleeping for it.
+- `notes`: restructure the design space around eleven dimensions, adding the three that only exist once peer state is explicit.
+- `beacon-chain/p2p/segmentbroadcaster`: assign segments by rendezvous hash so the partition survives peers appearing, and expose the replication factor.
+- `beacon-chain/p2p/segmentbroadcaster`: coordinated push behind `PushDivisor`, off by default -- it does not pay, and the diagnosis that motivated it was wrong.
+- `notes`: bring the variant B protocol note up to date with rendezvous assignment, the replication parameter and the coordinated-push result.
+- `notes`: record the replication sweep and the degree-70 run -- stability paid, more copies did not, and at Prysm's real connectivity degree variant B overtakes variant A on both latency and bytes.
+- `beacon-chain/p2p/segmentintegrationtest`: sweep payload size in the mesh driver, giving the whole-message baseline its own uncapped encoding so it is not bounded by a segment-format constant.
+- `container/segments`: drop the per-segment detached signature and carry no authority field at all. A receiver authenticates a group by testing its group id against the commitments it holds from accepted bids, so nothing the sender asserts is trusted and per-segment overhead falls by 112 bytes.
+- `beacon-chain/verification/segmentauth`: authenticate by commitment-set membership rather than a BLS verification, with a first-group-per-slot implementation standing in until `ExecutionPayloadBid` carries the commitment. The interim key is the node's own clock, so a peer can neither choose it nor grow the table.
+- `validator`: stop signing segment descriptors; authority comes from the bid the block carries.

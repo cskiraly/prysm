@@ -5,17 +5,11 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
-	"iter"
-	"log/slog"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/container/slice"
 	"github.com/OffchainLabs/prysm/v7/internal/logrusadapter"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
@@ -25,6 +19,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"iter"
+	"log/slog"
+	"strconv"
+	"sync"
+	"time"
 )
 
 const TTLInSlots = 3
@@ -33,20 +32,7 @@ const logPackage = "beacon-chain/p2p/partialdatacolumnbroadcaster"
 
 var errInvalidHeader = errors.New("invalid header")
 
-const dataColumnSidecarPrefix = "data_column_sidecar_"
-
-func extractColumnIndexFromTopic(topic string) (uint64, error) {
-	idx := strings.Index(topic, dataColumnSidecarPrefix)
-	if idx == -1 {
-		return 0, errors.New("could not extract column index from topic")
-	}
-	sub := topic[idx+len(dataColumnSidecarPrefix):]
-	end := strings.Index(sub, "/")
-	if end != -1 {
-		sub = sub[:end]
-	}
-	return strconv.ParseUint(sub, 10, 64)
-}
+var errMalformedPartialMessage = errors.New("malformed partial message")
 
 // ColumnCallbacks is the interface that the broadcaster uses to validate and handle
 // partial data column headers and cells.
@@ -65,15 +51,35 @@ type ColumnCallbacks interface {
 	HandleColumn(topic string, col blocks.VerifiedRODataColumn)
 	// HandleHeader is called when a new partial data column header is first validated.
 	HandleHeader(header *ethpb.PartialDataColumnHeader, groupID string)
+	// ValidateGloasGroupID validates a Gloas partial-column group's slot and root against local block state:
+	// [REJECT] when a seen block at the group's root has a different slot, [IGNORE] when no block for
+	// the root has been seen, else [ACCEPT].
+	ValidateGloasGroupID(slot primitives.Slot, root [32]byte) pubsub.ValidationResult
 }
 
 // Broadcaster is the behaviour of the partial data column broadcaster used by the rest of the node.
 type Broadcaster interface {
-	Start(callbacks ColumnCallbacks)
+	// Start runs the event loop. rowCallbacks may be nil, which leaves RowDAS row topics
+	// inert: incoming row messages are ignored and no row state is allocated.
+	Start(callbacks ColumnCallbacks, rowCallbacks RowCallbacks)
 	Publish(ctx context.Context, topicsAndColumns iter.Seq2[string, blocks.PartialDataColumn]) error
 	AppendPubSubOpts(opts []pubsub.Option) []pubsub.Option
 	Subscribe(ctx context.Context, t *pubsub.Topic) error
 	Unsubscribe(ctx context.Context, topic string) error
+	// PublishRow offers a row on a row topic: the cells this node holds, or a row it has just
+	// recovered. A no-op when row callbacks are not configured.
+	PublishRow(ctx context.Context, topic string, row blocks.PartialDataRow) error
+	// RowSnapshot returns a deep copy of the row held for a (topic, group), or nil. It goes
+	// through the event loop because the loop owns all row state.
+	RowSnapshot(ctx context.Context, topic string, groupID []byte) (*blocks.PartialDataRow, error)
+	// CrossForwardRow pushes a row's cells into the given column topics, one single-cell
+	// partial column each, and reports how many topics it pushed into. The caller picks the
+	// columns, which is where EIP-8371 leaves the policy.
+	CrossForwardRow(ctx context.Context, rowTopic string, row *blocks.PartialDataRow, columns []uint64) (int, error)
+	// PullRowFromColumns asks the given column topics for the one cell each holds of this row,
+	// without subscribing to them, and reports how many topics it asked. EIP-8371's optional
+	// direction.
+	PullRowFromColumns(ctx context.Context, rowTopic string, row *blocks.PartialDataRow, columns []uint64) (int, error)
 }
 
 var _ Broadcaster = (*PartialColumnBroadcaster)(nil)
@@ -90,19 +96,46 @@ type PartialColumnBroadcaster struct {
 	topics map[string]*pubsub.Topic
 	// subscribedTopics mirrors topics for lookups from the pubsub loop, which cannot touch the broadcaster-owned topics map.
 	subscribedTopics                 sync.Map
+	publishedTopics                  sync.Map
 	peerFeedbackSemaphore            chan struct{}
 	concurrentValidatorSemaphore     chan struct{}
 	concurrentHeaderHandlerSemaphore chan struct{}
 	// map topic -> map[groupID]PartialColumnVerifier
 	partialMsgStore map[string]map[string]*verification.PartialColumnVerifier
-	groupTTL        map[string]int8
+	// rowCallbacks is nil when RowDAS is off.
+	rowCallbacks RowCallbacks
+	// rowStore is the row-topic twin of partialMsgStore: map topic -> map[groupID]rowEntry.
+	rowStore          map[string]map[string]*rowEntry
+	publishPartialRow func(topic string, groupID []byte, row *blocks.PartialDataRow) error
+	// The cross-forwarding hooks, set by whatever owns the process's topic handles. A nil Join
+	// leaves cross-forwarding unavailable; a nil setPartialInterest leaves the pull arm
+	// unavailable. See TopicPushHooks.
+	joinTopicForPush   func(topic string) error
+	leaveTopicForPush  func(topic string) error
+	setPartialInterest func(topic string, want bool) error
+	// pushTopics are the topics joined for cross-forwarding rather than subscribed to, so they
+	// can be left again when their last group is evicted.
+	pushTopics map[string]bool
+	groupTTL   map[string]int8
 	// validHeaderCache caches validated headers by group ID (works across topics)
 	validHeaderCache map[string]*ethpb.PartialDataColumnHeader
 	// map groupID -> map[peer.ID]bool
-	headerSentCache  map[string]map[peer.ID]bool
-	incomingReq      chan request
-	eagerPushed      map[string]*eagerPushAgg
+	headerSentCache map[string]map[peer.ID]bool
+	incomingReq     chan request
+	eagerPushed     map[string]*eagerPushAgg
+	// actionReasons attributes generated publish actions to the comparison that caused them. See
+	// actionreasons.go for why aggregate counters could not settle the question.
+	actionReasons    *actionReasonCounts
 	republishSkipped map[string]map[uint64]bool
+	// rowClaimWake wakes the loop when a request claim lapses or held news reaches its deadline,
+	// so neither waits for whatever traffic arrives next. See coalesce.go.
+	rowClaimWake map[coalesceKey]*time.Timer
+	// claimWake carries due wake-ups from timer goroutines onto the event loop.
+	claimWake chan coalesceKey
+	// armCoalesce and now are seams: a test needs to drive a timer without sleeping, and the
+	// D9 work learned that a timer with no seam is a timer no test can observe.
+	armCoalesce func(time.Duration, func()) *time.Timer
+	now         func() time.Time
 }
 
 type eagerPushAgg struct {
@@ -119,6 +152,14 @@ const (
 	requestKindGossip
 	requestKindHandleIncomingRPC
 	requestKindCellsValidated
+	requestKindHandleIncomingRowRPC
+	requestKindRowCellsValidated
+	requestKindPublishRow
+	requestKindRowSnapshot
+	requestKindGossipRow
+	requestKindCrossForwardRow
+	requestKindPullRow
+	requestKindRowPeerHasWholeRow
 )
 
 func (k requestKind) String() string {
@@ -135,18 +176,41 @@ func (k requestKind) String() string {
 		return "handle_incoming_rpc"
 	case requestKindCellsValidated:
 		return "cells_validated"
+	case requestKindHandleIncomingRowRPC:
+		return "handle_incoming_row_rpc"
+	case requestKindRowCellsValidated:
+		return "row_cells_validated"
+	case requestKindPublishRow:
+		return "publish_row"
+	case requestKindRowSnapshot:
+		return "row_snapshot"
+	case requestKindGossipRow:
+		return "gossip_row"
+	case requestKindCrossForwardRow:
+		return "cross_forward_row"
+	case requestKindPullRow:
+		return "pull_row"
+	case requestKindRowPeerHasWholeRow:
+		return "row_peer_has_whole_row"
 	default:
 		return "unknown"
 	}
 }
 
 type requestValues struct {
-	cellsValidated *cellsValidated
-	unsub          unsubscribe
-	incomingRPC    incomingPartialRPC
-	sub            subscribe
-	publish        publish
-	gossip         gossip
+	cellsValidated    *cellsValidated
+	rowCellsValidated *rowCellsValidated
+	rowSnapshot       *rowSnapshotRequest
+	incomingRowRPC    incomingRowRPC
+	publishRow        publishRow
+	crossForwardRow   crossForwardRow
+	pullRow           pullRow
+	rowPeerHasWhole   rowPeerHasWhole
+	unsub             unsubscribe
+	incomingRPC       incomingPartialRPC
+	sub               subscribe
+	publish           publish
+	gossip            gossip
 }
 
 type request struct {
@@ -220,10 +284,18 @@ type unsubscribe struct {
 	topic string
 }
 
+type publishRow struct {
+	topic string
+	row   blocks.PartialDataRow
+}
+
 type incomingPartialRPC struct {
 	*pubsub_pb.PartialMessagesExtension
 	from    peer.ID
 	message *ethpb.PartialDataColumnSidecar
+	isGloas bool
+	slot    primitives.Slot
+	root    [32]byte
 }
 
 func (r incomingPartialRPC) logFields() logrus.Fields {
@@ -261,10 +333,17 @@ func NewBroadcaster(ctx context.Context, logger *logrus.Logger) *PartialColumnBr
 		ctx:              ctx,
 		topics:           make(map[string]*pubsub.Topic),
 		partialMsgStore:  make(map[string]map[string]*verification.PartialColumnVerifier),
+		rowStore:         make(map[string]map[string]*rowEntry),
+		pushTopics:       make(map[string]bool),
 		groupTTL:         make(map[string]int8),
 		validHeaderCache: make(map[string]*ethpb.PartialDataColumnHeader),
 		headerSentCache:  make(map[string]map[peer.ID]bool),
 		eagerPushed:      make(map[string]*eagerPushAgg),
+		actionReasons:    newActionReasonCounts(),
+		rowClaimWake:     make(map[coalesceKey]*time.Timer),
+		claimWake:        make(chan coalesceKey, 64),
+		armCoalesce:      time.AfterFunc,
+		now:              time.Now,
 		republishSkipped: make(map[string]map[uint64]bool),
 
 		// GossipSub sends the messages to this channel. The buffer should be
@@ -280,8 +359,12 @@ func NewBroadcaster(ctx context.Context, logger *logrus.Logger) *PartialColumnBr
 
 // onEmitGossip enqueues a gossip request for the broadcaster's event loop.
 func (p *PartialColumnBroadcaster) onEmitGossip(topic string, groupID []byte, _ []peer.ID, _ map[peer.ID]blocks.PartialDataColumnPeerState) {
+	kind := requestKindGossip
+	if axis, _, err := classifyTopic(topic); err == nil && axis == topicKindRow {
+		kind = requestKindGossipRow
+	}
 	// Drop gossip emission if we have too many pending requests.
-	p.tryEnqueue(requestKindGossip, requestValues{
+	p.tryEnqueue(kind, requestValues{
 		gossip: gossip{
 			topic:   topic,
 			groupID: groupID,
@@ -296,41 +379,75 @@ func (p *PartialColumnBroadcaster) onIncomingRPC(from peer.ID, peerStates map[pe
 		return nil
 	}
 
-	expectedGroupIDLen := fieldparams.RootLength + 1
-	if len(rpc.GetGroupID()) != expectedGroupIDLen {
-		p.logger.WithFields(logrus.Fields{
-			"peer":     from,
-			"topic":    rpc.GetTopicID(),
-			"got":      len(rpc.GetGroupID()),
-			"expected": expectedGroupIDLen,
-		}).Debug("Invalid group ID length")
-		p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
-		return errors.Errorf("invalid group ID length: got %d, expected %d", len(rpc.GetGroupID()), expectedGroupIDLen)
-	}
-
-	columnIndex, err := extractColumnIndexFromTopic(rpc.GetTopicID())
-	if err != nil || columnIndex >= fieldparams.NumberOfColumns {
-		p.logger.WithError(err).WithFields(logrus.Fields{
-			"peer":        from,
-			"topic":       rpc.GetTopicID(),
-			"columnIndex": columnIndex,
-			"maxColumns":  fieldparams.NumberOfColumns,
-		}).Debug("Invalid topic ID: column index missing or out of bounds")
-		p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
-		return errors.Errorf("invalid topic ID %q: column index missing or out of bounds", rpc.GetTopicID())
-	}
-
-	if _, subscribed := p.subscribedTopics.Load(rpc.GetTopicID()); !subscribed {
-		p.logIgnoreUnsubscribedTopic(from, rpc.GetTopicID())
-		return nil
-	}
-
-	nextPeerState, message, err := updatePeerStateFromIncomingRPC(peerStates[from], rpc)
+	// Which axis this message belongs to is decided by the topic, which is peer-controlled,
+	// so an unrecognised or out-of-range topic is downscored rather than defaulted.
+	kind, subnet, err := classifyTopic(rpc.GetTopicID())
 	if err != nil {
+		p.logger.WithError(err).WithFields(logrus.Fields{
+			"peer":  from,
+			"topic": rpc.GetTopicID(),
+		}).Debug("Invalid topic ID")
+		p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
+		return errors.Wrapf(err, "invalid topic ID %q", rpc.GetTopicID())
+	}
+	if kind == topicKindRow {
+		return p.onIncomingRowRPC(from, peerStates, rpc, subnet)
+	}
+
+	// Parse the group ID to detect the fork (Fulu 0x00||root, 33B; Gloas 0x01||SSZ(groupID), 41B).
+	// This validates the version byte, length, and (for Gloas) the SSZ encoding in one place.
+	isGloas, slot, root, err := blocks.ParsePartialColumnGroupID(rpc.GetGroupID())
+	if err != nil {
+		p.logger.WithError(err).WithFields(logrus.Fields{
+			"peer":  from,
+			"topic": rpc.GetTopicID(),
+			"got":   len(rpc.GetGroupID()),
+		}).Debug("Invalid group ID")
+		p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
+		return errors.Wrap(err, "parse partial column group id")
+	}
+
+	// Accept messages for subscribed topics and for topics we have published our own
+	// column on (the proposer publishes on all topics, custody or not). The published
+	// case is essential: this callback records the peer's parts-requests below, and
+	// that request state is the only trigger for sending cells to a partial-requesting
+	// peer — dropping these messages on published topics starves the network of the
+	// proposer's cells.
+	if _, subscribed := p.subscribedTopics.Load(rpc.GetTopicID()); !subscribed {
+		if _, published := p.publishedTopics.Load(rpc.GetTopicID()); !published {
+			p.logIgnoreUnsubscribedTopic(from, rpc.GetTopicID())
+			return nil
+		}
+	}
+
+	// Reject groups whose fork does not match the topic's fork digest, e.g. a Fulu group ID
+	// on a Gloas-digest topic.
+	topicIsGloas, err := topicForkIsGloas(rpc.GetTopicID())
+	if err != nil {
+		return errors.Wrap(err, "topicForkIsGloas")
+	}
+	if topicIsGloas != isGloas {
+		p.logger.WithFields(logrus.Fields{
+			"peer":       from,
+			"topic":      rpc.GetTopicID(),
+			"gloasGroup": isGloas,
+		}).Debug("Group ID fork does not match topic fork")
+		p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
+		return errors.Errorf("group ID fork (gloas=%t) does not match topic fork %q", isGloas, rpc.GetTopicID())
+	}
+
+	nextPeerState, message, err := updatePeerStateFromIncomingRPC(peerStates[from], rpc, isGloas)
+	if err != nil {
+		// A malformed message body is the peer's fault, so downscore it. Other errors
+		// are dropped without penalty.
+		if errors.Is(err, errMalformedPartialMessage) {
+			p.reportPeerFeedbackAsync(rpc.GetTopicID(), from, pubsub.PeerFeedbackInvalidMessage)
+		}
 		return errors.Wrap(err, "update peer state from incoming rpc")
 	}
+
 	_, ok := p.tryEnqueue(requestKindHandleIncomingRPC, requestValues{
-		incomingRPC: incomingPartialRPC{rpc, from, message},
+		incomingRPC: incomingPartialRPC{rpc, from, message, isGloas, slot, root},
 	})
 	if !ok {
 		p.logger.WithFields(logrus.Fields{
@@ -354,13 +471,19 @@ func (p *PartialColumnBroadcaster) reportPeerFeedbackAsync(topic string, from pe
 			if p.ctx.Err() != nil {
 				return
 			}
-			_ = p.peerFeedback(topic, from, kind)
+			p.reportPeerFeedback(topic, from, kind)
 		}()
 	default:
 		p.logger.WithFields(logrus.Fields{
 			"peer":  from,
 			"topic": topic,
 		}).Warn("Peer feedback semaphore saturated, dropping feedback")
+	}
+}
+
+func (p *PartialColumnBroadcaster) reportPeerFeedback(topic string, from peer.ID, kind pubsub.PeerFeedbackKind) {
+	if err := p.peerFeedback(topic, from, kind); err != nil {
+		p.logger.WithFields(logrus.Fields{"peer": from, "topic": topic}).WithError(err).Debug("Failed to report peer feedback")
 	}
 }
 
@@ -380,13 +503,27 @@ func (p *PartialColumnBroadcaster) AppendPubSubOpts(opts []pubsub.Option) []pubs
 		func(ps *pubsub.PubSub) error {
 			p.peerFeedback = ps.PeerFeedback
 			p.publishPartialCol = func(topic string, groupID []byte, col *blocks.PartialDataColumn) error {
-				if _, ok := p.headerSentCache[string(groupID)]; !ok {
-					p.headerSentCache[string(groupID)] = make(map[peer.ID]bool)
-				}
 				onEagerPush := func(remote peer.ID) {
-					p.recordEagerPush(groupID, col.Index, remote)
+					p.recordEagerPush(groupID, col.Index(), remote)
 				}
-				return pubsub.PublishPartial(ps, topic, groupID, col.PublishActionsFn(p.headerSentCache[string(groupID)], onEagerPush))
+				onAction := func(_ peer.ID, reason blocks.ActionReason) {
+					p.actionReasons.record(false, reason)
+				}
+				return pubsub.PublishPartial(ps, topic, groupID, col.PublishActionsFn(p.headerSentCacheFor(groupID, col), onEagerPush, onAction))
+			}
+			p.publishPartialRow = func(topic string, groupID []byte, row *blocks.PartialDataRow) error {
+				onEagerPush := func(remote peer.ID) {
+					p.recordEagerPush(groupID, row.RowIndex(), remote)
+				}
+				onAction := func(_ peer.ID, reason blocks.ActionReason) {
+					p.actionReasons.record(true, reason)
+				}
+				err := pubsub.PublishPartial(ps, topic, groupID, row.PublishActionsFn(p.rowHeaderSentCacheFor(groupID), onEagerPush, onAction))
+				// Claims are committed during that publish, so this is the point at which the
+				// earliest deadline is known.
+				p.armRowClaimWake(topic, groupID, row)
+
+				return err
 			}
 			return nil
 		},
@@ -397,8 +534,9 @@ func (p *PartialColumnBroadcaster) AppendPubSubOpts(opts []pubsub.Option) []pubs
 // Start starts the event loop of the PartialColumnBroadcaster.
 // It accepts the required validator and handler functions, returning an error if any is nil.
 // Note: The event loop is blocking and so the broadcaster should be started in a goroutine.
-func (p *PartialColumnBroadcaster) Start(callbacks ColumnCallbacks) {
+func (p *PartialColumnBroadcaster) Start(callbacks ColumnCallbacks, rowCallbacks RowCallbacks) {
 	p.callbacks = callbacks
+	p.rowCallbacks = rowCallbacks
 	p.loop()
 }
 
@@ -411,6 +549,8 @@ func (p *PartialColumnBroadcaster) loop() {
 	cleanup := time.NewTicker(params.BeaconConfig().SlotDuration())
 	for {
 		select {
+		case key := <-p.claimWake:
+			p.handleClaimWake(key)
 		case req := <-p.incomingReq:
 			// This check enables the requester to cancel the request by cancelling the given context.
 			if req.ctx.Err() != nil {
@@ -433,6 +573,22 @@ func (p *PartialColumnBroadcaster) loop() {
 				err = p.handleIncomingRPC(req.incomingRPC)
 			case requestKindCellsValidated:
 				err = p.handleCellsValidated(req.cellsValidated)
+			case requestKindHandleIncomingRowRPC:
+				err = p.handleIncomingRowRPC(req.incomingRowRPC)
+			case requestKindRowCellsValidated:
+				err = p.handleRowCellsValidated(req.rowCellsValidated)
+			case requestKindPublishRow:
+				err = p.publishRowOnLoop(req.publishRow.topic, req.publishRow.row)
+			case requestKindRowSnapshot:
+				err = p.rowSnapshotOnLoop(req.rowSnapshot)
+			case requestKindGossipRow:
+				p.gossipRow(req.gossip.topic, req.gossip.groupID)
+			case requestKindCrossForwardRow:
+				err = p.crossForwardRowOnLoop(req.crossForwardRow)
+			case requestKindPullRow:
+				err = p.pullRowOnLoop(req.pullRow)
+			case requestKindRowPeerHasWholeRow:
+				p.handleRowPeerHasWholeRow(req.rowPeerHasWhole)
 			default:
 				err = errUnknownRequestKind
 			}
@@ -457,6 +613,30 @@ func (p *PartialColumnBroadcaster) loop() {
 			p.evictExpiredGroups()
 		}
 	}
+}
+
+func (p *PartialColumnBroadcaster) headerSentCacheFor(groupID []byte, col *blocks.PartialDataColumn) map[peer.ID]bool {
+	if col.IsGloas() {
+		return nil
+	}
+	cache, ok := p.headerSentCache[string(groupID)]
+	if !ok {
+		cache = make(map[peer.ID]bool)
+		p.headerSentCache[string(groupID)] = cache
+	}
+	return cache
+}
+
+// rowHeaderSentCacheFor returns the per-group set of peers already sent this block's header.
+// It is the same cache the column path uses, on purpose: a peer needs the header once, not once
+// per axis.
+func (p *PartialColumnBroadcaster) rowHeaderSentCacheFor(groupID []byte) map[peer.ID]bool {
+	cache, ok := p.headerSentCache[string(groupID)]
+	if !ok {
+		cache = make(map[peer.ID]bool)
+		p.headerSentCache[string(groupID)] = cache
+	}
+	return cache
 }
 
 func (p *PartialColumnBroadcaster) recordEagerPush(groupID []byte, columnIndex uint64, remote peer.ID) {
@@ -508,11 +688,32 @@ func (p *PartialColumnBroadcaster) evictExpiredGroups() {
 		delete(p.groupTTL, groupID)
 		delete(p.validHeaderCache, groupID)
 		delete(p.headerSentCache, groupID)
+		// Cancel any armed flush for this group, so a late timer cannot resurrect state for a
+		// group that no longer exists -- the failure mode the review called out for per-group
+		// timer maps.
+		p.dropRowClaimWake([]byte(groupID))
 		for topic, msgStore := range p.partialMsgStore {
 			delete(msgStore, groupID)
 			if len(msgStore) == 0 {
 				delete(p.partialMsgStore, topic)
+				p.publishedTopics.Delete(topic)
+				// A topic we joined for cross-forwarding exists only for the groups we pushed or
+				// pulled on it. The subscription path's cleanup walks subscribed topics only, so
+				// without this these would outlive their fork digest.
+				p.leavePushTopic(topic)
 			}
+		}
+		for topic, rowStore := range p.rowStore {
+			delete(rowStore, groupID)
+			if len(rowStore) == 0 {
+				delete(p.rowStore, topic)
+			}
+		}
+		// Last, so the application drops its per-group state in step with ours. Synchronous by
+		// contract -- see RowGroupEvicted -- because a notice that arrived after the group was
+		// rebuilt would clear the wrong generation's state.
+		if p.rowCallbacks != nil {
+			p.rowCallbacks.RowGroupEvicted([]byte(groupID))
 		}
 	}
 }
@@ -537,101 +738,19 @@ func (p *PartialColumnBroadcaster) getDataColumn(topic string, group []byte) *bl
 	return verifier.Column
 }
 
-func decodePartsMetadataFromPeerState(state *ethpb.PartialDataColumnPartsMetadata, expectedLength uint64) (*ethpb.PartialDataColumnPartsMetadata, error) {
-	if state == nil {
-		return blocks.NewPartsMetaWithNoAvailableAndNoRequests(expectedLength), nil
-	}
-	return state, nil
-}
-
-func updatePeerStateFromIncomingRPC(peerState blocks.PartialDataColumnPeerState, rpc *pubsub_pb.PartialMessagesExtension) (blocks.PartialDataColumnPeerState,
-	*ethpb.PartialDataColumnSidecar, error) {
-	peerState = peerState.Clone()
-	hasIncomingPartsMetadata := len(rpc.PartsMetadata) > 0
-	hasMessage := len(rpc.PartialMessage) > 0
-
-	if hasIncomingPartsMetadata {
-		var incomingMeta ethpb.PartialDataColumnPartsMetadata
-		if err := incomingMeta.UnmarshalSSZ(rpc.PartsMetadata); err != nil {
-			return peerState, nil, errors.Wrap(err, "failed to unmarshal incoming parts metadata")
-		}
-		if incomingMeta.Available.Len() == 0 {
-			return peerState, nil, errors.New("incoming parts metadata has 0 length availability")
-		}
-
-		if peerState.Recvd == nil {
-			peerState.Recvd = &incomingMeta
-		} else {
-			if peerState.Recvd.Requests.Len() != incomingMeta.Requests.Len() {
-				return peerState, nil, errors.New("failed to merge available cells into recvdState parts metadata. requests length mismatch")
-			}
-			peerState.Recvd.Requests = incomingMeta.Requests
-			var err error
-			peerState.Recvd.Available, err = peerState.Recvd.Available.Or(incomingMeta.Available)
-			if err != nil {
-				return peerState, nil, errors.Wrap(err, "failed to merge available cells into recvdState parts metadata")
-			}
-		}
-	}
-
-	// we've already handled the update to the peer state based on the incoming parts metadata,
-	// so we can return early if there's no message to process.
-	if !hasMessage {
-		return peerState, nil, nil
-	}
-
-	var message ethpb.PartialDataColumnSidecar
-	if err := message.UnmarshalSSZ(rpc.PartialMessage); err != nil {
-		return peerState, nil, errors.Wrap(err, "failed to unmarshal partial message data")
-	}
-	if len(message.CellsPresentBitmap) == 0 {
-		return peerState, &message, nil
-	}
-
-	nKzgCommitments := message.CellsPresentBitmap.Len()
-	if nKzgCommitments == 0 {
-		return peerState, nil, errors.New("length of cells present bitmap is 0")
-	}
-
-	// only update RecvdState using the incoming partial message if the peer did not send us their parts metadata
-	if !hasIncomingPartsMetadata {
-		recievedMeta, err := decodePartsMetadataFromPeerState(peerState.Recvd, nKzgCommitments)
-		if err != nil {
-			return peerState, nil, errors.Wrap(err, "received")
-		}
-		recvdState, err := blocks.MergeAvailableIntoPartsMetadata(recievedMeta, message.CellsPresentBitmap)
-		if err != nil {
-			return peerState, nil, errors.Wrap(err, "merge available cells into received parts metadata")
-		}
-		peerState.Recvd = recvdState
-	}
-
-	sentMeta, err := decodePartsMetadataFromPeerState(peerState.Sent, nKzgCommitments)
-	if err != nil {
-		return peerState, nil, errors.Wrap(err, "sent")
-	}
-
-	sentState, err := blocks.MergeAvailableIntoPartsMetadata(sentMeta, message.CellsPresentBitmap)
-	if err != nil {
-		return peerState, nil, errors.Wrap(err, "merge available cells into sent parts metadata")
-	}
-	peerState.Sent = sentState
-
-	return peerState, &message, nil
-}
-
 func (p *PartialColumnBroadcaster) handleIncomingRPC(rpc incomingPartialRPC) error {
 	if p.peerFeedback == nil || p.publishPartialCol == nil {
 		return errors.New("pubsub not initialized")
 	}
 
 	topicID := rpc.GetTopicID()
-	// Only act on partial messages for topics we are currently subscribed to.
-	// The topic ID is peer-controlled, so this prevents a peer from making us
-	// allocate verifier/header state for columns we never asked for.
+	// Only act on partial messages for topics we are currently subscribed to, OR for
+	// groups we have published our own column for.
 	if _, subscribed := p.topics[topicID]; !subscribed {
-		p.logIgnoreUnsubscribedTopic(rpc.from, topicID)
-		return nil
+		if p.getPartialVerifier(topicID, rpc.GroupID) == nil {
+			p.logIgnoreUnsubscribedTopic(rpc.from, topicID)
+			return nil
+		}
 	}
 
 	message := rpc.message
@@ -640,6 +759,63 @@ func (p *PartialColumnBroadcaster) handleIncomingRPC(rpc incomingPartialRPC) err
 	groupID := rpc.GroupID
 	ourVerifier := p.getPartialVerifier(topicID, groupID)
 	var shouldRepublish bool
+
+	// In Gloas, a nil verifier means we have not published this
+	// column, so any cells the peer sends are unsolicited and dropped, never buffered.
+	// [REJECT] downscore if a seen block at the group's root has a mismatched slot, or if the peer
+	// pushed cells before we published; [IGNORE] otherwise.
+	if ourVerifier == nil && rpc.isGloas {
+		if p.callbacks.ValidateGloasGroupID(rpc.slot, rpc.root) == pubsub.ValidationReject {
+			p.logger.WithFields(rpc.logFields()).Debug("Rejecting Gloas partial message: group slot does not match block slot")
+			p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+			return nil
+		}
+		if hasMessage && message.CellsPresentBitmap.Count() > 0 {
+			p.logger.WithFields(rpc.logFields()).Debug("Peer pushed Gloas cells before we published our column; downscoring")
+			p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+		}
+		return nil
+	}
+
+	// Metadata only, with no state for this topic yet, but the group's header already validated
+	// on another topic.
+	//
+	// This is not a rare case, it is the normal one for a proposer's eager push. headerSentCache
+	// is keyed by group rather than by topic -- deliberately, since a peer needs the header once
+	// per block -- so the second and later eager pushes to the same peer in the same group carry
+	// parts metadata and nothing else. Without the branch below the receiver has no state to
+	// attach that metadata to and drops it, so a peer custodying k columns can receive partial
+	// cells on exactly one of them per block. Measured: in R9's setup, with no full-message path
+	// to cover for it, seven peers each completed 1 of their 8 published columns.
+	//
+	// Restricted to subscribed topics. A peer cannot use this to make us allocate state for
+	// topics we do not follow; the bound is our own custody, as it is for the message path.
+	if ourVerifier == nil && !hasMessage {
+		if header := p.validHeaderCache[string(groupID)]; header != nil {
+			if _, subscribed := p.topics[topicID]; subscribed {
+				columnIndex, err := extractColumnIndexFromTopic(topicID)
+				if err != nil {
+					return errors.Wrap(err, "extract column index from topic")
+				}
+				verifier, err := p.makeVerifierFromHeader(rpc.root, header, columnIndex, true, rpc)
+				if err != nil {
+					if errors.Is(err, errInvalidHeader) {
+						return nil
+					}
+					return errors.Wrap(err, "make verifier from cached header")
+				}
+				topicStore, ok := p.partialMsgStore[topicID]
+				if !ok {
+					topicStore = make(map[string]*verification.PartialColumnVerifier)
+					p.partialMsgStore[topicID] = topicStore
+				}
+				topicStore[string(groupID)] = verifier
+				p.groupTTL[string(groupID)] = TTLInSlots
+				ourVerifier = verifier
+				shouldRepublish = true
+			}
+		}
+	}
 
 	if ourVerifier == nil && hasMessage {
 		header, headerWasCached := p.getHeader(groupID, message)
@@ -650,7 +826,7 @@ func (p *PartialColumnBroadcaster) handleIncomingRPC(rpc incomingPartialRPC) err
 		// downscore peer if invalid header
 		if header.SignedBlockHeader == nil || header.SignedBlockHeader.Header == nil {
 			p.logger.WithFields(rpc.logFields()).Debug("Header is missing signed block header or header")
-			_ = p.peerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+			p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
 			return errors.New("header is missing signed block header or header")
 		}
 
@@ -658,7 +834,7 @@ func (p *PartialColumnBroadcaster) handleIncomingRPC(rpc incomingPartialRPC) err
 		root, err := header.SignedBlockHeader.Header.HashTreeRoot()
 		if err != nil {
 			p.logger.WithFields(rpc.logFields()).WithError(err).Debug("Failed to get root from header")
-			_ = p.peerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+			p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
 			return errors.Wrap(err, "failed to get root from header")
 		}
 
@@ -713,6 +889,12 @@ func (p *PartialColumnBroadcaster) handleIncomingRPC(rpc incomingPartialRPC) err
 func (p *PartialColumnBroadcaster) makeVerifierFromHeader(root [fieldparams.RootLength]byte, header *ethpb.PartialDataColumnHeader, columnIndex uint64,
 	headerWasCached bool, rpc incomingPartialRPC) (*verification.PartialColumnVerifier, error) {
 	topicID := rpc.GetTopicID()
+
+	if len(header.KzgCommitments) == 0 {
+		p.logger.WithFields(rpc.logFields()).Debug("Ignoring partial column header with no KZG commitments")
+		return nil, errInvalidHeader
+	}
+
 	newColumn, err := blocks.NewPartialDataColumn(
 		root,
 		header.SignedBlockHeader,
@@ -732,7 +914,7 @@ func (p *PartialColumnBroadcaster) makeVerifierFromHeader(root [fieldparams.Root
 	if !bytes.Equal(newColumn.GroupID(), rpc.GroupID) {
 		p.logger.WithFields(rpc.logFields()).Error("Group ID mismatch")
 		// REJECT case: penalize the peer
-		_ = p.peerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+		p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
 		return nil, errors.New("group ID mismatch")
 	}
 
@@ -753,7 +935,7 @@ func (p *PartialColumnBroadcaster) makeVerifierFromHeader(root [fieldparams.Root
 		p.logger.WithError(err).WithFields(rpc.logFields()).WithField("result", result).Debug("Partial column header validation failed")
 		if result == pubsub.ValidationReject {
 			// REJECT case: penalize the peer
-			_ = p.peerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+			p.reportPeerFeedback(topicID, rpc.from, pubsub.PeerFeedbackInvalidMessage)
 		}
 		// Both REJECT and IGNORE: don't process further
 		return nil, errInvalidHeader
@@ -762,23 +944,32 @@ func (p *PartialColumnBroadcaster) makeVerifierFromHeader(root [fieldparams.Root
 }
 
 func (p *PartialColumnBroadcaster) getHeader(groupID []byte, message *ethpb.PartialDataColumnSidecar) (*ethpb.PartialDataColumnHeader, bool) {
+	return p.cachedOrMessageHeader(groupID, message.Header)
+}
+
+// cachedOrMessageHeader returns the group's validated header if we have one, otherwise the
+// header carried in the message. The second return says whether the header came from the
+// cache, i.e. whether it has already been validated.
+//
+// The cache is keyed by group id alone, deliberately: the partial-columns spec says a header
+// validated on any subnet may be used for all subnets, and RowDAS row topics share the block's
+// column group id, so one cache serves both axes.
+func (p *PartialColumnBroadcaster) cachedOrMessageHeader(groupID []byte, messageHeaders []*ethpb.PartialDataColumnHeader) (*ethpb.PartialDataColumnHeader, bool) {
 	if cachedHeader, ok := p.validHeaderCache[string(groupID)]; ok {
 		return cachedHeader, true
-	} else {
-		// We haven't seen this group before. Check if we have a valid header.
-		if len(message.Header) == 0 {
-			p.logger.Debug("No partial column found and no header in message, ignoring")
-			return nil, false
-		}
-
-		return message.Header[0], false
 	}
+	if len(messageHeaders) == 0 {
+		p.logger.Debug("No partial column found and no header in message, ignoring")
+		return nil, false
+	}
+
+	return messageHeaders[0], false
 }
 
 func (p *PartialColumnBroadcaster) republishColumn(ourDataColumn *blocks.PartialDataColumn, rpc incomingPartialRPC,
 	shouldRepublish bool) error {
 	if !ourDataColumn.Published {
-		p.recordRepublishSkip(rpc.GroupID, ourDataColumn.Index)
+		p.recordRepublishSkip(rpc.GroupID, ourDataColumn.Index())
 		return nil
 	}
 
@@ -813,7 +1004,7 @@ func (p *PartialColumnBroadcaster) handlePartialCells(ourDataColumn *blocks.Part
 	}
 	// Track cells received via partial message
 	if len(cellIndices) > 0 {
-		columnIndexStr := strconv.FormatUint(ourDataColumn.Index, 10)
+		columnIndexStr := strconv.FormatUint(ourDataColumn.Index(), 10)
 		partialMessageCellsReceivedTotal.WithLabelValues(columnIndexStr).Add(float64(len(cellIndices)))
 	}
 	if len(cellsToVerify) > 0 {
@@ -827,10 +1018,10 @@ func (p *PartialColumnBroadcaster) handlePartialCells(ourDataColumn *blocks.Part
 				err := p.callbacks.ValidateColumn(cellsToVerify)
 				if err != nil {
 					p.logger.WithError(err).WithFields(rpc.logFields()).Error("Failed to validate cells")
-					_ = p.peerFeedback(topicId, rpc.from, pubsub.PeerFeedbackInvalidMessage)
+					p.reportPeerFeedback(topicId, rpc.from, pubsub.PeerFeedbackInvalidMessage)
 					return
 				}
-				_ = p.peerFeedback(topicId, rpc.from, pubsub.PeerFeedbackUsefulMessage)
+				p.reportPeerFeedback(topicId, rpc.from, pubsub.PeerFeedbackUsefulMessage)
 				_, _ = p.enqueue(p.ctx, requestKindCellsValidated, requestValues{
 					cellsValidated: &cellsValidated{
 						validationTook: time.Since(start),
@@ -842,7 +1033,7 @@ func (p *PartialColumnBroadcaster) handlePartialCells(ourDataColumn *blocks.Part
 				})
 			}()
 		default:
-			columnIndexStr := strconv.FormatUint(ourDataColumn.Index, 10)
+			columnIndexStr := strconv.FormatUint(ourDataColumn.Index(), 10)
 			partialMessageValidationsDroppedTotal.WithLabelValues(columnIndexStr).Add(float64(len(cellsToVerify)))
 			p.logger.WithFields(rpc.logFields()).Warn("Validator semaphore saturated, dropping cell validation")
 		}
@@ -851,8 +1042,13 @@ func (p *PartialColumnBroadcaster) handlePartialCells(ourDataColumn *blocks.Part
 }
 
 func (p *PartialColumnBroadcaster) handleHeader(rpc incomingPartialRPC, header *ethpb.PartialDataColumnHeader) {
-	groupID := rpc.GroupID
-	// Cache the valid header.
+	p.cacheAndHandleHeader(rpc.GroupID, header, rpc.logFields())
+}
+
+// cacheAndHandleHeader caches a newly validated header for its group and hands it to the
+// application. It is called from either axis: whichever topic a header first arrives on, the
+// cache and the downstream getBlobs path want it.
+func (p *PartialColumnBroadcaster) cacheAndHandleHeader(groupID []byte, header *ethpb.PartialDataColumnHeader, logFields logrus.Fields) {
 	p.validHeaderCache[string(groupID)] = header
 
 	select {
@@ -862,9 +1058,8 @@ func (p *PartialColumnBroadcaster) handleHeader(rpc incomingPartialRPC, header *
 			<-p.concurrentHeaderHandlerSemaphore
 		}()
 	default:
-		p.logger.WithFields(rpc.logFields()).Warn("Dropping header handler, max concurrent header handlers reached")
+		p.logger.WithFields(logFields).Warn("Dropping header handler, max concurrent header handlers reached")
 	}
-
 }
 
 func (p *PartialColumnBroadcaster) handleCellsValidated(cells *cellsValidated) error {
@@ -875,7 +1070,7 @@ func (p *PartialColumnBroadcaster) handleCellsValidated(cells *cellsValidated) e
 	ourDataColumn := ourVerifier.Column
 	var extended bool
 	for i, bundle := range cells.cells {
-		if bundle.ColumnIndex != ourDataColumn.Index {
+		if bundle.ColumnIndex != ourDataColumn.Index() {
 			return errors.New("cell bundle has wrong column index")
 		}
 		if ourVerifier.ExtendFromVerifiedCell(cells.cellIndices[i], bundle.Cell, bundle.Proof) {
@@ -883,30 +1078,25 @@ func (p *PartialColumnBroadcaster) handleCellsValidated(cells *cellsValidated) e
 		}
 	}
 
-	columnIndexStr := strconv.FormatUint(ourDataColumn.Index, 10)
-	if extended {
-		// Track useful cells (cells that extended our data)
-		partialMessageUsefulCellsTotal.WithLabelValues(columnIndexStr).Add(float64(len(cells.cells)))
-
-		col, ok, err := ourVerifier.Complete()
-		if err != nil {
-			p.logger.WithError(err).WithFields(cells.logFields()).Error("Failed to complete partial column verifier")
-			return errors.Wrap(err, "complete partial column verifier")
-		}
-		if ok {
-			go p.callbacks.HandleColumn(cells.topic, col)
-		}
-
-		if !ourDataColumn.Published {
-			p.recordRepublishSkip(cells.group, ourDataColumn.Index)
-			return nil
-		}
-
-		err = p.publishPartialCol(cells.topic, ourDataColumn.GroupID(), ourDataColumn)
-		if err != nil {
-			return errors.Wrap(err, "publish partial column")
-		}
+	if !extended {
+		return nil
 	}
+
+	columnIndexStr := strconv.FormatUint(ourDataColumn.Index(), 10)
+	// Track useful cells (cells that extended our data)
+	partialMessageUsefulCellsTotal.WithLabelValues(columnIndexStr).Add(float64(len(cells.cells)))
+
+	// Offer the same cells to our row before serving the column, since a cell that completes
+	// our row is worth more than the order these two happen in.
+	if err := p.crossFillRowFromColumn(cells.group, ourDataColumn.Index(), cells.cellIndices, cells.cells); err != nil {
+		p.logger.WithError(err).WithFields(cells.logFields()).Error("Failed to cross-fill row from column cells")
+	}
+
+	if err := p.afterColumnExtended(cells.topic, cells.group, ourVerifier); err != nil {
+		p.logger.WithError(err).WithFields(cells.logFields()).Error("Failed to handle extended partial column")
+		return err
+	}
+
 	return nil
 }
 
@@ -951,7 +1141,7 @@ func (p *PartialColumnBroadcaster) gossip(topic string, groupID []byte) {
 func (p *PartialColumnBroadcaster) publish(topicsAndColumns iter.Seq2[string, blocks.PartialDataColumn]) error {
 	var aggErr error
 	for topic, partialCol := range topicsAndColumns {
-		if len(partialCol.KzgCommitments) == 0 {
+		if partialCol.KzgCommitmentCount() == 0 {
 			p.logger.WithFields(logrus.Fields{
 				"topic": topic,
 			}).Debug("Skipping publish for column with no KZG commitments")
@@ -984,7 +1174,7 @@ func (p *PartialColumnBroadcaster) publish(topicsAndColumns iter.Seq2[string, bl
 			var extended bool
 			for i := range partialCol.Included.Len() {
 				if partialCol.Included.BitAt(i) {
-					if verifier.ExtendFromVerifiedCell(uint64(i), partialCol.Column[i], partialCol.KzgProofs[i]) {
+					if verifier.ExtendFromVerifiedCell(uint64(i), partialCol.Column()[i], partialCol.KzgProofs()[i]) {
 						extended = true
 					}
 				}
@@ -1003,7 +1193,18 @@ func (p *PartialColumnBroadcaster) publish(topicsAndColumns iter.Seq2[string, bl
 		}
 		ourColummn := verifier.Column
 
+		// Seed our row states from this column before serving it. A cell we supplied ourselves
+		// never passes through handleCellsValidated, so without this the row axis never sees the
+		// columns a node holds by any route other than the column topic -- see D13.
+		if err := p.crossFillRowFromWholeColumn(groupIDBytes, ourColummn); err != nil {
+			aggErr = stderrors.Join(aggErr, errors.Wrap(err, "cross-fill rows from a published column"))
+		}
+
 		p.groupTTL[string(groupIDBytes)] = TTLInSlots
+		// Mark the topic as locally published so incoming parts-requests on it are
+		// accepted even without a subscription (see publishedTopics). Cleared when the
+		// topic's last group is evicted.
+		p.publishedTopics.Store(topic, struct{}{})
 		err := p.publishPartialCol(topic, ourColummn.GroupID(), ourColummn)
 		if err == nil {
 			ourColummn.Published = true
@@ -1048,13 +1249,15 @@ func (p *PartialColumnBroadcaster) Unsubscribe(ctx context.Context, topic string
 	}
 	return req.waitForResponse()
 }
+
 func (p *PartialColumnBroadcaster) unsubscribe(topic string) error {
-	t, ok := p.topics[topic]
-	if !ok {
+	if _, ok := p.topics[topic]; !ok {
 		return errors.New("topic not found")
 	}
 	delete(p.topics, topic)
 	p.subscribedTopics.Delete(topic)
 	delete(p.partialMsgStore, topic)
-	return t.Close()
+	delete(p.rowStore, topic)
+	p.publishedTopics.Delete(topic)
+	return nil
 }

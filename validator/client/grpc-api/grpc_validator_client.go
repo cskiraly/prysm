@@ -526,7 +526,7 @@ func (c *grpcValidatorClient) GetExecutionPayloadEnvelope(ctx context.Context, s
 
 // PublishExecutionPayloadEnvelope publishes the contents arm when blobs/proofs were cached during
 // block production, and the bare signed_envelope arm otherwise (BN attaches cached blob data).
-func (c *grpcValidatorClient) PublishExecutionPayloadEnvelope(ctx context.Context, in *ethpb.SignedExecutionPayloadEnvelope) (*empty.Empty, error) {
+func (c *grpcValidatorClient) PublishExecutionPayloadEnvelope(ctx context.Context, in *ethpb.SignedExecutionPayloadEnvelope, segmentAuth *ethpb.PayloadSegmentAuth) (*empty.Empty, error) {
 	var cachedEnv *ethpb.ExecutionPayloadEnvelope
 	var blobs, kzgProofs [][]byte
 	if in.GetMessage().GetPayload() != nil {
@@ -544,6 +544,7 @@ func (c *grpcValidatorClient) PublishExecutionPayloadEnvelope(ctx context.Contex
 			},
 		}
 	}
+	generic.SegmentAuth = segmentAuth
 	return c.getClient().PublishExecutionPayloadEnvelope(ctx, generic)
 }
 

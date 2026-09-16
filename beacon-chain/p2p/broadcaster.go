@@ -10,25 +10,29 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OffchainLabs/methodical-ssz/ssz"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/altair"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/helpers"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/container/slice"
 	"github.com/OffchainLabs/prysm/v7/crypto/hash"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/pkg/errors"
-	ssz "github.com/prysmaticlabs/fastssz"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/proto"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 const minimumPeersPerSubnetForBroadcast = 1
@@ -89,6 +93,100 @@ func (s *Service) BroadcastForEpoch(ctx context.Context, msg proto.Message, epoc
 		return errors.Errorf("message of %T does not support marshaller interface", msg)
 	}
 	return s.broadcastObject(ctx, castMsg, fmt.Sprintf(topic, forkDigest))
+}
+
+// BroadcastSegments publishes a segmented execution payload envelope.
+//
+// Which variant does the work is decided here, because the variants differ precisely in what
+// a segment is on the wire and nothing above this layer should have to know:
+//
+//   - messages: each segment is an ordinary gossip message on its own topic, published as one
+//     batch. Batching changes the order in which (message, peer) sends are emitted rather
+//     than coalescing them: PublishBatch collects one RPC per mesh peer per segment, then the
+//     round-robin scheduler yields one RPC per message id per pass, so no single segment's
+//     fan-out is sent contiguously.
+//   - partial: the segments become parts of one message on the *envelope* topic, and the
+//     per-link negotiation decides who receives segments and who receives the whole envelope.
+//     Nothing is published here in the gossip sense; the group is made available and the
+//     broadcaster's own loop serves it.
+func (s *Service) BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error {
+	ctx, span := trace.StartSpan(ctx, "p2p.BroadcastSegments")
+	defer span.End()
+
+	if len(segs) == 0 {
+		return nil
+	}
+
+	twoSlots := 2 * params.BeaconConfig().SlotDuration()
+	ctx, cancel := context.WithTimeout(ctx, twoSlots)
+	defer cancel()
+
+	forkDigest, err := s.currentForkDigest()
+	if err != nil {
+		err := errors.Wrap(err, "could not retrieve fork digest")
+		tracing.AnnotateError(span, err)
+		return err
+	}
+
+	mode := features.Get().SegmentedPayloadGossip
+	span.SetAttributes(trace.StringAttribute("variant", mode.String()))
+	switch mode {
+	case features.SegmentedPayloadPartial:
+		return s.broadcastSegmentsAsPartial(span, forkDigest, segs)
+	default:
+		// Variant A is also the fallback when the mode is off: a caller that reached here
+		// with segments in hand asked for them to be published, and refusing silently would
+		// be worse than publishing on the dedicated topic.
+		return s.broadcastSegmentsAsMessages(ctx, span, forkDigest, segs)
+	}
+}
+
+// broadcastSegmentsAsMessages is variant A: one gossip message per segment, batched.
+func (s *Service) broadcastSegmentsAsMessages(
+	ctx context.Context,
+	span oteltrace.Span,
+	forkDigest [4]byte,
+	segs []*segments.SegmentMessage,
+) error {
+	topic := fmt.Sprintf(ExecutionPayloadSegmentTopicFormat, forkDigest)
+	span.SetAttributes(trace.StringAttribute("topic", topic))
+
+	var batch pubsub.MessageBatch
+	for _, seg := range segs {
+		enc, err := seg.Marshal()
+		if err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not marshal payload segment")
+		}
+		if err := s.batchObject(ctx, &batch, &ethpb.ExecutionPayloadSegment{Segment: enc}, topic); err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not batch payload segment")
+		}
+	}
+	if err := s.pubsub.PublishBatch(&batch); err != nil {
+		tracing.AnnotateError(span, err)
+		return errors.Wrap(err, "could not publish payload segment batch")
+	}
+	return nil
+}
+
+// broadcastSegmentsAsPartial is variant B: the group is offered on the envelope topic and the
+// segment broadcaster's loop decides, per link, what actually goes out.
+func (s *Service) broadcastSegmentsAsPartial(
+	span oteltrace.Span,
+	forkDigest [4]byte,
+	segs []*segments.SegmentMessage,
+) error {
+	if s.segmentBroadcaster == nil {
+		return errors.New("segmented payload gossip is in partial mode but no broadcaster is installed")
+	}
+	topic := fmt.Sprintf(ExecutionPayloadEnvelopeTopicFormat, forkDigest) + s.Encoding().ProtocolSuffix()
+	span.SetAttributes(trace.StringAttribute("topic", topic))
+	if err := s.segmentBroadcaster.Publish(topic, segs); err != nil {
+		tracing.AnnotateError(span, err)
+		return errors.Wrap(err, "could not offer payload segments as partial messages")
+	}
+	return nil
 }
 
 // BroadcastAttestation broadcasts an attestation to the p2p network, the message is assumed to be
@@ -430,16 +528,16 @@ func (s *Service) broadcastDataColumnSidecars(ctx context.Context, forkDigest [f
 	if s.partialColumnBroadcaster != nil {
 		for i := range partialColumns {
 			pc := &partialColumns[i]
-			topic, wrappedSubIdx, subnet := columnToTopic(pc.Index, forkDigest)
-			item, ok := itemsByIndex[pc.Index]
+			topic, wrappedSubIdx, subnet := columnToTopic(pc.Index(), forkDigest)
+			item, ok := itemsByIndex[pc.Index()]
 			if !ok {
 				item = &columnBroadcastItem{
-					index:         pc.Index,
+					index:         pc.Index(),
 					topic:         topic,
 					wrappedSubIdx: wrappedSubIdx,
 					subnet:        subnet,
 				}
-				itemsByIndex[pc.Index] = item
+				itemsByIndex[pc.Index()] = item
 			}
 			item.partialColumn = pc
 		}

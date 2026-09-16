@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OffchainLabs/prysm/v7/container/segments"
+
 	"github.com/OffchainLabs/prysm/v7/async/event"
 	mock "github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain/testing"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
@@ -218,4 +220,12 @@ func minimalTestService(t *testing.T, opts ...Option) (*Service, *testServiceReq
 
 	require.NoError(t, err)
 	return s, req
+}
+
+func (mb *mockBroadcaster) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	return nil
+}
+
+func (ma *mockAccessor) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	return nil
 }

@@ -528,7 +528,7 @@ func TestPublishExecutionPayloadEnvelope_ArmSelection(t *testing.T) {
 			})
 		vc := newTestGrpcValidatorClient(t, client, true)
 		vc.envelopeCache.Add(slot, signed.Message, [][]byte{{1}}, [][]byte{{2}})
-		_, err := vc.PublishExecutionPayloadEnvelope(t.Context(), signed)
+		_, err := vc.PublishExecutionPayloadEnvelope(t.Context(), signed, nil)
 		require.NoError(t, err)
 	})
 
@@ -543,7 +543,7 @@ func TestPublishExecutionPayloadEnvelope_ArmSelection(t *testing.T) {
 				return &emptypb.Empty{}, nil
 			})
 		vc := newTestGrpcValidatorClient(t, client, false)
-		_, err := vc.PublishExecutionPayloadEnvelope(t.Context(), signed)
+		_, err := vc.PublishExecutionPayloadEnvelope(t.Context(), signed, nil)
 		require.NoError(t, err)
 	})
 }
