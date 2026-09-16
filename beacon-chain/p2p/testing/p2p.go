@@ -62,6 +62,7 @@ type TestP2P struct {
 	BroadcastCalled       atomic.Bool
 	broadcastedPartials   []blocks.PartialDataColumn
 	broadcastedSegments   []*segments.SegmentMessage
+	completedGroups       [][32]byte
 	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
 	DelaySend             bool
 	Digest                [4]byte
@@ -289,6 +290,20 @@ func (p *TestP2P) BroadcastedSegments() []*segments.SegmentMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.broadcastedSegments
+}
+
+// SegmentGroupComplete records the root.
+func (p *TestP2P) SegmentGroupComplete(root [32]byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.completedGroups = append(p.completedGroups, root)
+}
+
+// CompletedSegmentGroups returns the roots passed to SegmentGroupComplete, in order.
+func (p *TestP2P) CompletedSegmentGroups() [][32]byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.completedGroups
 }
 
 // EnablePartialColumnBroadcaster sets a non-nil partial column broadcaster.

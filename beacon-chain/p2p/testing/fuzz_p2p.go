@@ -234,6 +234,9 @@ func (*FakeP2P) CustodyGroupCountFromPeer(peer.ID) uint64 {
 	return 0
 }
 
+// SegmentGroupComplete -- fuzz target, no-op.
+func (*FakeP2P) SegmentGroupComplete(_ [32]byte) {}
+
 // BroadcastSegments -- fuzz target, no-op.
 func (*FakeP2P) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
 	return nil

@@ -146,7 +146,7 @@ func TestTwoNodeSegmentExchange(t *testing.T) {
 // TestTwoNodeSegmentExchangeWithSegmentPolicy is the same exchange under the production
 // segment topic policy: phase forwarding, the IWANT discipline, the park and the offer table.
 func TestTwoNodeSegmentExchangeWithSegmentPolicy(t *testing.T) {
-	exchange(t, segmentgossip.Options(p2p.GossipExecutionPayloadSegmentMessage))
+	exchange(t, segmentgossip.Options(p2p.GossipExecutionPayloadSegmentMessage, segmentgossip.NewPullGate()))
 }
 
 func exchange(t *testing.T, opts []pubsub.Option) {

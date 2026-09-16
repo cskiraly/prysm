@@ -192,7 +192,9 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 		psOpts = s.partialColumnBroadcaster.AppendPubSubOpts(psOpts)
 	}
 	if features.Get().EnableSegmentedPayloadGossip {
-		psOpts = append(psOpts, segmentgossip.Options(GossipExecutionPayloadSegmentMessage)...)
+		// The gate is the router's; the sync layer feeds it through SegmentGroupComplete.
+		s.segmentPullGate = segmentgossip.NewPullGate()
+		psOpts = append(psOpts, segmentgossip.Options(GossipExecutionPayloadSegmentMessage, s.segmentPullGate)...)
 	}
 
 	return psOpts

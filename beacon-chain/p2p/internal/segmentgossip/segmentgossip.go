@@ -40,14 +40,21 @@ const (
 // work.
 const MaxIHaveMessages = 1024
 
-// Options returns the pubsub options that install the policy on the topic named topicName.
-// Order matters: the park and the offer table require the discipline to be installed first.
-func Options(topicName string) []pubsub.Option {
+// Options returns the pubsub options that install the policy on the topic named topicName,
+// with gate as the request gate that stops pulling a group once it is complete; a nil gate
+// installs no request gate. Order matters: the park and the offer table require the
+// discipline to be installed first.
+func Options(topicName string, gate *PullGate) []pubsub.Option {
 	isSegmentTopic := TopicMatcher(topicName)
-	return []pubsub.Option{
+	opts := []pubsub.Option{
 		pubsub.WithPhaseForwardingByMessage(isSegmentTopic, PushWidthOf),
 		pubsub.WithIWantDiscipline(isSegmentTopic, iwantWindow),
 		pubsub.WithIHaveCommitmentPark(parkBreaks, promiseDeadline, parkTTL),
 		pubsub.WithOfferTable(),
 	}
+	if gate != nil {
+		// No deferral: a decline here is final for as long as the node holds the payload.
+		opts = append(opts, pubsub.WithRequestGate(gate, nil))
+	}
+	return opts
 }

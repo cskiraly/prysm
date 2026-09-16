@@ -28,6 +28,7 @@ type (
 	// P2P represents the full p2p interface composed of all of the sub-interfaces.
 	P2P interface {
 		Broadcaster
+		SegmentGossiper
 		SetStreamHandler
 		PubSubProvider
 		PartialColumnBroadcasterProvider
@@ -58,6 +59,12 @@ type (
 		BroadcastLightClientFinalityUpdate(ctx context.Context, update interfaces.LightClientFinalityUpdate) error
 		BroadcastDataColumnSidecars(ctx context.Context, sidecars []blocks.VerifiedRODataColumn, partialColumns []blocks.PartialDataColumn) error
 		BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error
+	}
+
+	// SegmentGossiper lets the sync layer tell the segment topic's pull gate which groups this
+	// node has reassembled, so their remaining segments are no longer requested.
+	SegmentGossiper interface {
+		SegmentGroupComplete(root [32]byte)
 	}
 
 	// SetStreamHandler configures p2p to handle streams of a certain topic ID.

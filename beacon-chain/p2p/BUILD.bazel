@@ -27,6 +27,7 @@ go_library(
         "pubsub_filter.go",
         "pubsub_tracer.go",
         "rpc_topic_mappings.go",
+        "segment_gossip.go",
         "sender.go",
         "service.go",
         "subnets.go",
