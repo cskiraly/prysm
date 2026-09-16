@@ -7,6 +7,7 @@ go_test(
     deps = [
         "//beacon-chain/p2p:go_default_library",
         "//beacon-chain/p2p/encoder:go_default_library",
+        "//beacon-chain/p2p/internal/segmentgossip:go_default_library",
         "//beacon-chain/verification/segmentauth:go_default_library",
         "//config/params:go_default_library",
         "//container/segments:go_default_library",
@@ -15,6 +16,7 @@ go_test(
         "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
         "@com_github_libp2p_go_libp2p//x/simlibp2p:go_default_library",
         "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
         "@com_github_marcopolo_simnet//:go_default_library",
     ],
 )

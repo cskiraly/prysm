@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/crypto/hash"
@@ -10,7 +11,15 @@ import (
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
 
+// isSegmentTopic reports whether a topic is the execution payload segment topic, whose message
+// ids carry the segment's claim ahead of the content id; see segmentgossip.MessageID.
+var isSegmentTopic = segmentgossip.TopicMatcher(GossipExecutionPayloadSegmentMessage)
+
 // MsgID is a content addressable ID function.
+//
+// On the execution payload segment topic the 20-byte content id below is the tail of a
+// 56-byte id whose head names the segment's group root and index, read from the SSZ body;
+// every other topic keeps the spec's 20 bytes. See segmentgossip.MessageID.
 //
 // Ethereum Beacon Chain spec defines the message ID as:
 //
@@ -126,5 +135,9 @@ func postAltairMsgID(pmsg *pubsubpb.Message, fEpoch primitives.Epoch) string {
 	combinedData = append(combinedData, topic...)
 	combinedData = append(combinedData, decodedData...)
 	h := hash.Hash(combinedData)
-	return bytesutil.UnsafeCastToString(h[:20])
+	contentID := string(h[:20])
+	if isSegmentTopic(topic) {
+		return segmentgossip.MessageID(decodedData, contentID)
+	}
+	return contentID
 }

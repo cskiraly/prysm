@@ -17,12 +17,14 @@ import (
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 	"github.com/marcopolo/simnet"
@@ -63,10 +65,16 @@ func twoNodes(t *testing.T, extra ...pubsub.Option) (*pubsub.PubSub, *pubsub.Pub
 	synctest.Wait()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Prysm's id function, so the ids announced and delivered here are the ones a node
+	// computes: on the segment topic, the segment's claim ahead of the content id.
+	var genesisValidatorsRoot [32]byte
 	opts := append([]pubsub.Option{
 		pubsub.WithMessageSigning(false),
 		pubsub.WithStrictSignatureVerification(false),
 		pubsub.WithPeerOutboundQueueSize(pubsubQueueSize),
+		pubsub.WithMessageIdFn(func(pmsg *pubsubpb.Message) string {
+			return p2p.MsgID(genesisValidatorsRoot[:], pmsg)
+		}),
 	}, extra...)
 	ps1, err := pubsub.NewGossipSub(ctx, h1, opts...)
 	require.NoError(t, err)
@@ -175,7 +183,9 @@ func exchange(t *testing.T, opts []pubsub.Option) {
 			msg, err := sub2.Next(recvCtx)
 			require.NoError(t, err, "a segment never arrived: %d of %d received", received, len(segs))
 			received++
-			out := feed(t, reassembler, msg.Data)
+			pb := decodeSegment(t, msg.Data)
+			requireClaim(t, msg.ID, pb)
+			out := feed(t, reassembler, pb)
 			if out != nil {
 				reassembled = out
 			}
@@ -238,7 +248,11 @@ func TestTwoNodeSegmentRejection(t *testing.T) {
 		for range 2 {
 			msg, err := sub2.Next(recvCtx)
 			require.NoError(t, err)
-			if out := feedAllowingError(t, reassembler, msg.Data, &rejected); out != nil {
+			pb := decodeSegment(t, msg.Data)
+			// The corrupted segment's id still carries its claim: the id names what the
+			// message says it is, and the proof is what refuses it.
+			requireClaim(t, msg.ID, pb)
+			if out := feedAllowingError(t, reassembler, pb, &rejected); out != nil {
 				t.Fatal("should not have completed yet")
 			}
 		}
@@ -253,7 +267,7 @@ func TestTwoNodeSegmentRejection(t *testing.T) {
 		for reassembled == nil {
 			msg, err := sub2.Next(recvCtx)
 			require.NoError(t, err, "a segment never arrived")
-			if out := feedAllowingError(t, reassembler, msg.Data, &rejected); out != nil {
+			if out := feedAllowingError(t, reassembler, decodeSegment(t, msg.Data), &rejected); out != nil {
 				reassembled = out
 			}
 		}
@@ -274,11 +288,27 @@ func publishAll(t *testing.T, topic *pubsub.Topic, segs []*ethpb.ExecutionPayloa
 	synctest.Wait()
 }
 
-// feed decodes a received gossip message and hands the segment to the reassembler.
-func feed(t *testing.T, r *segments.Reassembler, data []byte) []byte {
+// decodeSegment decodes a received gossip message the way the sync validator does.
+func decodeSegment(t *testing.T, data []byte) *ethpb.ExecutionPayloadSegment {
 	t.Helper()
 	pb := &ethpb.ExecutionPayloadSegment{}
 	require.NoError(t, encoder.SszNetworkEncoder{}.DecodeGossip(data, pb))
+	return pb
+}
+
+// requireClaim checks that the id gossipsub delivered a segment under is the structured id:
+// the segment's own root and index, readable by any node that sees the id announced.
+func requireClaim(t *testing.T, mid string, pb *ethpb.ExecutionPayloadSegment) {
+	t.Helper()
+	claim, ok := segmentgossip.ParseMessageID(mid)
+	require.Equal(t, true, ok, "a segment's message id should carry its claim; got %d bytes", len(mid))
+	require.Equal(t, true, bytes.Equal(pb.SegmentDescriptor.Root, claim.Root[:]), "the id names another group")
+	require.Equal(t, pb.Index, claim.Index, "the id names another index")
+}
+
+// feed hands a decoded segment to the reassembler.
+func feed(t *testing.T, r *segments.Reassembler, pb *ethpb.ExecutionPayloadSegment) []byte {
+	t.Helper()
 	m, h, err := segments.FromProto(pb)
 	require.NoError(t, err)
 	out, err := r.Add(h, m)
@@ -287,10 +317,8 @@ func feed(t *testing.T, r *segments.Reassembler, data []byte) []byte {
 }
 
 // feedAllowingError is feed for cases where a rejection is the expected outcome.
-func feedAllowingError(t *testing.T, r *segments.Reassembler, data []byte, rejected *int) []byte {
+func feedAllowingError(t *testing.T, r *segments.Reassembler, pb *ethpb.ExecutionPayloadSegment, rejected *int) []byte {
 	t.Helper()
-	pb := &ethpb.ExecutionPayloadSegment{}
-	require.NoError(t, encoder.SszNetworkEncoder{}.DecodeGossip(data, pb))
 	m, h, err := segments.FromProto(pb)
 	if err != nil {
 		*rejected++
