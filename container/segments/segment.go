@@ -239,12 +239,3 @@ func Join(d *Descriptor, h Hasher, segs [][]byte) ([]byte, error) {
 	}
 	return out, nil
 }
-
-// DefaultSegmentSize is the segment size used when a publisher has no reason to choose
-// another.
-//
-// 32 KiB keeps total wire overhead near 1% of a 1 MiB payload: proof depth is 5 at that
-// size, and proofs dominate the overhead, growing as K*ceil(log2 K) while the payload
-// stays fixed. Smaller segments lower time-to-first-byte but cost disproportionately more
-// -- 4 KiB segments push overhead above 10%.
-const DefaultSegmentSize = 32 << 10

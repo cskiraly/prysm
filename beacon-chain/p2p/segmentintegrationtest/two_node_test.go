@@ -157,11 +157,11 @@ func exchange(t *testing.T, opts []pubsub.Option) {
 		synctest.Wait()
 
 		reassembler, err := segments.NewReassembler(segments.ReassemblerConfig{
-			Auth: segmentauth.New(harnessCommitment(t, payload, segments.DefaultSegmentSize)),
+			Auth: segmentauth.New(harnessCommitment(t, payload, segmentauth.DefaultSegmentSize)),
 		})
 		require.NoError(t, err)
 
-		segs := wireSegments(t, payload, segments.DefaultSegmentSize)
+		segs := wireSegments(t, payload, segmentauth.DefaultSegmentSize)
 		t.Logf("publishing %d segments for a %d KiB payload over a %d Mbps link",
 			len(segs), payloadLen>>10, linkRate/simlibp2p.OneMbps)
 
@@ -213,11 +213,11 @@ func TestTwoNodeSegmentRejection(t *testing.T) {
 		synctest.Wait()
 
 		reassembler, err := segments.NewReassembler(segments.ReassemblerConfig{
-			Auth: segmentauth.New(harnessCommitment(t, payload, segments.DefaultSegmentSize)),
+			Auth: segmentauth.New(harnessCommitment(t, payload, segmentauth.DefaultSegmentSize)),
 		})
 		require.NoError(t, err)
 
-		segs := wireSegments(t, payload, 32<<10)
+		segs := wireSegments(t, payload, segmentauth.DefaultSegmentSize)
 		require.Equal(t, true, len(segs) >= 3, "need several segments to corrupt one")
 
 		// Corrupt a segment's payload bytes in place, leaving its proof intact: the tree no

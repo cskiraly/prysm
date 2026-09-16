@@ -19,10 +19,17 @@ type Params struct {
 	HashID      segments.HashID
 }
 
+// DefaultSegmentSize is the segment size a publisher cuts at until the commitment in the bid
+// names one. 16 KiB is where the measured completion floor is: on a 500-node simulated mesh,
+// across payloads from 128 KiB to 2 MiB, 16 KiB takes about a tenth off the median and the
+// p99 against the codec's 32 KiB, 8 KiB adds nothing and doubles the control traffic, and
+// 64 KiB costs 15 to 40 percent.
+const DefaultSegmentSize = 16 << 10
+
 // DefaultParams is the segmentation a publisher uses until the commitment in the bid names
-// one: the codec's default segment size over SHA-256.
+// one: DefaultSegmentSize over SHA-256.
 func DefaultParams() Params {
-	return Params{SegmentSize: segments.DefaultSegmentSize, HashID: segments.HashSHA256}
+	return Params{SegmentSize: DefaultSegmentSize, HashID: segments.HashSHA256}
 }
 
 // SegmentMessagesForEnvelope derives the segmentation of a signed envelope.

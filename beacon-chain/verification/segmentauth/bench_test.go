@@ -20,7 +20,7 @@ func BenchmarkAuthenticateDescriptor(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	d, _, err := segments.Commit(make([]byte, 1<<20), segments.DefaultSegmentSize, h)
+	d, _, err := segments.Commit(make([]byte, 1<<20), DefaultSegmentSize, h)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func BenchmarkSegmentVerifyForContrast(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	msgs, err := segments.BuildSegmentMessages(make([]byte, 1<<20), segments.DefaultSegmentSize, h)
+	msgs, err := segments.BuildSegmentMessages(make([]byte, 1<<20), DefaultSegmentSize, h)
 	if err != nil {
 		b.Fatal(err)
 	}

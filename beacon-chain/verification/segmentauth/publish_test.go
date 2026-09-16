@@ -58,7 +58,7 @@ func TestSegmentMessagesForEnvelopeRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	encoded, err := signed.MarshalSSZ()
 	require.NoError(t, err)
-	descriptor, _, err := segments.Commit(encoded, segments.DefaultSegmentSize, hasher)
+	descriptor, _, err := segments.Commit(encoded, 2*DefaultSegmentSize, hasher)
 	require.NoError(t, err)
 	require.Equal(t, true, descriptor.Count > 1, "envelope should need several segments")
 	groupID := descriptor.GroupID(hasher)
@@ -130,7 +130,10 @@ func TestSegmentMessagesForEnvelopeRoundTrip(t *testing.T) {
 	t.Run("default params segment the envelope", func(t *testing.T) {
 		segs, err := SegmentMessagesForEnvelope(signed, DefaultParams())
 		require.NoError(t, err)
-		require.Equal(t, int(descriptor.Count), len(segs))
+		want, _, err := segments.Commit(encoded, DefaultSegmentSize, hasher)
+		require.NoError(t, err)
+		require.Equal(t, int(want.Count), len(segs))
+		require.Equal(t, true, want.Count > descriptor.Count, "the default cuts more segments than twice the default")
 	})
 
 }
