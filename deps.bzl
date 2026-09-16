@@ -2010,37 +2010,18 @@ def prysm_deps():
         name = "com_github_libp2p_go_libp2p_pubsub",
         build_file_proto_mode = "disable_global",
         importpath = "github.com/libp2p/go-libp2p-pubsub",
+        # The fork the study measured with (branch segments-snapshot: phase forwarding, the
+        # disciplined pull path, the instruments and the adversaries of the follow-up post).
+        # Same pin as the go.mod replace directive.
+        replace = "github.com/cskiraly/go-libp2p-pubsub",
         # Replaces proto.CloneOf (needs protobuf-go >= v1.36.4) with proto.Clone,
         # as rules_go pins org_golang_google_protobuf to v1.36.3 for bazel builds.
         patch_args = ["-p1"],
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
-            # Phase forwarding (design-space dimension 9 on variant A). Same diff as the
-            # go.mod replace to ./third_party/go-libp2p-pubsub; regenerate with
-            # diff -u <modcache>/gossipsub.go third_party/go-libp2p-pubsub/gossipsub.go etc.
-            "//third_party:com_github_libp2p_go_libp2p_pubsub-phaseforward.patch",
-            # Partial-message interest in a topic we joined but did not subscribe to, which
-            # EIP-8371's pull direction needs (notes/rowdas/TODO.md F1). Applied on top of the
-            # patch above, so it is a diff against the already-patched tree: regenerate with
-            # git diff --relative=third_party/go-libp2p-pubsub -- third_party/go-libp2p-pubsub
-            # against the last commit of the fork.
-            "//third_party:com_github_libp2p_go_libp2p_pubsub-partialinterest.patch",
-            # sendRPC reports whether the RPC was admitted to the peer's queue, and the
-            # partial-messages extension passes it to PublishAction.OnSent, so the
-            # application records only what actually went out (plan-repair.md item 3).
-            # Also carries the extension's per-topic counter cleanup from e4b789012c, which
-            # never had a patch: the fork and this list had drifted before this entry.
-            #
-            # Generated as base-tree-to-fork rather than commit-to-commit, so it cannot drift
-            # the same way: copy <modcache>/go-libp2p-pubsub@v0.17.0, apply the patches above
-            # in order (patch -p1 -N -f; the BUILD hunk is skipped), then
-            # diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base third_party/go-libp2p-pubsub.
-            # sign.go is excluded because the cloneof patch above is Bazel-only. Verify by
-            # applying the result to a fresh base copy and diffing against the fork: empty.
-            "//third_party:com_github_libp2p_go_libp2p_pubsub-admission.patch",
         ],
-        sum = "h1:SNdvB6V0eYMXLRR95n+4vpxJKbFsbHhgjPdDiTpGoo0=",
-        version = "v0.17.0",
+        sum = "h1:ECVG45afO9Ip54ARIUDER87kXXStQrMtoOYmZWH7V8Q=",
+        version = "v0.17.1-0.20260916110724-16ca04274f51",
     )
     go_repository(
         name = "com_github_libp2p_go_libp2p_testing",
@@ -2141,19 +2122,14 @@ def prysm_deps():
     go_repository(
         name = "com_github_marcopolo_simnet",
         importpath = "github.com/marcopolo/simnet",
-        patch_args = ["-p1"],
-        patches = [
-            # LinkSettings.BurstWindow: how much line time the token bucket may accumulate.
-            # Zero keeps upstream's one-MTU burst, which is exact under a virtual clock; on the
-            # real clock every timer wake-up overshoots, so one-MTU pacing lost capacity (a
-            # 50 Mbps link delivered ~21) and wall-clock links set a few milliseconds
-            # (gossipsim.RealClockBurstWindow). Same diff as the go.mod replace to
-            # ./third_party/simnet; regenerate with
-            # diff -ruN -x '*.orig' -x BUILD.bazel -x .github <modcache>/simnet@v0.0.7 third_party/simnet.
-            "//third_party:com_github_marcopolo_simnet-burst.patch",
-        ],
-        sum = "h1:DpH8BMGsF9+1w13L8rvCaAhb6nYJdY+dIXncDrssvUs=",
-        version = "v0.0.7",
+        # Fork (branch burst-window): LinkSettings.BurstWindow sizes the rate link's
+        # token-bucket burst in line time rather than one MTU, so a 50 Mbps link delivers
+        # 50 Mbps on the real clock (wall-clock links set a few milliseconds via
+        # gossipsim.RealClockBurstWindow; zero keeps upstream's behaviour, which is exact
+        # under a virtual clock). Same pin as the go.mod replace directive.
+        replace = "github.com/cskiraly/simnet",
+        sum = "h1:5KF4+gg6TVbdeit+jBt6XbwqBhsUyupVtgyW6rN8SWc=",
+        version = "v0.0.8-0.20260831115143-816b7ffb262a",
     )
     go_repository(
         name = "com_github_marten_seemann_tcp",

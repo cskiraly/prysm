@@ -66,6 +66,7 @@ require (
 	github.com/prometheus/prom2json v1.3.0
 	github.com/prysmaticlabs/fastssz v0.0.0-20260421202104-7a6eb71e6e45
 	github.com/prysmaticlabs/prombbolt v0.0.0-20210126082820-9b7adba6db7c
+	github.com/quic-go/quic-go v0.59.0
 	github.com/r3labs/sse/v2 v2.10.0
 	github.com/rs/cors v1.7.0
 	github.com/schollz/progressbar/v3 v3.3.4
@@ -252,7 +253,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/prysmaticlabs/protoc-gen-go-cast v0.0.0-20230228205207-28762a7b9294 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/quic-go/webtransport-go v0.10.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
@@ -315,14 +315,15 @@ replace github.com/json-iterator/go => github.com/prestonvanloon/go v1.1.7-0.201
 
 replace github.com/tyler-smith/go-bip39 => ./third_party/go-bip39
 
-// Local fork carrying the phase-forwarding experiment (design-space dimension 9 on variant A).
-// The same diff is applied to bazel's external repo as third_party/*-phase.patch.
-replace github.com/libp2p/go-libp2p-pubsub => ./third_party/go-libp2p-pubsub
+// The go-libp2p-pubsub fork the study measured with (branch segments-snapshot: phase forwarding,
+// the disciplined pull path, the instruments and the adversaries of the follow-up post). The
+// fork's go.mod keeps the upstream module path; deps.bzl pins the same version.
+replace github.com/libp2p/go-libp2p-pubsub => github.com/cskiraly/go-libp2p-pubsub v0.17.1-0.20260916110724-16ca04274f51
 
-// simnet: the rate link's burst is sized in line time rather than one MTU, so a 50 Mbps link
-// delivers 50 Mbps on the real clock. See third_party/simnet/ratelink.go and
-// testing/gossipsim/calibration_test.go.
-replace github.com/marcopolo/simnet => ./third_party/simnet
+// simnet fork (branch burst-window): the rate link's burst is sized in line time rather than one
+// MTU, so a 50 Mbps link delivers 50 Mbps on the real clock. See
+// testing/gossipsim/calibration_test.go. Same pin as deps.bzl.
+replace github.com/marcopolo/simnet => github.com/cskiraly/simnet v0.0.8-0.20260831115143-816b7ffb262a
 
 tool (
 	github.com/OffchainLabs/methodical-ssz/cmd/ssz
