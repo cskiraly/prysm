@@ -3,11 +3,15 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
+	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/container/segments"
+	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
@@ -45,8 +49,11 @@ var errSegmentedGossipDisabled = errors.New("segmented payload gossip is disable
 // Ordering is deliberate and runs cheapest-first: decode, then the per-peer budget when the
 // segment would open a group, then the Merkle proof, the length checks and the descriptor
 // authentication, all inside the reassembler's Add so a segment is verified exactly once.
-// While the node is still syncing every segment is ignored, as envelopes are: nothing here
-// could be judged against a chain the node does not have yet.
+// The segment that completes a group is followed by the group's recovery, the payload's
+// decompression when the descriptor says it was compressed, and the envelope's decode; the
+// pull gate is told first, since the node holds what the root committed to whatever those
+// bytes turn out to be. While the node is still syncing every segment is ignored, as
+// envelopes are: nothing here could be judged against a chain the node does not have yet.
 func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.ID, msg *pubsub.Message) (pubsub.ValidationResult, error) {
 	if pid == s.cfg.p2p.PeerID() {
 		return pubsub.ValidationAccept, nil
@@ -98,22 +105,47 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 		return segmentAddResult(err)
 	}
 	if complete == nil {
-		// Buffered a new segment. Accept so it propagates: it is verified and belongs to an
-		// authenticated descriptor, which is the whole precondition for forwarding.
+		// Buffered a new segment, or one more of a group already delivered. Accept so it
+		// propagates: it is verified and belongs to an authenticated descriptor, which is
+		// the whole precondition for forwarding.
 		msg.ValidatorData = pb
 		return pubsub.ValidationAccept, nil
 	}
 
+	// This node holds what the root committed to, so it asks for no more of the group.
+	s.cfg.p2p.SegmentGroupComplete(bytesutil.ToBytes32(seg.Descriptor.Root))
+
+	payload, err := decodeSegmentedPayload(seg.Descriptor.Encoding, complete)
+	if err != nil {
+		// The bytes hashed to an authenticated root, so a failure here means the builder
+		// committed to something that does not decode as it said. Reject: it is attributable.
+		tracing.AnnotateError(span, err)
+		return pubsub.ValidationReject, err
+	}
 	envelope := &ethpb.SignedExecutionPayloadEnvelope{}
-	if err := envelope.UnmarshalSSZ(complete); err != nil {
-		// The bytes hashed to an authenticated root, so a decode failure here means the
-		// builder committed to something that is not an envelope. Reject: it is attributable.
+	if err := envelope.UnmarshalSSZ(payload); err != nil {
+		// Likewise: the builder committed to something that is not an envelope.
 		tracing.AnnotateError(span, err)
 		return pubsub.ValidationReject, err
 	}
 	segmentReassembledCounter.Inc()
 	msg.ValidatorData = envelope
 	return pubsub.ValidationAccept, nil
+}
+
+// decodeSegmentedPayload undoes what the publisher did to the envelope's bytes before
+// committing to them, as the descriptor names it. The decompressed size is bounded by the
+// gossip payload maximum, the same bound every gossip message decodes under.
+func decodeSegmentedPayload(enc segments.Encoding, committed []byte) ([]byte, error) {
+	switch enc {
+	case segments.EncodingRaw:
+		return committed, nil
+	case segments.EncodingSnappy:
+		return encoder.DecodeSnappy(committed, params.BeaconConfig().MaxPayloadSize)
+	default:
+		// Unreachable: the descriptor validated inside Add, and Validate bounds the encoding.
+		return nil, fmt.Errorf("%w: %d", segments.ErrEncoding, enc)
+	}
 }
 
 // segmentAddResult maps a reassembler error onto a gossip validation result.
