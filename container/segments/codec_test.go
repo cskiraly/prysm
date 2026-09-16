@@ -1,6 +1,7 @@
 package segments
 
 import (
+	"bytes"
 	"fmt"
 	"math/bits"
 	"testing"
@@ -79,6 +80,7 @@ func TestFromProtoRejects(t *testing.T) {
 		{"unknown hash id", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.SegmentDescriptor.HashId = 200 }), ErrUnknownHashID},
 		{"hash id beyond a byte", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.SegmentDescriptor.HashId = 1 << 9 }), ErrWireField},
 		{"version beyond a byte", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.SegmentDescriptor.Version = 1 << 9 }), ErrWireField},
+		{"encoding beyond a byte", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.SegmentDescriptor.Encoding = 1 << 9 }), ErrWireField},
 		{"root of the wrong width", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.SegmentDescriptor.Root = pb.SegmentDescriptor.Root[:31] }), ErrDescriptorMismatch},
 		{"proof element of the wrong width", mutate(func(pb *ethpb.ExecutionPayloadSegment) { pb.Proof[0] = pb.Proof[0][:31] }), ErrProofDigestSize},
 		{"too many proof elements", mutate(tooDeep), ErrProofCount},
@@ -143,5 +145,75 @@ func TestBuildSegmentMessagesRejects(t *testing.T) {
 	t.Run("bad segment size", func(t *testing.T) {
 		_, err := BuildSegmentMessages(msgOfLen(10), 0, h)
 		require.ErrorIs(t, err, ErrSegmentSize)
+	})
+}
+
+// TestBuildLayout covers the one builder the publisher uses: the encoding rides in the
+// descriptor through the wire, plain and coded groups come from the same call, and what the
+// layout cannot express is refused.
+func TestBuildLayout(t *testing.T) {
+	h, err := HasherByID(HashSHA256)
+	require.NoError(t, err)
+	msg := msgOfLen(700)
+
+	for _, tc := range []struct {
+		name   string
+		layout Layout
+		coded  bool
+	}{
+		{"plain raw", Layout{SegmentSize: 64, Hasher: h}, false},
+		{"plain snappy", Layout{SegmentSize: 64, Hasher: h, Encoding: EncodingSnappy}, false},
+		{"coded snappy", Layout{SegmentSize: 64, Hasher: h, Encoding: EncodingSnappy, Parity: 3}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgs, err := Build(msg, tc.layout)
+			require.NoError(t, err)
+			d := msgs[0].Descriptor
+			require.Equal(t, tc.layout.Encoding, d.Encoding)
+			require.Equal(t, tc.coded, d.Version == VersionCoded)
+			require.Equal(t, 11+tc.layout.Parity, len(msgs))
+			pb, err := msgs[0].ToProto()
+			require.NoError(t, err)
+			enc, err := pb.MarshalSSZ()
+			require.NoError(t, err)
+			back := &ethpb.ExecutionPayloadSegment{}
+			require.NoError(t, back.UnmarshalSSZ(enc))
+			got, gotHasher, err := FromProto(back)
+			require.NoError(t, err)
+			require.DeepEqual(t, d, got.Descriptor)
+			require.NoError(t, got.Verify(gotHasher))
+		})
+	}
+
+	t.Run("encodings give distinct groups", func(t *testing.T) {
+		raw, err := Build(msg, Layout{SegmentSize: 64, Hasher: h})
+		require.NoError(t, err)
+		snap, err := Build(msg, Layout{SegmentSize: 64, Hasher: h, Encoding: EncodingSnappy})
+		require.NoError(t, err)
+		require.DeepEqual(t, raw[0].Descriptor.Root, snap[0].Descriptor.Root, "same bytes, same tree")
+		require.Equal(t, false, bytes.Equal(raw[0].Descriptor.GroupID(h), snap[0].Descriptor.GroupID(h)), "different groups")
+	})
+
+	t.Run("rejects", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			layout Layout
+			want   error
+		}{
+			{"nil hasher", Layout{SegmentSize: 64}, ErrDescriptorMismatch},
+			{"unknown encoding", Layout{SegmentSize: 64, Hasher: h, Encoding: EncodingSnappy + 1}, ErrEncoding},
+			{"negative parity", Layout{SegmentSize: 64, Hasher: h, Parity: -1}, ErrCodedShape},
+		} {
+			_, err := Build(msg, tc.layout)
+			require.ErrorIs(t, err, tc.want, tc.name)
+		}
+	})
+
+	t.Run("a descriptor with an unknown encoding does not validate", func(t *testing.T) {
+		msgs, err := Build(msg, Layout{SegmentSize: 64, Hasher: h})
+		require.NoError(t, err)
+		bad := *msgs[0].Descriptor
+		bad.Encoding = EncodingSnappy + 1
+		require.ErrorIs(t, bad.Validate(h), ErrEncoding)
 	})
 }

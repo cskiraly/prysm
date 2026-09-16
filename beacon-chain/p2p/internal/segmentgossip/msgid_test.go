@@ -29,6 +29,7 @@ func testSegment() *ethpb.ExecutionPayloadSegment {
 			SegmentSize: 16 << 10,
 			TotalLength: 6*(16<<10) + 100,
 			Root:        root,
+			Encoding:    1,
 		},
 		Index: 0x01020304,
 		Proof: [][]byte{proof},
@@ -75,7 +76,7 @@ func TestMessageIDFallsBack(t *testing.T) {
 		{"short body", enc[:40], contentID},
 		{"first offset word does not point past the fixed part", func() []byte {
 			b := bytes.Clone(enc)
-			b[60]++
+			b[64]++
 			return b
 		}(), contentID},
 		{"empty body", nil, contentID},

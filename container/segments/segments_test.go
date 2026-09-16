@@ -186,6 +186,12 @@ func TestDescriptorGroupID(t *testing.T) {
 		require.Equal(t, descriptorFixedLen+h.Size(), len(enc))
 		require.Equal(t, Version, enc[0])
 		require.Equal(t, byte(h.ID()), enc[1])
+		require.Equal(t, byte(EncodingRaw), enc[2])
+	})
+	t.Run("the encoding is part of the group id", func(t *testing.T) {
+		other := *d
+		other.Encoding = EncodingSnappy
+		require.Equal(t, false, bytes.Equal(d.GroupID(h), other.GroupID(h)))
 	})
 	t.Run("group id is stable and descriptor-bound", func(t *testing.T) {
 		same := *d

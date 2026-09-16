@@ -42,14 +42,14 @@ func TopicMatcher(topicName string) func(topic string) bool {
 // what the announcer says the message is, which is all an announcement ever was.
 
 // Byte layout of the SSZ-encoded ExecutionPayloadSegment, pinned by TestMessageIDOffsets
-// against a real encode: the 56-byte SegmentDescriptor (version, hash_id, count, segment_size
-// as uint32, total_length as uint64, root), then index, then the offset words of the two
-// variable-length fields, proof and data.
+// against a real encode: the 60-byte SegmentDescriptor (version, hash_id, count, segment_size
+// as uint32, total_length as uint64, root, encoding as uint32), then index, then the offset
+// words of the two variable-length fields, proof and data.
 const (
 	sszRootAt    = 24
-	sszIndexAt   = 56
-	sszProofAt   = 60
-	sszFixedLen  = 68
+	sszIndexAt   = 60
+	sszProofAt   = 64
+	sszFixedLen  = 72
 	contentIDLen = 20
 )
 

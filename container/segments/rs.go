@@ -158,31 +158,37 @@ func wireShard(d *Descriptor, index int, shard []byte) ([]byte, error) {
 	return shard[:want], nil
 }
 
-// BuildCodedSegmentMessages produces the wire messages for a Reed-Solomon coded group:
-// the systematic segments of msg followed by parity segments, committed together.
+// BuildCodedSegmentMessages produces the wire messages for a Reed-Solomon coded group of raw
+// bytes: the systematic segments of msg followed by parity segments, committed together.
 func BuildCodedSegmentMessages(msg []byte, segmentSize, parity int, h Hasher) ([]*SegmentMessage, error) {
 	if parity <= 0 {
 		return nil, fmt.Errorf("%w: parity %d", ErrCodedShape, parity)
 	}
-	segs, err := Split(msg, segmentSize)
+	return Build(msg, Layout{SegmentSize: segmentSize, Hasher: h, Parity: parity})
+}
+
+func buildCoded(msg []byte, l Layout) ([]*SegmentMessage, error) {
+	h := l.Hasher
+	segs, err := Split(msg, l.SegmentSize)
 	if err != nil {
 		return nil, err
 	}
 	k := len(segs)
-	n := k + parity
+	n := k + l.Parity
 	if n > MaxCodedSegments {
 		return nil, fmt.Errorf("%w: %d segments, max %d", ErrCodedShape, n, MaxCodedSegments)
 	}
 	d := &Descriptor{
 		Version:     VersionCoded,
 		HashID:      h.ID(),
+		Encoding:    l.Encoding,
 		Count:       uint32(n),
-		SegmentSize: uint32(segmentSize),
+		SegmentSize: uint32(l.SegmentSize),
 		TotalLength: uint64(len(msg)),
 	}
 	// The codec zero-pads the final systematic segment; the wire carries it truncated, and
 	// the commitment covers the wire form.
-	par, err := rsParity(paddedShards(d, segs), parity)
+	par, err := rsParity(paddedShards(d, segs), l.Parity)
 	if err != nil {
 		return nil, err
 	}

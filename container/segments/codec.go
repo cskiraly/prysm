@@ -72,6 +72,7 @@ func (m *SegmentMessage) ToProto() (*ethpb.ExecutionPayloadSegment, error) {
 		SegmentDescriptor: &ethpb.SegmentDescriptor{
 			Version:     uint32(d.Version),
 			HashId:      uint32(d.HashID),
+			Encoding:    uint32(d.Encoding),
 			Count:       d.Count,
 			SegmentSize: d.SegmentSize,
 			TotalLength: d.TotalLength,
@@ -94,8 +95,8 @@ func FromProto(pb *ethpb.ExecutionPayloadSegment) (*SegmentMessage, Hasher, erro
 		return nil, nil, fmt.Errorf("%w: nil descriptor", ErrDescriptorMismatch)
 	}
 	pd := pb.SegmentDescriptor
-	if pd.Version > 0xff || pd.HashId > 0xff {
-		return nil, nil, fmt.Errorf("%w: version %d, hash id %d", ErrWireField, pd.Version, pd.HashId)
+	if pd.Version > 0xff || pd.HashId > 0xff || pd.Encoding > 0xff {
+		return nil, nil, fmt.Errorf("%w: version %d, hash id %d, encoding %d", ErrWireField, pd.Version, pd.HashId, pd.Encoding)
 	}
 	h, err := HasherByID(HashID(pd.HashId))
 	if err != nil {
@@ -120,6 +121,7 @@ func FromProto(pb *ethpb.ExecutionPayloadSegment) (*SegmentMessage, Hasher, erro
 	d := &Descriptor{
 		Version:     uint8(pd.Version),
 		HashID:      HashID(pd.HashId),
+		Encoding:    Encoding(pd.Encoding),
 		Count:       pd.Count,
 		SegmentSize: pd.SegmentSize,
 		TotalLength: pd.TotalLength,
@@ -137,9 +139,42 @@ func (m *SegmentMessage) Verify(h Hasher) error {
 	return VerifySegment(m.Descriptor, h, int(m.Index), m.Data, m.Proof)
 }
 
-// BuildSegmentMessages produces the wire messages for every segment of msg.
+// Layout is how a message is cut and committed: the segment size, the hash, the encoding
+// the message bytes are already in, and the parity segments to add, zero for a plain group.
+type Layout struct {
+	SegmentSize int
+	Hasher      Hasher
+	Encoding    Encoding
+	Parity      int
+}
+
+// Build produces the wire messages of msg under the layout: a plain group when Parity is
+// zero, a Reed-Solomon coded group otherwise.
+func Build(msg []byte, l Layout) ([]*SegmentMessage, error) {
+	if l.Hasher == nil {
+		return nil, fmt.Errorf("%w: nil hasher", ErrDescriptorMismatch)
+	}
+	if l.Encoding > EncodingSnappy {
+		return nil, fmt.Errorf("%w: %d", ErrEncoding, l.Encoding)
+	}
+	switch {
+	case l.Parity < 0:
+		return nil, fmt.Errorf("%w: parity %d", ErrCodedShape, l.Parity)
+	case l.Parity > 0:
+		return buildCoded(msg, l)
+	default:
+		return buildPlain(msg, l)
+	}
+}
+
+// BuildSegmentMessages produces the wire messages for every segment of msg, as a plain group
+// of raw bytes.
 func BuildSegmentMessages(msg []byte, segmentSize int, h Hasher) ([]*SegmentMessage, error) {
-	d, segs, tree, err := commit(msg, segmentSize, h)
+	return Build(msg, Layout{SegmentSize: segmentSize, Hasher: h})
+}
+
+func buildPlain(msg []byte, l Layout) ([]*SegmentMessage, error) {
+	d, segs, tree, err := commit(msg, l.SegmentSize, l.Hasher, l.Encoding)
 	if err != nil {
 		return nil, err
 	}

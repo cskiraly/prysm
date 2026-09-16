@@ -12,6 +12,21 @@ import (
 // needed. VersionCoded, in rs.go, marks a Reed-Solomon coded group. Bump on any layout change.
 const Version uint8 = 1
 
+// Encoding names what was done to the message before it was segmented, so the receiver
+// knows how to read the reassembled bytes. The library carries it in the descriptor,
+// committed with the rest, and does not act on it: the caller that segmented the bytes is
+// the one that encoded them.
+type Encoding uint8
+
+const (
+	// EncodingRaw means the reassembled bytes are the message.
+	EncodingRaw Encoding = 0
+	// EncodingSnappy means the reassembled bytes are the snappy block compression of the
+	// message. Compressing first makes every segment dense on the wire and lets the group
+	// carry fewer of them.
+	EncodingSnappy Encoding = 1
+)
+
 // Bounds on segmentation, enforced on both the producing and consuming side so a peer
 // cannot make us allocate an unbounded number of segments or an oversized buffer.
 const (
@@ -38,6 +53,8 @@ var (
 	ErrSegmentLength = errors.New("segment length disagrees with descriptor")
 	// ErrIncompleteSegments is returned when reassembly is missing a segment.
 	ErrIncompleteSegments = errors.New("missing one or more segments")
+	// ErrEncoding is returned for a content encoding this library does not know.
+	ErrEncoding = errors.New("unknown content encoding")
 )
 
 // Descriptor is the authenticated header for a segmented message.
@@ -52,23 +69,25 @@ var (
 type Descriptor struct {
 	Version     uint8
 	HashID      HashID
+	Encoding    Encoding
 	Count       uint32
 	SegmentSize uint32
 	TotalLength uint64
 	Root        []byte
 }
 
-// descriptorFixedLen is the encoded length before the variable-length root.
-const descriptorFixedLen = 1 + 1 + 4 + 4 + 8
+// descriptorFixedLen is the canonical encoded length before the variable-length root.
+const descriptorFixedLen = 1 + 1 + 1 + 4 + 4 + 8
 
-// Commit splits msg into segments of segmentSize and builds the commitment over them.
+// Commit splits msg into segments of segmentSize and builds the commitment over them, as a
+// plain group of raw bytes.
 func Commit(msg []byte, segmentSize int, h Hasher) (*Descriptor, [][]byte, error) {
-	d, segs, _, err := commit(msg, segmentSize, h)
+	d, segs, _, err := commit(msg, segmentSize, h, EncodingRaw)
 	return d, segs, err
 }
 
 // commit is Commit keeping the tree, so a caller that also needs proofs builds it once.
-func commit(msg []byte, segmentSize int, h Hasher) (*Descriptor, [][]byte, *Tree, error) {
+func commit(msg []byte, segmentSize int, h Hasher, enc Encoding) (*Descriptor, [][]byte, *Tree, error) {
 	segs, err := Split(msg, segmentSize)
 	if err != nil {
 		return nil, nil, nil, err
@@ -80,6 +99,7 @@ func commit(msg []byte, segmentSize int, h Hasher) (*Descriptor, [][]byte, *Tree
 	d := &Descriptor{
 		Version:     Version,
 		HashID:      h.ID(),
+		Encoding:    enc,
 		Count:       uint32(len(segs)),
 		SegmentSize: uint32(segmentSize),
 		TotalLength: uint64(len(msg)),
@@ -128,6 +148,9 @@ func (d *Descriptor) Validate(h Hasher) error {
 	}
 	if d.HashID != h.ID() {
 		return fmt.Errorf("%w: hash id %d, hasher %d", ErrDescriptorMismatch, d.HashID, h.ID())
+	}
+	if d.Encoding > EncodingSnappy {
+		return fmt.Errorf("%w: %d", ErrEncoding, d.Encoding)
 	}
 	if len(d.Root) != h.Size() {
 		return fmt.Errorf("%w: root %d bytes, want %d", ErrDescriptorMismatch, len(d.Root), h.Size())
@@ -183,9 +206,10 @@ func (d *Descriptor) MarshalCanonical() []byte {
 	out := make([]byte, descriptorFixedLen+len(d.Root))
 	out[0] = d.Version
 	out[1] = byte(d.HashID)
-	binary.LittleEndian.PutUint32(out[2:6], d.Count)
-	binary.LittleEndian.PutUint32(out[6:10], d.SegmentSize)
-	binary.LittleEndian.PutUint64(out[10:18], d.TotalLength)
+	out[2] = byte(d.Encoding)
+	binary.LittleEndian.PutUint32(out[3:7], d.Count)
+	binary.LittleEndian.PutUint32(out[7:11], d.SegmentSize)
+	binary.LittleEndian.PutUint64(out[11:19], d.TotalLength)
 	copy(out[descriptorFixedLen:], d.Root)
 	return out
 }

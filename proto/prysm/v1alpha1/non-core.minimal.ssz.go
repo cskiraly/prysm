@@ -607,7 +607,7 @@ func (c *ExecutionPayloadEnvelopesByRangeRequest) HashTreeRootWith(hh *ssz.Hashe
 }
 
 func (c *ExecutionPayloadSegment) SizeSSZ() int {
-	size := 68
+	size := 72
 	size += len(c.Proof) * 32
 	size += len(c.Data)
 	return size
@@ -620,7 +620,7 @@ func (c *ExecutionPayloadSegment) MarshalSSZ() ([]byte, error) {
 
 func (c *ExecutionPayloadSegment) MarshalSSZTo(dst []byte) ([]byte, error) {
 	var err error
-	offset := 68
+	offset := 72
 
 	// Field 0: SegmentDescriptor
 	if c.SegmentDescriptor == nil {
@@ -663,21 +663,21 @@ func (c *ExecutionPayloadSegment) MarshalSSZTo(dst []byte) ([]byte, error) {
 func (c *ExecutionPayloadSegment) UnmarshalSSZ(buf []byte) error {
 	var err error
 	size := uint64(len(buf))
-	if size < 68 {
+	if size < 72 {
 		return ssz.ErrSize
 	}
 
-	sszSlice0 := buf[0:56]  // c.SegmentDescriptor
-	sszSlice1 := buf[56:60] // c.Index
+	sszSlice0 := buf[0:60]  // c.SegmentDescriptor
+	sszSlice1 := buf[60:64] // c.Index
 
-	sszVarOffset2 := ssz.ReadOffset(buf[60:64]) // c.Proof
-	if sszVarOffset2 != 68 {
+	sszVarOffset2 := ssz.ReadOffset(buf[64:68]) // c.Proof
+	if sszVarOffset2 != 72 {
 		return ssz.ErrInvalidVariableOffset
 	}
 	if sszVarOffset2 > size {
 		return ssz.ErrOffset
 	}
-	sszVarOffset3 := ssz.ReadOffset(buf[64:68]) // c.Data
+	sszVarOffset3 := ssz.ReadOffset(buf[68:72]) // c.Data
 	if sszVarOffset3 > size || sszVarOffset3 < sszVarOffset2 {
 		return ssz.ErrOffset
 	}
@@ -768,7 +768,7 @@ func (c *ExecutionPayloadSegment) HashTreeRootWith(hh *ssz.Hasher) (err error) {
 }
 
 func (c *SegmentDescriptor) SizeSSZ() int {
-	size := 56
+	size := 60
 
 	return size
 }
@@ -802,13 +802,16 @@ func (c *SegmentDescriptor) MarshalSSZTo(dst []byte) ([]byte, error) {
 	}
 	dst = append(dst, c.Root...)
 
+	// Field 6: Encoding
+	dst = binary.LittleEndian.AppendUint32(dst, c.Encoding)
+
 	return dst, err
 }
 
 func (c *SegmentDescriptor) UnmarshalSSZ(buf []byte) error {
 	var err error
 	size := uint64(len(buf))
-	if size != 56 {
+	if size != 60 {
 		return ssz.ErrSize
 	}
 
@@ -818,6 +821,7 @@ func (c *SegmentDescriptor) UnmarshalSSZ(buf []byte) error {
 	sszSlice3 := buf[12:16] // c.SegmentSize
 	sszSlice4 := buf[16:24] // c.TotalLength
 	sszSlice5 := buf[24:56] // c.Root
+	sszSlice6 := buf[56:60] // c.Encoding
 
 	// Field 0: Version
 	c.Version = binary.LittleEndian.Uint32(sszSlice0)
@@ -837,6 +841,9 @@ func (c *SegmentDescriptor) UnmarshalSSZ(buf []byte) error {
 	// Field 5: Root
 	c.Root = make([]byte, 0, 32)
 	c.Root = append(c.Root, sszSlice5...)
+
+	// Field 6: Encoding
+	c.Encoding = binary.LittleEndian.Uint32(sszSlice6)
 	return err
 }
 
@@ -868,6 +875,8 @@ func (c *SegmentDescriptor) HashTreeRootWith(hh *ssz.Hasher) (err error) {
 		return ssz.ErrBytesLength
 	}
 	hh.PutBytes(c.Root)
+	// Field 6: Encoding
+	hh.PutUint32(c.Encoding)
 	hh.Merkleize(indx)
 	return nil
 }

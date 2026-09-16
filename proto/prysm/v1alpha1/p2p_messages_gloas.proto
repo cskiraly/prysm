@@ -57,8 +57,10 @@ message ExecutionPayloadSegment {
 
 // SegmentDescriptor is the authenticated header of a segmented message: every field that
 // affects reassembly, so that pinning the first descriptor seen for a group is enough to
-// reject peers that later contradict it. version and hash_id are bytes in
-// container/segments and are rejected above 255.
+// reject peers that later contradict it. version, hash_id and encoding are bytes in
+// container/segments and are rejected above 255. encoding names what was done to the
+// message before it was segmented (segments.EncodingRaw, segments.EncodingSnappy), so the
+// receiver knows how to read the reassembled bytes.
 message SegmentDescriptor {
   uint32 version = 1;
   uint32 hash_id = 2;
@@ -66,4 +68,5 @@ message SegmentDescriptor {
   uint32 segment_size = 4;
   uint64 total_length = 5;
   bytes root = 6 [(ethereum.eth.ext.ssz_size) = "32"];
+  uint32 encoding = 7;
 }
