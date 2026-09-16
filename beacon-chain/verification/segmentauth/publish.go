@@ -6,17 +6,27 @@ import (
 	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/math"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	"github.com/golang/snappy"
 )
 
 // ErrEnvelopeMalformed is returned when the envelope or its segmentation parameters are unusable.
 var ErrEnvelopeMalformed = fmt.Errorf("segment publish input malformed")
 
-// Params selects a segmentation of an envelope: the segment size and the hash the tree is
-// built with. Both are part of the group id, so a receiver only admits segments cut with the
-// parameters the chain committed to.
+// Params selects a segmentation of an envelope. Every field is part of the group id, so a
+// receiver only admits segments cut with the parameters the chain committed to.
 type Params struct {
+	// SegmentSize is the size the envelope's SSZ bytes are cut at; it sets the segment count.
 	SegmentSize uint32
-	HashID      segments.HashID
+	// HashID names the hash the tree is built with.
+	HashID segments.HashID
+	// Encoding is what is done to the envelope's bytes before they are committed to.
+	// EncodingSnappy compresses first, so every segment is dense on the wire and the group
+	// carries fewer of them; the receiver decompresses what it reassembles.
+	Encoding segments.Encoding
+	// Coded adds as many parity segments as there are data segments, so any half of the
+	// group completes a receiver. A group the code cannot hold, above MaxCodedPayload at the
+	// segment size, is published plain instead.
+	Coded bool
 }
 
 // DefaultSegmentSize is the segment size a publisher cuts at until the commitment in the bid
@@ -27,9 +37,18 @@ type Params struct {
 const DefaultSegmentSize = 16 << 10
 
 // DefaultParams is the segmentation a publisher uses until the commitment in the bid names
-// one: DefaultSegmentSize over SHA-256.
+// one: the envelope compressed first, cut into as many segments as DefaultSegmentSize gives
+// its SSZ bytes, with as many parity segments again, over SHA-256. This is the third tier of
+// the study's recommendation; measured against the plain group at the same segment size it
+// completes sooner at every payload size and asks for fewer bytes, because a receiver is done
+// at the first half of the group to reach it, whichever half that is.
 func DefaultParams() Params {
-	return Params{SegmentSize: DefaultSegmentSize, HashID: segments.HashSHA256}
+	return Params{
+		SegmentSize: DefaultSegmentSize,
+		HashID:      segments.HashSHA256,
+		Encoding:    segments.EncodingSnappy,
+		Coded:       true,
+	}
 }
 
 // SegmentMessagesForEnvelope derives the segmentation of a signed envelope.
@@ -40,9 +59,15 @@ func DefaultParams() Params {
 //
 // Note what that does NOT give the publisher: with the commitment in the block rather than in a
 // signature, there is nothing local to check the derived segmentation against, so a caller that
-// supplies a segment size or hash the builder did not commit to produces a well-formed group
-// that every peer refuses. Restoring that local check needs the bid field, at which point this
-// function can compare its derived group id against the block's commitment before broadcasting.
+// supplies parameters the builder did not commit to produces a well-formed group that every
+// peer refuses. Restoring that local check needs the bid field, at which point this function
+// can compare its derived group id against the block's commitment before broadcasting.
+//
+// Shape of a coded group: the segment count K follows the envelope's SSZ size at SegmentSize,
+// the segments themselves are the committed (compressed) bytes cut into K, and K parity
+// segments follow. So a 1 MiB envelope is 64 data segments of about 12 KiB once compressed,
+// plus 64 parity, which is the shape the study measured. A plain group cuts the committed
+// bytes at SegmentSize directly.
 //
 // The result is the segmentation itself; the p2p broadcaster frames it for gossip.
 func SegmentMessagesForEnvelope(
@@ -65,11 +90,34 @@ func SegmentMessagesForEnvelope(
 		return nil, err
 	}
 
-	out, err := segments.BuildSegmentMessages(encoded, segmentSize, hasher)
+	committed := encoded
+	switch p.Encoding {
+	case segments.EncodingRaw:
+	case segments.EncodingSnappy:
+		committed = snappy.Encode(nil, encoded)
+	default:
+		return nil, fmt.Errorf("%w: encoding %d", segments.ErrEncoding, p.Encoding)
+	}
+
+	layout := segments.Layout{SegmentSize: segmentSize, Hasher: hasher, Encoding: p.Encoding}
+	if p.Coded {
+		k := (len(encoded) + segmentSize - 1) / segmentSize
+		if 2*k <= segments.MaxCodedSegments {
+			layout.SegmentSize = (len(committed) + k - 1) / k
+			layout.Parity = k
+		}
+	}
+	out, err := segments.Build(committed, layout)
 	if err != nil {
 		return nil, fmt.Errorf("segment envelope: %w", err)
 	}
 	return out, nil
+}
+
+// MaxCodedPayload is the largest envelope, by SSZ size, that a coded group at segmentSize can
+// hold: the code has room for 2K segments, K of them data.
+func MaxCodedPayload(segmentSize int) int {
+	return segments.MaxCodedSegments / 2 * segmentSize
 }
 
 // segmentSizeAsInt converts a wire segment size, rejecting values the codec would refuse.

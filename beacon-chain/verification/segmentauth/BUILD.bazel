@@ -13,6 +13,7 @@ go_library(
         "//container/segments:go_default_library",
         "//math:go_default_library",
         "//proto/prysm/v1alpha1:go_default_library",
+        "@com_github_golang_snappy//:go_default_library",
     ],
 )
 
@@ -31,5 +32,6 @@ go_test(
         "//proto/engine/v1:go_default_library",
         "//proto/prysm/v1alpha1:go_default_library",
         "//testing/require:go_default_library",
+        "@com_github_golang_snappy//:go_default_library",
     ],
 )
