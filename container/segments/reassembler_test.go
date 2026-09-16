@@ -60,9 +60,29 @@ func TestReassemblerCompletes(t *testing.T) {
 			}
 		}
 		require.DeepEqual(t, msg, out)
-		// Completing a group must release its budget.
-		require.Equal(t, 0, r.Groups())
+		// Completing a group must release its budget; the entry stays, marked delivered,
+		// so a late segment cannot reopen it.
 		require.Equal(t, 0, r.Bytes())
+		require.Equal(t, 1, r.Groups())
+		require.Equal(t, true, r.Complete(msgs[0].Descriptor.GroupID(h)))
+	})
+
+	t.Run("delivered once", func(t *testing.T) {
+		r := newTestReassembler(t, ReassemblerConfig{})
+		for _, m := range msgs {
+			_, err := r.Add(h, m)
+			require.NoError(t, err)
+		}
+		// Every segment again, after delivery: verified, accepted, buffered nowhere, and the
+		// message is not returned a second time.
+		for _, m := range msgs {
+			got, err := r.Add(h, m)
+			require.NoError(t, err)
+			require.Equal(t, true, got == nil)
+		}
+		require.Equal(t, 0, r.Bytes())
+		require.Equal(t, 1, r.Groups())
+		require.Equal(t, true, r.Has(msgs[0].Descriptor.GroupID(h)), "a delivered group is still open")
 	})
 
 	t.Run("reverse order", func(t *testing.T) {
@@ -278,12 +298,16 @@ func TestReassemblerHas(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, true, r.Has(groupID))
 	})
-	t.Run("absent after completion", func(t *testing.T) {
+	t.Run("still present after completion", func(t *testing.T) {
+		// A delivered group stays open until its TTL, so a late segment joins it, proves
+		// against the pinned root and costs no authentication, instead of reopening a
+		// group that would have to be authenticated again.
 		for _, m := range msgs[1:] {
 			_, err := r.Add(h, m)
 			require.NoError(t, err)
 		}
-		require.Equal(t, false, r.Has(groupID))
+		require.Equal(t, true, r.Has(groupID))
+		require.Equal(t, true, r.Complete(groupID))
 	})
 	t.Run("absent for an unauthenticated group", func(t *testing.T) {
 		// A rejected descriptor must leave no trace, or Has would report a group that
@@ -292,5 +316,93 @@ func TestReassemblerHas(t *testing.T) {
 		_, err := failing.Add(h, msgs[0])
 		require.Equal(t, true, err != nil)
 		require.Equal(t, false, failing.Has(groupID))
+	})
+}
+
+// TestReassemblerCodedGroup drives a coded group through the reassembler: complete at
+// Required segments whichever they are, the recovered payload returned once, and the
+// remaining segments of the group accepted without effect.
+func TestReassemblerCodedGroup(t *testing.T) {
+	h := testHasher(t)
+	msg := msgOfLen(4*64 + 7)
+	msgs, err := BuildCodedSegmentMessages(msg, 64, 4, h)
+	require.NoError(t, err)
+	d := msgs[0].Descriptor
+	k := int(d.Required())
+	n := int(d.Count)
+	groupID := d.GroupID(h)
+
+	r := newTestReassembler(t, ReassemblerConfig{})
+
+	// Feed parity-heavy: skip systematic indices 1 and 3, take parity instead.
+	feed := []int{0, 2, n - 1, n - 2, n - 3}
+	require.Equal(t, k, len(feed))
+	var got []byte
+	for i, idx := range feed {
+		out, err := r.Add(h, msgs[idx])
+		require.NoError(t, err)
+		if i < k-1 {
+			require.Equal(t, true, out == nil, "delivered early at segment %d", i)
+			require.Equal(t, false, r.Complete(groupID))
+		} else {
+			got = out
+		}
+	}
+	require.DeepEqual(t, msg, got)
+	require.Equal(t, true, r.Complete(groupID))
+	require.Equal(t, 0, r.Bytes(), "completion releases the buffers")
+
+	t.Run("the rest of the group buffers nothing and delivers nothing", func(t *testing.T) {
+		for _, idx := range []int{1, 3, k} {
+			out, err := r.Add(h, msgs[idx])
+			require.NoError(t, err)
+			require.Equal(t, true, out == nil)
+		}
+		require.Equal(t, 0, r.Bytes())
+	})
+
+	t.Run("a delivered group ages out like any other", func(t *testing.T) {
+		clock := newTestClock()
+		r := newTestReassembler(t, ReassemblerConfig{TTL: time.Minute, Now: clock.now})
+		for _, idx := range feed {
+			_, err := r.Add(h, msgs[idx])
+			require.NoError(t, err)
+		}
+		require.Equal(t, true, r.Complete(groupID))
+		clock.advance(2 * time.Minute)
+		r.Prune()
+		require.Equal(t, false, r.Complete(groupID))
+		require.Equal(t, 0, r.Groups())
+	})
+
+	t.Run("an inconsistent codeword drops the group", func(t *testing.T) {
+		// Commit systematic segments and one corrupted parity segment together; every leaf
+		// proves against the root, so only recovery can refuse it, and it must not be retried
+		// on every later arrival.
+		leaves := make([][]byte, n)
+		for i, m := range msgs {
+			leaves[i] = m.Data
+		}
+		bad := make([]byte, len(leaves[k]))
+		copy(bad, leaves[k])
+		bad[0] ^= 1
+		leaves[k] = bad
+		tree, err := BuildTree(h, leaves)
+		require.NoError(t, err)
+		badDesc := &Descriptor{Version: VersionCoded, HashID: d.HashID, Count: d.Count, SegmentSize: d.SegmentSize, TotalLength: d.TotalLength, Root: tree.Root()}
+		r := newTestReassembler(t, ReassemblerConfig{})
+		for i := 0; i < k; i++ {
+			proof, err := tree.Proof(i)
+			require.NoError(t, err)
+			out, err := r.Add(h, &SegmentMessage{Descriptor: badDesc, Index: uint32(i), Proof: proof, Data: leaves[i]})
+			if i < k-1 {
+				require.NoError(t, err)
+				require.Equal(t, true, out == nil)
+				continue
+			}
+			require.ErrorIs(t, err, ErrCodewordMismatch)
+		}
+		require.Equal(t, 0, r.Groups())
+		require.Equal(t, 0, r.Bytes())
 	})
 }

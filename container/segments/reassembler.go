@@ -42,6 +42,11 @@ type group struct {
 	have    int
 	bytes   int
 	created time.Time
+	// delivered marks a group whose message has been returned. The entry stays until its
+	// TTL, with its buffers released, so that a segment arriving after completion is
+	// recognised as belonging to a finished group rather than reopening it: a coded group
+	// keeps producing arrivals past its threshold, and a plain one still sees duplicates.
+	delivered bool
 }
 
 // Reassembler collects verified segments until a message is complete.
@@ -81,8 +86,9 @@ func NewReassembler(cfg ReassemblerConfig) (*Reassembler, error) {
 
 // Add verifies a segment and buffers it, returning the reassembled message once complete.
 //
-// The returned message is nil while the group is still incomplete. A duplicate segment is
-// accepted idempotently and consumes no additional budget.
+// The returned message is nil while the group is still incomplete, and nil again for every
+// segment of a group that has already been delivered: the message is returned exactly once.
+// A duplicate segment is accepted idempotently and consumes no additional budget.
 func (r *Reassembler) Add(h Hasher, m *SegmentMessage) ([]byte, error) {
 	if err := m.Verify(h); err != nil {
 		return nil, err
@@ -117,6 +123,11 @@ func (r *Reassembler) Add(h Hasher, m *SegmentMessage) ([]byte, error) {
 		return nil, ErrDescriptorConflict
 	}
 
+	// Verified against the pinned root, so the segment is genuine; the group just has no
+	// further use for it.
+	if g.delivered {
+		return nil, nil
+	}
 	idx := int(m.Index)
 	if g.segs[idx] != nil {
 		return nil, nil
@@ -131,15 +142,38 @@ func (r *Reassembler) Add(h Hasher, m *SegmentMessage) ([]byte, error) {
 	g.bytes += len(seg)
 	r.bytes += len(seg)
 
-	if uint32(g.have) < g.desc.Count {
+	if uint32(g.have) < g.desc.Required() {
 		return nil, nil
 	}
-	msg, err := Join(g.desc, h, g.segs)
-	if err != nil {
-		return nil, err
+	var msg []byte
+	var err error
+	if g.desc.Version == VersionCoded {
+		msg, err = RecoverAndVerify(g.desc, h, g.segs)
+		if err != nil {
+			// Every buffered segment proved itself against the pinned root, so an
+			// inconsistent codeword is the builder's doing and no further segment can fix
+			// it. Keeping the group would re-run recovery on every arrival.
+			r.dropLocked(key, g)
+			return nil, err
+		}
+	} else {
+		msg, err = Join(g.desc, h, g.segs)
+		if err != nil {
+			return nil, err
+		}
 	}
-	r.dropLocked(key, g)
+	r.releaseLocked(g)
+	g.delivered = true
 	return msg, nil
+}
+
+// Complete reports whether a group's message has been reassembled and returned. False for a
+// group that is not open, which includes one that completed longer ago than the TTL.
+func (r *Reassembler) Complete(groupID []byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.groups[string(groupID)]
+	return ok && g.delivered
 }
 
 // Drop discards a group, e.g. once the message has been handled elsewhere.
@@ -152,7 +186,7 @@ func (r *Reassembler) Drop(groupID []byte) {
 	}
 }
 
-// Has reports whether a group is already open.
+// Has reports whether a group is already open, delivered or not.
 //
 // Lets a caller find out whether Add would need to authenticate a descriptor -- and so
 // spend a signature verification -- before handing it the segment. An open group needs no
@@ -172,7 +206,7 @@ func (r *Reassembler) Prune() {
 	r.pruneExpiredLocked()
 }
 
-// Groups returns the number of tracked groups.
+// Groups returns the number of tracked groups, delivered ones included until their TTL.
 func (r *Reassembler) Groups() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -188,8 +222,16 @@ func (r *Reassembler) Bytes() int {
 
 // dropLocked removes a group and returns its bytes to the budget.
 func (r *Reassembler) dropLocked(key string, g *group) {
-	r.bytes -= g.bytes
+	r.releaseLocked(g)
 	delete(r.groups, key)
+}
+
+// releaseLocked returns a group's buffered bytes to the budget and drops the buffers, keeping
+// the descriptor and the entry.
+func (r *Reassembler) releaseLocked(g *group) {
+	r.bytes -= g.bytes
+	g.bytes = 0
+	g.segs = nil
 }
 
 // pruneExpiredLocked evicts groups older than the TTL.

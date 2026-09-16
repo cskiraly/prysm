@@ -201,8 +201,10 @@ func exchange(t *testing.T, opts []pubsub.Option) {
 		// synctest bubble, which is what gives this test a deterministic clock.
 		require.Equal(t, true, bytes.Equal(payload, reassembled), "reassembled payload differs from the original")
 		require.Equal(t, len(segs), received, "should consume exactly the published segments")
-		require.Equal(t, 0, reassembler.Groups(), "completion should release the group")
 		require.Equal(t, 0, reassembler.Bytes(), "completion should release the buffer")
+		first, h, err := segments.FromProto(segs[0])
+		require.NoError(t, err)
+		require.Equal(t, true, reassembler.Complete(first.Descriptor.GroupID(h)), "the group should be marked complete")
 	})
 }
 
