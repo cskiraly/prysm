@@ -50,17 +50,17 @@ func TestBroadcastSegments(t *testing.T) {
 		}
 	})
 
-	t.Run("segments survive variant A's SSZ frame", func(t *testing.T) {
-		// The publisher frames codec bytes in SSZ; a reader must recover them exactly, or
-		// reassembly on the far side would fail for reasons unrelated to gossip.
+	t.Run("segments survive the SSZ wire type", func(t *testing.T) {
+		// A reader must recover every segment exactly, or reassembly on the far side would fail
+		// for reasons unrelated to gossip.
 		for _, m := range segmentMessages(t, 300, 64) {
-			codec, err := m.Marshal()
+			pb, err := m.ToProto()
 			require.NoError(t, err)
-			enc, err := (&ethpb.ExecutionPayloadSegment{Segment: codec}).MarshalSSZ()
+			enc, err := pb.MarshalSSZ()
 			require.NoError(t, err)
 			back := &ethpb.ExecutionPayloadSegment{}
 			require.NoError(t, back.UnmarshalSSZ(enc))
-			seg, hasher, err := segments.UnmarshalSegmentMessage(back.Segment)
+			seg, hasher, err := segments.FromProto(back)
 			require.NoError(t, err)
 			require.NoError(t, seg.Verify(hasher))
 		}

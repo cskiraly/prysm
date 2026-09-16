@@ -76,10 +76,10 @@ func TestSegmentMessagesForEnvelopeRoundTrip(t *testing.T) {
 		require.NoError(t, err)
 		var out []byte
 		for _, built := range msgs {
-			// Through the wire codec, as the broadcaster frames it and a receiver decodes it.
-			enc, err := built.Marshal()
+			// Through the wire type, as the broadcaster sends it and a receiver decodes it.
+			pb, err := built.ToProto()
 			require.NoError(t, err)
-			m, h, err := segments.UnmarshalSegmentMessage(enc)
+			m, h, err := segments.FromProto(pb)
 			require.NoError(t, err)
 			got, err := r.Add(h, m)
 			require.NoError(t, err)

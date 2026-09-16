@@ -155,7 +155,9 @@ func (d *Descriptor) SegmentLength(index int) (int, error) {
 	return int(d.SegmentSize), nil
 }
 
-// MarshalCanonical encodes the descriptor in a fixed little-endian layout.
+// MarshalCanonical encodes the descriptor in a fixed little-endian layout. It is the group
+// id's hash preimage and the descriptor-equality key, not a wire format: on the wire the
+// descriptor travels as SSZ inside ethpb.ExecutionPayloadSegment.
 func (d *Descriptor) MarshalCanonical() []byte {
 	out := make([]byte, descriptorFixedLen+len(d.Root))
 	out[0] = d.Version
@@ -165,23 +167,6 @@ func (d *Descriptor) MarshalCanonical() []byte {
 	binary.LittleEndian.PutUint64(out[10:18], d.TotalLength)
 	copy(out[descriptorFixedLen:], d.Root)
 	return out
-}
-
-// UnmarshalCanonical decodes a descriptor produced by MarshalCanonical.
-func UnmarshalCanonical(b []byte, digestSize int) (*Descriptor, error) {
-	if len(b) != descriptorFixedLen+digestSize {
-		return nil, fmt.Errorf("%w: %d bytes, want %d", ErrDescriptorMismatch, len(b), descriptorFixedLen+digestSize)
-	}
-	d := &Descriptor{
-		Version:     b[0],
-		HashID:      HashID(b[1]),
-		Count:       binary.LittleEndian.Uint32(b[2:6]),
-		SegmentSize: binary.LittleEndian.Uint32(b[6:10]),
-		TotalLength: binary.LittleEndian.Uint64(b[10:18]),
-		Root:        make([]byte, digestSize),
-	}
-	copy(d.Root, b[descriptorFixedLen:])
-	return d, nil
 }
 
 // GroupID derives a stable identifier for the segmented message from the descriptor.

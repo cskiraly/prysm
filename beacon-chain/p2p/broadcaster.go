@@ -148,12 +148,12 @@ func (s *Service) BroadcastSegments(ctx context.Context, segs []*segments.Segmen
 
 	var batch pubsub.MessageBatch
 	for _, seg := range segs {
-		enc, err := seg.Marshal()
+		pb, err := seg.ToProto()
 		if err != nil {
 			tracing.AnnotateError(span, err)
-			return errors.Wrap(err, "could not marshal payload segment")
+			return errors.Wrap(err, "could not convert payload segment to its wire type")
 		}
-		if err := s.batchObject(ctx, &batch, &ethpb.ExecutionPayloadSegment{Segment: enc}, topic); err != nil {
+		if err := s.batchObject(ctx, &batch, pb, topic); err != nil {
 			tracing.AnnotateError(span, err)
 			return errors.Wrap(err, "could not batch payload segment")
 		}

@@ -175,23 +175,22 @@ func TestDescriptorValidate(t *testing.T) {
 	})
 }
 
-func TestDescriptorCanonicalRoundTrip(t *testing.T) {
+func TestDescriptorGroupID(t *testing.T) {
 	h, err := HasherByID(HashSHA256)
 	require.NoError(t, err)
 	d, _, err := Commit(msgOfLen(1000), 128, h)
 	require.NoError(t, err)
 
-	enc := d.MarshalCanonical()
-	got, err := UnmarshalCanonical(enc, h.Size())
-	require.NoError(t, err)
-	require.DeepEqual(t, d, got)
-
-	t.Run("short buffer rejected", func(t *testing.T) {
-		_, err := UnmarshalCanonical(enc[:len(enc)-1], h.Size())
-		require.ErrorIs(t, err, ErrDescriptorMismatch)
+	t.Run("canonical bytes have the fixed layout", func(t *testing.T) {
+		enc := d.MarshalCanonical()
+		require.Equal(t, descriptorFixedLen+h.Size(), len(enc))
+		require.Equal(t, Version, enc[0])
+		require.Equal(t, byte(h.ID()), enc[1])
 	})
 	t.Run("group id is stable and descriptor-bound", func(t *testing.T) {
-		require.DeepEqual(t, d.GroupID(h), got.GroupID(h))
+		same := *d
+		same.Root = bytes.Clone(d.Root)
+		require.DeepEqual(t, d.GroupID(h), same.GroupID(h))
 		other := *d
 		other.SegmentSize += 1
 		require.Equal(t, false, bytes.Equal(d.GroupID(h), other.GroupID(h)))

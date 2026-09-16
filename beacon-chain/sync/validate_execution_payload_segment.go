@@ -74,9 +74,9 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 		return pubsub.ValidationReject, errWrongMessage
 	}
 
-	// Malformed bytes are the peer's fault and provably invalid, so reject rather than
-	// ignore: this is what feeds gossipsub's invalid-message scoring.
-	seg, hasher, err := segments.UnmarshalSegmentMessage(pb.Segment)
+	// A message the wire type carries but the descriptor cannot hold is the peer's fault and
+	// provably invalid, so reject rather than ignore: this feeds gossipsub's invalid-message scoring.
+	seg, hasher, err := segments.FromProto(pb)
 	if err != nil {
 		tracing.AnnotateError(span, err)
 		return pubsub.ValidationReject, err

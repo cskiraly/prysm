@@ -294,16 +294,3 @@ func TestReassemblerHas(t *testing.T) {
 		require.Equal(t, false, failing.Has(groupID))
 	})
 }
-
-// TestMarshalBoundsData keeps MaxSegmentMessageSize honest: it is documented as the largest
-// buffer Marshal can produce, and the gossip ssz_max is derived from it.
-func TestMarshalBoundsData(t *testing.T) {
-	h, err := HasherByID(HashSHA256)
-	require.NoError(t, err)
-	msgs, err := BuildSegmentMessages(msgOfLen(128), 64, h)
-	require.NoError(t, err)
-	m := *msgs[0]
-	m.Data = make([]byte, MaxSegmentSize+1)
-	_, err = m.Marshal()
-	require.ErrorIs(t, err, ErrSegmentSize)
-}

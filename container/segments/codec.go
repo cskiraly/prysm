@@ -1,34 +1,30 @@
 package segments
 
 import (
-	"encoding/binary"
+	"bytes"
 	"errors"
 	"fmt"
-	"math/bits"
 
-	"github.com/OffchainLabs/prysm/v7/math"
+	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 )
 
-// Field widths for the segment wire format.
-const (
-	indexLen      = 4
-	proofCountLen = 1
-	dataLenLen    = 4
-)
+// MaxProofDepth is the deepest proof any valid descriptor can require, ceil(log2 MaxSegments),
+// and the bound on the wire type's proof list. TestMaxProofDepth pins the two together.
+const MaxProofDepth = 14
+
+// digestSize is the one digest width the wire type carries; every registered hasher produces it.
+const digestSize = 32
 
 var (
-	// ErrShortBuffer is returned when a buffer ends before a field is complete.
-	ErrShortBuffer = errors.New("buffer too short for segment message")
-	// ErrTrailingBytes is returned when a buffer has bytes left after decoding.
-	ErrTrailingBytes = errors.New("trailing bytes after segment message")
 	// ErrProofCount is returned for a proof element count beyond the tree depth limit.
 	ErrProofCount = errors.New("proof element count out of range")
+	// ErrWireField is returned when a wire field does not fit the descriptor's type.
+	ErrWireField = errors.New("wire field out of range")
 )
 
-// maxProofCount is the deepest proof any valid descriptor can require.
-var maxProofCount = bits.Len(uint(MaxSegments - 1))
-
-// SegmentMessage is the on-wire form of one segment of a segmented message.
+// SegmentMessage is one segment of a segmented message: the descriptor it belongs to, its
+// index, its Merkle proof and its bytes. On the wire it travels as ethpb.ExecutionPayloadSegment,
+// an SSZ container; ToProto and FromProto convert, and FromProto bounds every field.
 //
 // A Merkle proof only proves a segment belongs to Descriptor.Root, so something outside the
 // tree has to establish that Root is legitimate. Nothing here does, deliberately: the receiver
@@ -50,113 +46,86 @@ type SegmentMessage struct {
 	Data       []byte
 }
 
-// Marshal encodes the segment message.
-func (m *SegmentMessage) Marshal() ([]byte, error) {
-	if m.Descriptor == nil {
+// ToProto converts the message to its gossip wire type, refusing anything the wire cannot carry.
+func (m *SegmentMessage) ToProto() (*ethpb.ExecutionPayloadSegment, error) {
+	d := m.Descriptor
+	if d == nil {
 		return nil, fmt.Errorf("%w: nil descriptor", ErrDescriptorMismatch)
 	}
-	if len(m.Proof) > maxProofCount {
+	if len(m.Proof) > MaxProofDepth {
 		return nil, fmt.Errorf("%w: %d elements", ErrProofCount, len(m.Proof))
 	}
-	// Bound the data here, not only on decode, so MaxSegmentMessageSize really is the largest
-	// buffer this function can produce -- the gossip wire type's ssz_max is derived from it.
 	if len(m.Data) > MaxSegmentSize {
 		return nil, fmt.Errorf("%w: %d bytes", ErrSegmentSize, len(m.Data))
 	}
-	digestSize := len(m.Descriptor.Root)
-	for _, p := range m.Proof {
+	if len(d.Root) != digestSize {
+		return nil, fmt.Errorf("%w: root has %d bytes, want %d", ErrProofDigestSize, len(d.Root), digestSize)
+	}
+	proof := make([][]byte, len(m.Proof))
+	for i, p := range m.Proof {
 		if len(p) != digestSize {
 			return nil, fmt.Errorf("%w: %d bytes, want %d", ErrProofDigestSize, len(p), digestSize)
 		}
+		proof[i] = bytes.Clone(p)
 	}
-	desc := m.Descriptor.MarshalCanonical()
-	total := len(desc) + indexLen + proofCountLen + len(m.Proof)*digestSize +
-		dataLenLen + len(m.Data)
-	out := make([]byte, 0, total)
-	out = append(out, desc...)
-	out = binary.LittleEndian.AppendUint32(out, m.Index)
-	out = append(out, byte(len(m.Proof)))
-	for _, p := range m.Proof {
-		out = append(out, p...)
-	}
-	out = binary.LittleEndian.AppendUint32(out, uint32(len(m.Data)))
-	out = append(out, m.Data...)
-	return out, nil
+	return &ethpb.ExecutionPayloadSegment{
+		SegmentDescriptor: &ethpb.SegmentDescriptor{
+			Version:     uint32(d.Version),
+			HashId:      uint32(d.HashID),
+			Count:       d.Count,
+			SegmentSize: d.SegmentSize,
+			TotalLength: d.TotalLength,
+			Root:        bytes.Clone(d.Root),
+		},
+		Index: m.Index,
+		Proof: proof,
+		Data:  bytes.Clone(m.Data),
+	}, nil
 }
 
-// UnmarshalSegmentMessage decodes a segment message and returns the hasher it names.
+// FromProto converts a decoded wire message and returns the hasher its descriptor names.
 //
-// The descriptor is self-describing: byte 1 is the hash ID, which fixes the digest size and
-// therefore every subsequent field boundary. Decoding is strict — exact length, no trailing
-// bytes, every length bounded before allocation.
-func UnmarshalSegmentMessage(b []byte) (*SegmentMessage, Hasher, error) {
-	// Need version and hash ID before anything else can be sized.
-	if len(b) < 2 {
-		return nil, nil, fmt.Errorf("%w: %d bytes", ErrShortBuffer, len(b))
+// Strict: a field the descriptor's type cannot hold, an unknown hash id, a digest of the wrong
+// width, too many proof elements or oversized data are all rejected here, so a caller can hand
+// the result straight to Verify. SSZ already bounds the proof list and the data on decode; the
+// checks are repeated so a message built in-process is held to the same bounds.
+func FromProto(pb *ethpb.ExecutionPayloadSegment) (*SegmentMessage, Hasher, error) {
+	if pb == nil || pb.SegmentDescriptor == nil {
+		return nil, nil, fmt.Errorf("%w: nil descriptor", ErrDescriptorMismatch)
 	}
-	h, err := HasherByID(HashID(b[1]))
+	pd := pb.SegmentDescriptor
+	if pd.Version > 0xff || pd.HashId > 0xff {
+		return nil, nil, fmt.Errorf("%w: version %d, hash id %d", ErrWireField, pd.Version, pd.HashId)
+	}
+	h, err := HasherByID(HashID(pd.HashId))
 	if err != nil {
 		return nil, nil, err
 	}
-	digestSize := h.Size()
-
-	off := 0
-	descLen := descriptorFixedLen + digestSize
-	if len(b) < off+descLen {
-		return nil, nil, fmt.Errorf("%w: descriptor needs %d bytes", ErrShortBuffer, descLen)
+	if len(pd.Root) != h.Size() {
+		return nil, nil, fmt.Errorf("%w: root %d bytes, want %d", ErrDescriptorMismatch, len(pd.Root), h.Size())
 	}
-	d, err := UnmarshalCanonical(b[off:off+descLen], digestSize)
-	if err != nil {
-		return nil, nil, err
+	if len(pb.Proof) > MaxProofDepth {
+		return nil, nil, fmt.Errorf("%w: %d, max %d", ErrProofCount, len(pb.Proof), MaxProofDepth)
 	}
-	off += descLen
-
-	if len(b) < off+indexLen+proofCountLen {
-		return nil, nil, fmt.Errorf("%w: index and proof count", ErrShortBuffer)
+	if len(pb.Data) > MaxSegmentSize {
+		return nil, nil, fmt.Errorf("%w: %d bytes", ErrSegmentSize, len(pb.Data))
 	}
-	index := binary.LittleEndian.Uint32(b[off : off+indexLen])
-	off += indexLen
-	proofCount := int(b[off])
-	off += proofCountLen
-	if proofCount > maxProofCount {
-		return nil, nil, fmt.Errorf("%w: %d, max %d", ErrProofCount, proofCount, maxProofCount)
+	proof := make([][]byte, len(pb.Proof))
+	for i, p := range pb.Proof {
+		if len(p) != h.Size() {
+			return nil, nil, fmt.Errorf("%w: got %d, want %d", ErrProofDigestSize, len(p), h.Size())
+		}
+		proof[i] = bytes.Clone(p)
 	}
-
-	if len(b) < off+proofCount*digestSize {
-		return nil, nil, fmt.Errorf("%w: %d proof elements", ErrShortBuffer, proofCount)
+	d := &Descriptor{
+		Version:     uint8(pd.Version),
+		HashID:      HashID(pd.HashId),
+		Count:       pd.Count,
+		SegmentSize: pd.SegmentSize,
+		TotalLength: pd.TotalLength,
+		Root:        bytes.Clone(pd.Root),
 	}
-	proof := make([][]byte, proofCount)
-	for i := range proof {
-		proof[i] = make([]byte, digestSize)
-		copy(proof[i], b[off:off+digestSize])
-		off += digestSize
-	}
-
-	if len(b) < off+dataLenLen {
-		return nil, nil, fmt.Errorf("%w: data length", ErrShortBuffer)
-	}
-	rawDataLen := binary.LittleEndian.Uint32(b[off : off+dataLenLen])
-	off += dataLenLen
-	if rawDataLen > MaxSegmentSize {
-		return nil, nil, fmt.Errorf("%w: %d bytes", ErrSegmentSize, rawDataLen)
-	}
-	// Bounded above first, then converted through a checked cast: int is 32-bit on some
-	// platforms, so a raw uint32 cast could wrap negative.
-	dataLen, err := math.Int(uint64(rawDataLen))
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: data length %d: %w", ErrSegmentSize, rawDataLen, err)
-	}
-	if len(b) < off+dataLen {
-		return nil, nil, fmt.Errorf("%w: segment data", ErrShortBuffer)
-	}
-	data := make([]byte, dataLen)
-	copy(data, b[off:off+dataLen])
-	off += dataLen
-
-	if off != len(b) {
-		return nil, nil, fmt.Errorf("%w: %d bytes left", ErrTrailingBytes, len(b)-off)
-	}
-	return &SegmentMessage{Descriptor: d, Index: index, Proof: proof, Data: data}, h, nil
+	return &SegmentMessage{Descriptor: d, Index: pb.Index, Proof: proof, Data: bytes.Clone(pb.Data)}, h, nil
 }
 
 // Verify checks the descriptor, the segment length and the Merkle proof.
@@ -189,10 +158,3 @@ func BuildSegmentMessages(msg []byte, segmentSize int, h Hasher) ([]*SegmentMess
 	}
 	return out, nil
 }
-
-// MaxSegmentMessageSize is the largest buffer Marshal can produce, and therefore the
-// bound the gossip wire type must allow. Kept in sync with the ssz_max on
-// ethpb.ExecutionPayloadSegment by TestMaxSegmentMessageSize.
-const MaxSegmentMessageSize = descriptorFixedLen + 32 + // descriptor with a 32-byte root
-	indexLen + proofCountLen + 14*32 + // deepest proof: ceil(log2 MaxSegments) = 14
-	dataLenLen + MaxSegmentSize

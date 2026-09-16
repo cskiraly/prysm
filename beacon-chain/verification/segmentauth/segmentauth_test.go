@@ -117,9 +117,9 @@ func TestEndToEndWithReassembler(t *testing.T) {
 
 	var out []byte
 	for _, m := range built {
-		enc, err := m.Marshal()
+		pb, err := m.ToProto()
 		require.NoError(t, err)
-		decoded, hasher, err := segments.UnmarshalSegmentMessage(enc)
+		decoded, hasher, err := segments.FromProto(pb)
 		require.NoError(t, err)
 		got, err := r.Add(hasher, decoded)
 		require.NoError(t, err)

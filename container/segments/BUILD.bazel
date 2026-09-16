@@ -15,6 +15,7 @@ go_library(
     deps = [
         "//crypto/hash:go_default_library",
         "//math:go_default_library",
+        "//proto/prysm/v1alpha1:go_default_library",
     ],
 )
 
@@ -27,5 +28,8 @@ go_test(
         "segments_test.go",
     ],
     embed = [":go_default_library"],
-    deps = ["//testing/require:go_default_library"],
+    deps = [
+        "//proto/prysm/v1alpha1:go_default_library",
+        "//testing/require:go_default_library",
+    ],
 )

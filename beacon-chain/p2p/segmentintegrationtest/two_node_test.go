@@ -122,9 +122,9 @@ func wireSegments(t *testing.T, payload []byte, segmentSize int) []*ethpb.Execut
 
 	out := make([]*ethpb.ExecutionPayloadSegment, len(msgs))
 	for i, m := range msgs {
-		enc, err := m.Marshal()
+		pb, err := m.ToProto()
 		require.NoError(t, err)
-		out[i] = &ethpb.ExecutionPayloadSegment{Segment: enc}
+		out[i] = pb
 	}
 	return out
 }
@@ -220,10 +220,15 @@ func TestTwoNodeSegmentRejection(t *testing.T) {
 		segs := wireSegments(t, payload, segmentauth.DefaultSegmentSize)
 		require.Equal(t, true, len(segs) >= 3, "need several segments to corrupt one")
 
-		// Corrupt a segment's payload bytes in place, leaving its proof intact: the tree no
-		// longer reproduces the root, which is what a receiver must catch.
-		corrupted := &ethpb.ExecutionPayloadSegment{Segment: bytes.Clone(segs[1].Segment)}
-		corrupted.Segment[len(corrupted.Segment)-1] ^= 0xff
+		// Corrupt a segment's payload bytes, leaving its proof intact: the tree no longer
+		// reproduces the root, which is what a receiver must catch.
+		corrupted := &ethpb.ExecutionPayloadSegment{
+			SegmentDescriptor: segs[1].SegmentDescriptor,
+			Index:             segs[1].Index,
+			Proof:             segs[1].Proof,
+			Data:              bytes.Clone(segs[1].Data),
+		}
+		corrupted.Data[len(corrupted.Data)-1] ^= 0xff
 
 		publishAll(t, topic1, []*ethpb.ExecutionPayloadSegment{segs[0], corrupted})
 
@@ -274,7 +279,7 @@ func feed(t *testing.T, r *segments.Reassembler, data []byte) []byte {
 	t.Helper()
 	pb := &ethpb.ExecutionPayloadSegment{}
 	require.NoError(t, encoder.SszNetworkEncoder{}.DecodeGossip(data, pb))
-	m, h, err := segments.UnmarshalSegmentMessage(pb.Segment)
+	m, h, err := segments.FromProto(pb)
 	require.NoError(t, err)
 	out, err := r.Add(h, m)
 	require.NoError(t, err)
@@ -286,7 +291,7 @@ func feedAllowingError(t *testing.T, r *segments.Reassembler, data []byte, rejec
 	t.Helper()
 	pb := &ethpb.ExecutionPayloadSegment{}
 	require.NoError(t, encoder.SszNetworkEncoder{}.DecodeGossip(data, pb))
-	m, h, err := segments.UnmarshalSegmentMessage(pb.Segment)
+	m, h, err := segments.FromProto(pb)
 	if err != nil {
 		*rejected++
 		return nil

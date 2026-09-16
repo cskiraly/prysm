@@ -18,33 +18,50 @@ func TestSegmentTopicIsMapped(t *testing.T) {
 	require.Equal(t, true, ok, "segment topic maps to the wrong type")
 }
 
-// TestSegmentSszMaxCoversCodec is a drift guard. The ssz_max on
-// ethpb.ExecutionPayloadSegment is a literal in the .proto file, while the codec's real
-// bound lives in container/segments. If either moves without the other, a maximum-size
-// segment stops marshalling and the failure would otherwise only show up on a live
-// network carrying a worst-case message.
-func TestSegmentSszMaxCoversCodec(t *testing.T) {
+// TestSegmentWireBounds checks the wire type against the container's limits: a segment at
+// MaxSegmentSize with a proof of MaxProofDepth elements marshals, one byte or one element
+// more does not. The bounds are literals in the .proto file, so this is the drift guard.
+func TestSegmentWireBounds(t *testing.T) {
+	full := func() *ethpb.ExecutionPayloadSegment {
+		proof := make([][]byte, segments.MaxProofDepth)
+		for i := range proof {
+			proof[i] = make([]byte, 32)
+		}
+		return &ethpb.ExecutionPayloadSegment{
+			SegmentDescriptor: &ethpb.SegmentDescriptor{Root: make([]byte, 32)},
+			Proof:             proof,
+			Data:              make([]byte, segments.MaxSegmentSize),
+		}
+	}
+
 	t.Run("maximum size segment marshals", func(t *testing.T) {
-		m := &ethpb.ExecutionPayloadSegment{Segment: make([]byte, segments.MaxSegmentMessageSize)}
-		enc, err := m.MarshalSSZ()
+		enc, err := full().MarshalSSZ()
 		require.NoError(t, err)
-		require.Equal(t, true, len(enc) >= segments.MaxSegmentMessageSize)
+		require.Equal(t, true, len(enc) > segments.MaxSegmentSize)
 	})
 
-	t.Run("one byte over the bound is rejected", func(t *testing.T) {
-		// Confirms the bound is actually enforced, so the test above is meaningful.
-		m := &ethpb.ExecutionPayloadSegment{Segment: make([]byte, segments.MaxSegmentMessageSize+1)}
+	t.Run("one byte of data over the bound is rejected", func(t *testing.T) {
+		m := full()
+		m.Data = append(m.Data, 0)
 		_, err := m.MarshalSSZ()
-		require.Equal(t, true, err != nil, "ssz_max is larger than the codec bound")
+		require.Equal(t, true, err != nil, "ssz_max on data is larger than MaxSegmentSize")
+	})
+
+	t.Run("one proof element over the bound is rejected", func(t *testing.T) {
+		m := full()
+		m.Proof = append(m.Proof, make([]byte, 32))
+		_, err := m.MarshalSSZ()
+		require.Equal(t, true, err != nil, "ssz_max on proof is larger than MaxProofDepth")
 	})
 
 	t.Run("round trips", func(t *testing.T) {
-		want := []byte("a segment blob")
-		enc, err := (&ethpb.ExecutionPayloadSegment{Segment: want}).MarshalSSZ()
+		want := full()
+		enc, err := want.MarshalSSZ()
 		require.NoError(t, err)
 		got := &ethpb.ExecutionPayloadSegment{}
 		require.NoError(t, got.UnmarshalSSZ(enc))
-		require.DeepEqual(t, want, got.Segment)
+		require.Equal(t, segments.MaxProofDepth, len(got.Proof))
+		require.DeepEqual(t, want.Data, got.Data)
 	})
 }
 

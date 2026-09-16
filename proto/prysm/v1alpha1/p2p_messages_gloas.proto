@@ -38,17 +38,32 @@ message ExecutionPayloadEnvelopesByRangeRequest {
 // ExecutionPayloadSegment carries one segment of a segmented execution payload
 // envelope.
 //
-// Prysm-local: this is NOT a spec type, unlike the RPC messages above. The segment
-// field is an opaque blob in the container/segments wire format, which carries its
-// own version byte and descriptor. SSZ only frames it, so a segment can travel
-// through the normal gossip pipeline (which decodes into a proto message) while the
-// real format stays free to change without touching consensus types.
-//
-// ssz_max is the largest message container/segments can produce:
-//   descriptor 50 + index 4 + proof count 1 + proof 448 (32 * ceil(log2 MaxSegments))
-//   + data length 4 + data 1048576 (MaxSegmentSize) = 1049083
-// segments.MaxSegmentMessageSize holds the same value and is asserted against this
-// bound by a test, so the two cannot drift apart silently.
+// Prysm-local: this is NOT a spec type, unlike the RPC messages above; the feature it
+// belongs to is flag-gated and the type changes with it. SSZ is the wire codec.
+// container/segments converts to and from this type and bounds every field on the way
+// in, so a decoded message that converts can be verified against its descriptor.
 message ExecutionPayloadSegment {
-  bytes segment = 1 [(ethereum.eth.ext.ssz_max) = "1049083"];
+  SegmentDescriptor segment_descriptor = 1;
+  uint32 index = 2;
+  // Sibling digests from the leaf to the root, at most ceil(log2 MaxSegments) = 14
+  // (segments.MaxProofDepth).
+  repeated bytes proof = 3 [
+    (ethereum.eth.ext.ssz_size) = "?,32",
+    (ethereum.eth.ext.ssz_max) = "14"
+  ];
+  // At most segments.MaxSegmentSize bytes.
+  bytes data = 4 [(ethereum.eth.ext.ssz_max) = "1048576"];
+}
+
+// SegmentDescriptor is the authenticated header of a segmented message: every field that
+// affects reassembly, so that pinning the first descriptor seen for a group is enough to
+// reject peers that later contradict it. version and hash_id are bytes in
+// container/segments and are rejected above 255.
+message SegmentDescriptor {
+  uint32 version = 1;
+  uint32 hash_id = 2;
+  uint32 count = 3;
+  uint32 segment_size = 4;
+  uint64 total_length = 5;
+  bytes root = 6 [(ethereum.eth.ext.ssz_size) = "32"];
 }
