@@ -10,18 +10,16 @@ import (
 //
 // Stock forwarding pushes every message to every mesh peer, so a node receives the payload
 // several times over and the repeats, not the first copies, bound completion. On the segment
-// topic each node instead pushes a segment to at most phaseDegree mesh peers not known to hold
-// it and announces it to the rest, and pulls are disciplined: one outstanding request per
-// segment, a short move-on window, a remembered list of announcers to fall back to, and a park
-// for announcers that do not serve. Measured on a 500-node simulated mesh with 1 MiB payloads
-// this cut median completion from 4.9 s to 0.73 s and received bytes from 4.4 to 1.4 payload
-// copies per node. Every other topic keeps stock forwarding and stock requests; the one
-// router-wide knob touched is the IHAVE limit, see MaxIHaveMessages.
+// topic each node instead pushes a segment to a few mesh peers not known to hold it, as many
+// as the payload's size warrants (see PushWidth), and announces it to the rest, and pulls are
+// disciplined: one outstanding request per segment, a short move-on window, a remembered list
+// of announcers to fall back to, and a park for announcers that do not serve. Measured on a
+// 500-node simulated mesh with 1 MiB payloads this cut median completion from 4.9 s to 0.73 s
+// and received bytes from 4.4 to 1.4 payload copies per node. Every other topic keeps stock
+// forwarding and stock requests; the one router-wide knob touched is the IHAVE limit, see
+// MaxIHaveMessages.
 
 const (
-	// phaseDegree is how many mesh peers a segment is pushed to before the rest are announced
-	// instead.
-	phaseDegree = 2
 	// iwantWindow is how long one outstanding request for a segment blocks another; a round
 	// trip plus the segment's transmission at home-link rates.
 	iwantWindow = 200 * time.Millisecond
@@ -47,7 +45,7 @@ const MaxIHaveMessages = 1024
 func Options(topicName string) []pubsub.Option {
 	isSegmentTopic := TopicMatcher(topicName)
 	return []pubsub.Option{
-		pubsub.WithPhaseForwarding(isSegmentTopic, phaseDegree),
+		pubsub.WithPhaseForwardingByMessage(isSegmentTopic, PushWidthOf),
 		pubsub.WithIWantDiscipline(isSegmentTopic, iwantWindow),
 		pubsub.WithIHaveCommitmentPark(parkBreaks, promiseDeadline, parkTTL),
 		pubsub.WithOfferTable(),

@@ -70,12 +70,7 @@ type Claim struct {
 // decoded and whose content id is contentID, or contentID alone when the body is not a
 // well-formed ExecutionPayloadSegment.
 func MessageID(decoded []byte, contentID string) string {
-	if len(decoded) < sszFixedLen || len(contentID) != contentIDLen {
-		return contentID
-	}
-	// The first variable-length field's offset word must point just past the fixed part;
-	// anything else is not this container, whatever the length.
-	if binary.LittleEndian.Uint32(decoded[sszProofAt:sszProofAt+4]) != sszFixedLen {
+	if !isSegmentBody(decoded) || len(contentID) != contentIDLen {
 		return contentID
 	}
 	id := make([]byte, 0, MessageIDLen)
@@ -83,6 +78,14 @@ func MessageID(decoded []byte, contentID string) string {
 	id = append(id, decoded[sszIndexAt:sszIndexAt+4]...)
 	id = append(id, contentID...)
 	return string(id)
+}
+
+// isSegmentBody reports whether an SSZ body has the shape of an ExecutionPayloadSegment: long
+// enough for the fixed part, with the first variable-length field's offset word pointing just
+// past it. Anything else is not this container, whatever its length.
+func isSegmentBody(decoded []byte) bool {
+	return len(decoded) >= sszFixedLen &&
+		binary.LittleEndian.Uint32(decoded[sszProofAt:sszProofAt+4]) == sszFixedLen
 }
 
 // ParseMessageID recovers the claim from a structured segment message id. The second result
