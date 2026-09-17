@@ -66,9 +66,11 @@ Found by the reviews of this series and left open deliberately, with where each 
    encoding or shape are not the production defaults, or whose total length exceeds the envelope
    maximum. The real fix is the bid commitment.
 7. **The message id's width is a choice** (this branch). Control traffic scales with the id: the
-   study's harness carried a 101-byte id, this branch a 56-byte one (root, index, content id), and
-   the 56-byte id has not been measured. The control-traffic panels of the post compare arms whose
-   ids differed in width; see the notes.
+   study's harness carried a 101-byte id, this branch a 56-byte one (root, index, content id).
+   Measured through the study's harness at 500 nodes and 1 MiB, ten seeds: the 56-byte id costs
+   about 119 KB of control per node on the plain group and 129 KB on the coded one, against 56 KB
+   at Prysm's 20-byte id and 192 KB at the harness's 101 bytes, so the post's control panels
+   overstate this branch by about a factor of 1.6; completion moves by two percent or less.
 8. **The Reed-Solomon code is the table implementation** (this branch; performance). Correct and
    dependency-free, one to two orders of magnitude slower than a SIMD library; the benchmarks in
    `container/segments` say what it costs at 1 MiB. Switch to klauspost/reedsolomon before any
@@ -76,11 +78,6 @@ Found by the reviews of this series and left open deliberately, with where each 
 9. **Envelopes above 2 MiB of SSZ go uncoded** (this branch). The code has 256 points and the
    group uses two per 16 KiB of envelope, so a larger envelope is published as a plain compressed
    group. A wider field or a larger segment size at that scale is a design decision, not made here.
-10. **Tiers 2 and 3 have unit and two-node coverage but no harness equivalence run** (this branch).
-    The tier 1 policy was run through the study's harness against the research arm (below). The
-    push width by size, the coded group and stop-pull as built here have not been; the study's
-    arms for them exist and the run is owed before any claim that this code reproduces the post.
-
 Smaller, also open: the request gate's `Replay` deadlocks if called from inside `Allow` or
 `Committed` (fork; the pull gate installs no deferral); when every announcer of a segment is
 temporarily ineligible the retry chain ends until a new announcement arrives (fork; latency only,
@@ -107,8 +104,13 @@ Every commit of this series builds and passes its tests on its own, under `go te
 Bazel. The tier 1 policy was run through the study's own harness against the research fork it was
 extracted from: at 500 nodes and 1 MiB, six seeds at 32 KiB and at 16 KiB, medians within 2
 percent and received bytes within 1 percent of the research arm. The records are in the study's
-notes. Tiers 2 and 3 are covered by unit tests and by the two-node exchanges over a simulated link;
-their harness run is open item 10.
+notes. Tiers 2 and 3 were run the same way, this branch's publisher, option bundle and pull gate
+inside the harness against the study's size-adaptive and compress-first coded arms: at 500 nodes
+and 1 MiB, ten seeds, with the ids at the harness's width the paired medians are within 3 percent
+on completion, within 2 percent on received data for tier 2 and within 2.2 percent for tier 3
+(the harness's own coded arm on this fork sits 3 percent above the research rows, so the
+difference is the fork's fix commits, not this code), and within 5 percent on control. With this
+branch's 56-byte id the timing is the same and control is a third lower; see open item 7.
 
 ## Pointers
 
