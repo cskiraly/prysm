@@ -57,6 +57,8 @@ case $arm in
   bare)      TESTP="TestQ6RealisticMesh$";   EXTRA="SEGMENT_ARMS=segmented SEGMENT_PUBLISH_MODE=fcfs SEGMENT_STRUCTURED_IDS=1"; [ -n "$FC" ] && EXTRA="$EXTRA SEGMENT_SIZE_BYTES=$((P/32))" ;;
   # Q84 ladder (2026-09-10): the first post's Table 2 rows as curves against size. bare = + segmentation; lad_batch = + batch publishing; lad_phase = + phase forwarding r=2 (no discipline); atuned = + disciplined pulls.
   lad_batch) TESTP="TestQ6RealisticMesh$";   EXTRA="SEGMENT_ARMS=segmented SEGMENT_STRUCTURED_IDS=1"; [ -n "$FC" ] && EXTRA="$EXTRA SEGMENT_SIZE_BYTES=$((P/32))" ;;
+  # 2026-09-16 (author): the batch-publishing rung at 16 KiB segments, so the closing figure's tier 1 sits on the post's recommended segment size (Q104).
+  lad_batch16) TESTP="TestQ6RealisticMesh$"; EXTRA="SEGMENT_ARMS=segmented SEGMENT_STRUCTURED_IDS=1 SEGMENT_SIZE_BYTES=16384" ;;
   lad_phase) TESTP="TestQ6RealisticMesh$";   EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_STRUCTURED_IDS=1"; [ -n "$FC" ] && EXTRA="$EXTRA SEGMENT_SIZE_BYTES=$((P/32))" ;;
   # Q89 (2026-09-11): the split without the phase: push r=2, announce the rest, no IDONTWANT-driven decay of r (WithPhaseFixedBudget).
   lad_split) TESTP="TestQ6RealisticMesh$";   EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_PHASE_FIXED_BUDGET=1 SEGMENT_STRUCTURED_IDS=1"; [ -n "$FC" ] && EXTRA="$EXTRA SEGMENT_SIZE_BYTES=$((P/32))" ;;
@@ -110,6 +112,12 @@ case $arm in
   # Q85 (2026-09-11): A with size-adaptive rules, as a rule not a pick: 16 KiB segments everywhere; push r = 4 up to 256 KiB, 3 up to 1 MiB, 2 above;
   # the request discipline (move-on, offer table, park) only from 512 KiB up — below, stock behaviour (every announcer asked) is faster and capture-proof.
   aadapt)    TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; AD="$FINAL"; [ $P -lt 524288 ] && AD=""; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 $AD" ;;
+  # 2026-09-16 (author): the one-regime rule — aadapt's push schedule (r = 4 to 256 KiB, 3 to 1 MiB, 2 above) with the
+  # request discipline (move-on, offer table, park) at EVERY size; 16 KiB segments. Prices the discipline below 512 KiB.
+  aadaptd)   TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 $FINAL" ;;
+  # 2026-09-16 (author): aadaptd with the harness's structured ids (101-byte hybrid ids, as the ladder rungs and the coded arms run),
+  # to test whether id width explains the control-byte gap between the tiers (Q106). Same policy, same sizes, same seeds.
+  aadaptds)  TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 SEGMENT_STRUCTURED_IDS=1 $FINAL" ;;
   # Q85/Q86 (2026-09-11): the refined size-adaptive rule — 16 KiB units everywhere; r = 4 up to 256 KiB, 3 at 384 KiB, 2 from 512 KiB; the discipline and tail hedging (k=3, h=4) from 512 KiB up.
   # E4/E5 (2026-09-13): the oracle regime rule — every node picks r and whether it runs the discipline, offer table, park and tail hedge from R = wire time on its own uplink / RTT
   # (thresholds reproduce aadapt2 on the 50 Mbps home uplink); 16 KiB units everywhere like aadapt2.
@@ -117,6 +125,9 @@ case $arm in
   # rules plus code (2026-09-16, closing figure's open question): aadapt's push schedule and discipline threshold with the
   # compress-first code over 16 KiB segments of the compressed bytes (K = P/16 KiB, parity = K, stop-pull), as acodedcf64.
   aadaptcf)  TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; AD="$FINAL"; [ $P -lt 524288 ] && AD=""; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$((P/16384)) SEGMENT_PARITY=$((P/16384)) SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $AD" ;;
+  # 2026-09-16 (author): tier 3 with the discipline at EVERY size — aadaptcf's push schedule and compress-first code with $FINAL everywhere (Q105).
+  # Identical to aadaptcf from 512 KiB up, so only 128 / 256 / 384 KiB need cells.
+  aadaptcfd) TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$((P/16384)) SEGMENT_PARITY=$((P/16384)) SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $FINAL" ;;
   aadapt2)   TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 393216 ] && AR=3; [ $P -le 262144 ] && AR=4; AD="$FINAL SEGMENT_TAIL_HEDGE_K=3 SEGMENT_TAIL_H=4"; [ $P -lt 524288 ] && AD=""; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 $AD" ;;
   # E1 composed arm (2026-09-13, hedge-and-adaptivity plan §5): aadapt2 unchanged from 512 KiB up; below it the discipline and a
   # fractional tail hedge h = max(1, K/8) at k = 3 (E1: the gain is flat from h/K = 1/8 up and the bytes climb past it) — acomp keeps

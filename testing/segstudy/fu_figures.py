@@ -33,13 +33,13 @@ WIRE = {"p128k": 93953, "p256k": 188170, "p384k": 282151, "p512k": 375363, "p640
 COPIES_LABEL = "copies of the compressed payload received per node"
 
 ARMS = {  # arm -> (label, color, marker)
-    "atuned":    ("A tuned: phase r=2, move-on/ban, offer table", "#1f77b4", "P"),
-    "acoded":    ("A coded 32+32 + stop-pull", "#d62728", "^"),
-    "acodedcf":  ("A coded 32+32 + stop-pull, payload compressed before coding (32 segments of the compressed bytes)", "#ff7f0e", "v"),
+    "atuned":    ("A-tuned: phase r=2, move-on/ban, offer table", "#1f77b4", "P"),
+    "acoded":    ("A coded K+K + stop-pull", "#d62728", "^"),
+    "acodedcf":  ("A coded K+K + stop-pull, payload compressed before coding (K segments of the compressed bytes)", "#ff7f0e", "v"),
     "aplain400": ("A, plain 400 ms discipline (control)", "#7f7f7f", "P"),
     "whole":     ("whole message, one-outstanding IWANT (200 ms + 200 ms/MiB)", "#777777", "o"),
     "wholend":   ("whole message, stock gossipsub", "#111111", "o"),
-    "wholeot":   ("whole message, A tuned's request policy (offer table, park; scaled window)", "#333333", "o"),
+    "wholeot":   ("whole message, A-tuned's request policy (offer table, park; scaled window)", "#333333", "o"),
     "bare":      ("segments on stock gossipsub: full-mesh push, sequential publish, no discipline", "#8c564b", "v"),
     "lad_batch": ("+ batch publishing (full-mesh push, no discipline)", "#e377c2", "v"),
     "lad_phase": ("+ phase forwarding r=2 (no discipline)", "#bcbd22", "v"),
@@ -49,21 +49,25 @@ ARMS = {  # arm -> (label, color, marker)
     "btuned":    ("B before the 2026-09-08 fixes (raw wire, over-counted strikes)", "#b39ddb", "d"),
     "aphaseot":  ("A: phase r=2, 400 ms one-outstanding discipline, offer table", "#4c72b0", "P"),
     "ahedge":    ("A: phase r=2, hedged second ask at 200 ms, offer table", "#6baed6", "P"),
-    "am_k64":    ("A tuned, 16 KiB segments", "#0b3d91", "s"),
-    "am_k8k":    ("A tuned, 8 KiB segments", "#001f5b", "D"),
+    "am_k64":    ("A-tuned, 16 KiB segments", "#0b3d91", "s"),
+    "am_k8k":    ("A-tuned, 8 KiB segments", "#001f5b", "D"),
     "aadapt":    ("A, size-adaptive rules (16 KiB; r = 4/3/2 by size; discipline from 512 KiB)", "#d62728", "*"),
     "aadapt2":   ("A, refined rule (16 KiB; r = 4 to 256 KiB, 3 at 384, 2 from 512; discipline + tail hedge k=3 h=4 from 512 KiB)", "#7b0000", "X"),
-    "am_r1":     ("A tuned, push r=1", "#4c72b0", "P"),
-    "am_r3":     ("A tuned, push r=3", "#4c72b0", "P"),
-    "am_r4":     ("A tuned, push r=4", "#4c72b0", "P"),
+    "am_r1":     ("A-tuned, push r=1", "#4c72b0", "P"),
+    "am_r3":     ("A-tuned, push r=3", "#4c72b0", "P"),
+    "am_r4":     ("A-tuned, push r=4", "#4c72b0", "P"),
     "bcoded":    ("B before the fixes + RS 32+32", "#d1c4e9", "d"),
     "c64":       ("C, 64 topics (16 KiB)", "#2ca02c", "s"),
     "c32":       ("C, 32 topics (32 KiB)", "#2ca02c", "s"),
-    "atail_k3h4": ("A tuned + tail hedge (k = 3, h = 4)", "#7b0000", "X"),
+    "atail_k3h4": ("A-tuned + tail hedge (k = 3, h = 4)", "#7b0000", "X"),
     "lad_split": ("segments on stock gossipsub + batch + announce instead of push (r = 2, no decay)", "#17becf", "d"),
     "c32rs":     ("C + RS 32+32 (64 topics)", "#17becf", "s"),
     "ccust":     ("C + RS, partial subscription S = K + R of N (R = 8 at 1 MiB)", "#ff7f0e", "P"),
     "ccust0":    ("C + RS, partial subscription S = K (R = 0)", "#e6550d", "P"),
+    "aadaptcf":  ("A, size-adaptive rules + compress-first code (16 KiB; K = P / 16 KiB, parity K; stop-pull)", "#7b0000", "p"),
+    "aadaptd":   ("A, size-adaptive push (r = 4/3/2 by size) with the discipline at every size, 16 KiB (Q103)", "#006d2c", "h"),
+    "aadaptds":  ("A, size-adaptive push (r = 4/3/2 by size) with the discipline at every size, 16 KiB, the harness's 101-byte structured ids (Q106)", "#006d2c", "h"),
+    "lad_batch16": ("+ batch publishing at 16 KiB segments (full-mesh push, no discipline; Q104)", "#e377c2", "v"),
 }
 SIX = ["atuned", "acoded", "bfixed", "c32", "c32rs", "ccust"]  # bfixed replaced btuned as B's reference (Q74 addendum 2026-09-08)
 
@@ -137,6 +141,11 @@ def censored(r):
 
 def style(ax, xlab, ylab, title):
     ax.set_xlabel(xlab)
+    # A long y label runs past its panel into the neighbour's title on the four-panel figures
+    # (author, 2026-09-17); wrap it onto two or three lines instead.
+    if len(ylab) > 32 and "\n" not in ylab:
+        import textwrap
+        ylab = "\n".join(textwrap.wrap(ylab, 32))
     ax.set_ylabel(ylab)
     ax.set_title(title, fontsize=9)
     ax.grid(True, which="both", alpha=0.25)
@@ -230,7 +239,7 @@ def figure_a():
     lab = {
         "aplain": "segmented, full push, no discipline", "apull_nd": "pull-only, no discipline", "apull": "pull-only, disc.",
         "aphase_nd": "phase r=2, no discipline", "aphase": "phase r=2, 400 ms disc.", "aphase_ot": "+ offer table",
-        "moveban_ot": "move-on/ban + offer table (A tuned)", "aphase_r1": "r=1", "aphase_r3": "r=3", "aphase_r4": "r=4",
+        "moveban_ot": "move-on/ban + offer table (A-tuned)", "aphase_r1": "r=1", "aphase_r3": "r=3", "aphase_r4": "r=4",
         "codedphase_nd": "coded, no discipline", "codedphase_nosp": "coded+phase, no stop-pull",
         "codedphase": "coded+phase+stop-pull", "codedphase_ot": "coded + offer table (A coded)", "codedpull": "coded pull-only",
         "fullpush_d4": "full push D=4", "fullpush_d6": "full push D=6", "meshless": "meshless", "aphasedelay": "source delay",
@@ -283,7 +292,7 @@ def figure_amap():
         "aplain400":    ("phase r=2, 400 ms discipline", "#1f77b4", "P"),
         "aphaseot":     ("+ offer table", "#1f77b4", "P"),
         "am_disc200":   ("200 ms move-on + offer table", "#1f77b4", "P"),
-        "atuned":       ("+ park k=1 (A tuned)", "#1f77b4", "P"),
+        "atuned":       ("+ park k=1 (A-tuned)", "#1f77b4", "P"),
         "ahedge":       ("hedged ask + offer table", "#1f77b4", "P"),
         "am_r0":        ("pull-only, tuned rules", "#1f77b4", "P"),
         "am_r1":        ("r=1", "#1f77b4", "P"),
@@ -535,8 +544,8 @@ def figure_f():
 def figure_f_slide():
     """The talk's copy of Figure 7: one panel, short labels, legend below the plot."""
     short = {"wholend": "whole message, stock gossipsub", "whole": "whole message, one-outstanding IWANT",
-             "wholeot": "whole message, A tuned's request policy", "bare": "segments on stock gossipsub, no rules",
-             "atuned": "A tuned", "acoded": "A coded 32+32", "bfixed": "B tuned", "c64": "C, 64 topics", "c32": "C, 32 topics",
+             "wholeot": "whole message, A-tuned's request policy", "bare": "segments on stock gossipsub, no rules",
+             "atuned": "A-tuned", "acoded": "A coded 32+32", "bfixed": "B tuned", "c64": "C, 64 topics", "c32": "C, 32 topics",
              "c32rs": "C + RS 32+32", "ccust": "C + RS, partial subscription"}
     fig, ax1 = plt.subplots(1, 1, figsize=(7.2, 6.4))
     keys = [(kib, dict(pay=pay)) for pay, kib in PAYS]
@@ -643,7 +652,7 @@ def ladder_panels(steps, colors, title, fname, nsize=500, dashed=(), ymax=None):
 
 
 def figure_ladder(nsize=500):
-    """Figure 2: the six rungs, whole message to A tuned, against payload size."""
+    """Figure 2: the six rungs, whole message to A-tuned, against payload size."""
     tag = "Figure 2 — " if nsize == 500 else ""
     ladder_panels(LADDER_STEPS, LADDER_COLORS, f"{tag}the ladder against payload size, {nsize} nodes",
                   "fu_ladder.png" if nsize == 500 else f"fu_ladder_n{nsize}.png", nsize)
@@ -654,41 +663,56 @@ def figure_ladder_n1000():
 
 
 def figure_discipline():
-    """Part 1's Figure 3 (section 2.2, reorganised 2026-09-13): the phase rung and the disciplined pull that makes A tuned."""
+    """Part 1's Figure 3 (section 2.2, reorganised 2026-09-13): the phase rung and the disciplined pull that makes A-tuned."""
     ladder_panels([("lad_phase", "the phase (Figure 2's last rung)"),
-                   ("atuned", "+ disciplined pulls (one request per id, offer table, park) = A tuned")],
+                   ("atuned", "+ disciplined pulls (one request per id, offer table, park) = A-tuned")],
                   ["#bcbd22", "#1f77b4"], "Figure 3 — disciplined pulls against payload size, 500 nodes", "fu_discipline.png")
 
 
 def figure_branches():
-    """Part 1's Figure 5 (section 4): the discipline (A tuned) and the code built on it."""
+    """Part 1's Figure 5 (section 4): the discipline (A-tuned) and the code built on it."""
     ladder_panels([("lad_phase", "the phase (Figure 2's last rung)"),
-                   ("atuned", "+ disciplined pulls (one request per id, offer table, park) = A tuned"),
-                   ("acoded", "A tuned + erasure code 32+32 with stop-pull"),
+                   ("atuned", "+ disciplined pulls (one request per id, offer table, park) = A-tuned"),
+                   ("acoded", "A-tuned + erasure code K+K with stop-pull"),
                    ("acodedcf", "the same code over the compressed payload (compress first)")],
                   ["#bcbd22", "#1f77b4", "#ff7f0e", "#d62728"], "Figure 5 — the code against payload size, 500 nodes", "fu_branches.png", dashed=("acodedcf",))
 
 
 def figure_closing():
-    """Part 1's Figure 9 (the closing, 2026-09-16; replaces the two-line size-rules figure): Figure 2's
-    axes with where the ladder ends: whole message, A tuned at 32 and 16 KiB, the rules that follow the
-    payload size, and coded A cut first and compress first. The latency panels are capped just above
-    the budget, so whole message leaves the figure where it leaves the budget."""
-    ladder_panels([LADDER_STEPS[0],
-                   ("atuned", "A tuned (32 KiB, r = 2, the discipline)"),
-                   ("am_k64", "A tuned at 16 KiB"),
-                   ("aadapt", "rules that follow the size: 16 KiB; push r = 4 to 256 KiB, 3 to 1 MiB, 2 above; discipline from 512 KiB"),
-                   ("acoded", "A coded 32+32 + stop-pull (cut first)"),
-                   ("acodedcf", "the same code over the compressed payload (compress first)")],
-                  [LADDER_COLORS[0], "#1f77b4", "#0b3d91", "#2ca02c", "#d62728", "#ff7f0e"],
-                  "Figure 9 — where the ladder ends, 500 nodes", "fu_closing.png", dashed=("acodedcf",), ymax=3.6)
+    """Part 1's Figure 9 (the closing; rebuilt around the closing's three tiers on 2026-09-16 afternoon,
+    author's decision): Figure 2's axes with one line per tier plus two references. Whole message; tier 1 =
+    segmentation with batch publishing; A-tuned at 16 KiB as the byte floor; tier 2 = size-adaptive A (the
+    rules that follow the payload size); the compress-first code at 32 KiB, dashed, as the neighbour tier 3
+    is judged against; tier 3 = size-adaptive A over the compress-first code (Q99). A-tuned at 32 KiB and
+    the cut-first code left the figure (Figures 5 and 7 carry them). The latency panels are capped just
+    above the budget, so whole message leaves the figure where it leaves the budget."""
+    # The two references are dashed and the legend names the tiers (author, 2026-09-16 evening).
+    # Tier 2 is drawn from aadaptds (Q106: aadaptd's rules with the harness's structured ids) since 2026-09-17, so every
+    # segmented line but the A-tuned reference carries the same 101-byte id; Q106 showed the id width alone moves the
+    # control panel 2.6–3.5× and the latency panels by at most five percent.
+    # Tier 3 under one regime (Q105): aadaptcfd is measured at 128–384 KiB; from 512 KiB up aadaptcf runs the same
+    # knobs (the runner sets $FINAL there too), so its records are borrowed under the merged name "tier3".
+    small = {"p128k", "p256k", "p384k"}
+    if not any(r["arm"] == "tier3" for r in recs):
+        merged = [dict(r, arm="tier3") for r in recs
+                  if (r["arm"] == "aadaptcfd" and r["pay"] in small) or (r["arm"] == "aadaptcf" and r["pay"] not in small)]
+        recs.extend(merged)
+        ARMS["tier3"] = ("tier 3 (merged: aadaptcfd below 512 KiB, aadaptcf above)", "#7b0000", "p")
+    ladder_panels([("wholend", "today: whole message, stock gossipsub"),
+                   ("lad_batch16", "tier 1: segmentation + batch publishing (16 KiB; full-mesh push)"),  # Q104; render only once its ten seeds are folded
+                   ("am_k64", "reference: A-tuned at 16 KiB (r = 2, the discipline)"),
+                   ("aadaptds", "tier 2: size-adaptive A (16 KiB; push r = 4 to 256 KiB, 3 to 1 MiB, 2 above; the discipline at every size)"),  # Q103 rules; drawn from Q106's equal-id arm so the three tiers share the 101-byte id (author, 2026-09-17)
+                   ("acodedcf", "reference: the compress-first code alone (A-tuned 32 KiB + RS K+K, stop-pull)"),
+                   ("tier3", "tier 3: size-adaptive A + the compress-first code (16 KiB; K = P / 16 KiB, parity K; stop-pull; the discipline at every size)")],
+                  [LADDER_COLORS[0], LADDER_COLORS[2], "#0b3d91", "#2ca02c", "#ff7f0e", "#7b0000"],
+                  "Figure 9 — where the ladder ends, 500 nodes", "fu_closing.png", dashed=("am_k64", "acodedcf"), ymax=3.6)
 
 
 def figure_units(lines=None, title="Figure 5 — the unit size, 500-node headline base (1 MiB)", fname="fu_units.png", ctrl_note="control (B's harness does not separate it)", dashed=(), units=(8, 16, 32, 64), pay="p1m"):
     """The post's Figure 8: the unit size swept at the base (500 nodes, 1 MiB, clean, home) for five
     configurations. Four panels: p50 and p99 on the left, data bytes and control bytes on the right."""
-    lines = lines or [("A tuned", ["am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
-             ("A tuned + tail hedge (k = 3, h = 4)", ["ath8", "ath16", "atail_k3h4", "ath64"], "#7b0000", "X"),
+    lines = lines or [("A-tuned", ["am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
+             ("A-tuned + tail hedge (k = 3, h = 4)", ["ath8", "ath16", "atail_k3h4", "ath64"], "#7b0000", "X"),
              ("A coded 32+32 + stop-pull", ["acoded128", "acoded64", "acoded", "acoded16"], "#d62728", "^"),
              ("B tuned", ["bfixed8", "bfixed16", "bfixed", "bfixed64"], "#9467bd", "D"),
              ("C + RS 32+32", ["c128rs", "c64rs", "c32rs", "c16rs"], "#17becf", "s")]
@@ -705,7 +729,7 @@ def figure_units(lines=None, title="Figure 5 — the unit size, 500-node headlin
                     continue
                 m_, l_, h_ = spread(vals)
                 xs.append(u); med.append(m_); lo.append(l_); hi.append(h_)
-            if xs:  # the hedge adds no control traffic, so its control line is dashed to keep A tuned's visible beneath it
+            if xs:  # the hedge adds no control traffic, so its control line is dashed to keep A-tuned's visible beneath it
                 curve(ax, xs, med, lo, hi, c, m, label if ax is ax1 else None, ls="--" if (label in dashed or (ax is ax4 and "hedge" in label)) else "-")
     from matplotlib.ticker import NullFormatter, NullLocator
     for ax in (ax1, ax2, ax3, ax4):
@@ -727,9 +751,9 @@ def figure_units(lines=None, title="Figure 5 — the unit size, 500-node headlin
 
 
 def figure_units_a():
-    """Part 1's Figure 7: the unit swept at the base for the A family only (A tuned, coded A)."""
-    figure_units(lines=[("A tuned", ["am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
-                        ("A coded 32+32 + stop-pull", ["acoded128", "acoded64", "acoded", "acoded16"], "#d62728", "^"),
+    """Part 1's Figure 7: the unit swept at the base for the A family only (A-tuned, coded A)."""
+    figure_units(lines=[("A-tuned", ["am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
+                        ("A coded K+K + stop-pull", ["acoded128", "acoded64", "acoded", "acoded16"], "#d62728", "^"),
                         ("the same code over the compressed payload (compress first)", ["acodedcf128", "acodedcf64", "acodedcf", "acodedcf16"], "#ff7f0e", "v")],
                  title="Figure 7 — the unit size for the A family, 500-node headline base (1 MiB)", fname="fu_units_a.png",
                  ctrl_note="control bytes", dashed=("the same code over the compressed payload (compress first)",))
@@ -740,7 +764,7 @@ def figure_units_a128():
     """Background only since 2026-09-16 (was Part 1's Figure 8): the segment size swept at 128 KiB, from 64 KiB
     (two segments) down to 2 KiB (sixty-four), for the same three lines as Figure 7. Arms are named by their shard count at 1 MiB; at 128 KiB the count is
     an eighth of the name."""
-    figure_units(lines=[("A tuned", ["am_k2k", "am_k4k", "am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
+    figure_units(lines=[("A-tuned", ["am_k2k", "am_k4k", "am_k8k", "am_k64", "atuned", "am_k16"], "#1f77b4", "P"),
                         ("A coded + stop-pull (K = the segment count, K parity)", ["acoded512", "acoded256", "acoded128", "acoded64", "acoded", "acoded16"], "#d62728", "^"),
                         ("the same code over the compressed payload (compress first)", ["acodedcf512", "acodedcf256", "acodedcf128", "acodedcf64", "acodedcf", "acodedcf16"], "#ff7f0e", "v")],
                  title="Figure 8 — the unit size for the A family at 128 KiB, 500 nodes", fname="fu_units_a128.png",
@@ -755,7 +779,7 @@ def figure_nodes():
     250 to 4000 nodes, every seed a point has (ten to 500 nodes, three above; 125 nodes was measured and left out: the
     70-peer neighbourhood covers most of such a network, author 2026-09-15). Two panels,
     p50 and p99; hollow where the median seed misses the 3 s budget; whole message's by-3 s share written beside it."""
-    arms = [("wholend", "whole message"), ("lad_phase", "the phase shift"), ("atuned", "A tuned"), ("acoded", "coded A")]
+    arms = [("wholend", "whole message"), ("lad_phase", "the phase shift"), ("atuned", "A-tuned"), ("acoded", "coded A")]
     ns = (250, 500, 1000, 2000, 4000)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.9), sharex=True)
     drew = False
@@ -792,7 +816,7 @@ def figure_nodes():
         ax.axhline(3.0, color="grey", ls="--", lw=0.8)
         ax.set_ylabel(name); ax.set_xlabel("nodes"); ax.grid(True, alpha=0.3)
     ax1.legend(fontsize=8, loc="center left")
-    fig.suptitle("Figure 10 — the four arms against network size, 1 MiB (ten seeds per point to 500 nodes, three above)", fontsize=10)
+    fig.suptitle("Figure 8 — the four arms against network size, 1 MiB", fontsize=10)  # the post's Figure 8; the seed set is named in the draft, not on the figure
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "fu_nodes.png"), dpi=140); plt.close(fig)
 
@@ -800,36 +824,36 @@ def figure_nodes():
 CENS_Y = 6.0  # where a strand count is written when the p99 itself is not observable (more than 1% never completed)
 
 
-MEM_LEFT = [("atuned", "A tuned (32 KiB)"), ("aplain400", "plain 400 ms discipline, no memory (control)"),
-            ("am_k64", "A tuned, 16 KiB"), ("atail_k3h4", "A tuned + tail hedge (k = 3, h = 4)"),
+MEM_LEFT = [("atuned", "A-tuned (32 KiB)"), ("aplain400", "plain 400 ms discipline, no memory (control)"),
+            ("am_k64", "A-tuned, 16 KiB"), ("atail_k3h4", "A-tuned + tail hedge (k = 3, h = 4)"),
             ("acoded", "A coded 32+32 + stop-pull")]
 MEM_RIGHT = [("aphaseot", "offer table only, 400 ms window: memory without move-on or park (control)"),
-             ("atuned", "A tuned (32 KiB)"), ("am_k64", "A tuned, 16 KiB"),
-             ("atail_k3h4", "A tuned + tail hedge (k = 3, h = 4)"), ("acoded", "A coded 32+32 + stop-pull")]
+             ("atuned", "A-tuned (32 KiB)"), ("am_k64", "A-tuned, 16 KiB"),
+             ("atail_k3h4", "A-tuned + tail hedge (k = 3, h = 4)"), ("acoded", "A coded 32+32 + stop-pull")]
 
 
 def figure_memory_base():
     """The ablation controls (was Part 1's Figure 4 on 2026-09-13; replaced by the ladder version on 2026-09-14) —
-    A tuned against the plain discipline without memory (left) and against the offer table without move-on or park (right)."""
+    A-tuned against the plain discipline without memory (left) and against the offer table without move-on or park (right)."""
     figure_memory(left=[a for a in MEM_LEFT if a[0] in ("atuned", "aplain400")],
                   right=[a for a in MEM_RIGHT if a[0] in ("aphaseot", "atuned")], num="ablation", fname="fu_memory_base.png")
 
 
 LADDER_STRESS = [("wholend", "whole message, stock gossipsub"), ("bare", "+ segmentation (full-mesh push)"),
                  ("lad_batch", "+ batch publishing"), ("lad_split", "+ announce instead of push (r = 2)"),
-                 ("lad_phase", "+ the phase shift"), ("atuned", "+ disciplined pulls = A tuned")]
+                 ("lad_phase", "+ the phase shift"), ("atuned", "+ disciplined pulls = A-tuned")]
 
 
 def figure_memory_branches():
     """Part 1's Figure 6 (section 4): Figure 4's two panels with the coded line added, so the code is read
-    against the rungs that explain it (author, 2026-09-16; the two-line version isolated A tuned and the code)."""
+    against the rungs that explain it (author, 2026-09-16; the two-line version isolated A-tuned and the code)."""
     lines = LADDER_STRESS + [("acoded", "+ erasure code 32+32 with stop-pull"),
                              ("acodedcf", "the same code over the compressed payload (compress first)", ARMS["acoded"][1])]
     figure_memory(left=lines, right=lines, num="6", fname="fu_memory_branches.png", dashed=("acodedcf",))
 
 
 def figure_memory_ladder():
-    """Part 1's Figure 4 (2026-09-14): the ladder's rungs under the two stresses, A tuned as the top rung."""
+    """Part 1's Figure 4 (2026-09-14): the ladder's rungs under the two stresses, A-tuned as the top rung."""
     figure_memory(left=LADDER_STRESS, right=LADDER_STRESS, num="4", fname="fu_memory_ladder.png")
 
 
@@ -1043,7 +1067,7 @@ def tables():
 
 # Fixed-count rule (K = 32 at every size, units of P/32) for every ladder rung, seed 7 first (Q97,
 # 2026-09-16). Those cells live in their own log set (logs_fc/ -> fu_results_fc.json) so the seed-7
-# records of the older ten-seed A tuned fixed-count cells (128/256 KiB, 2 MiB) are not overwritten.
+# records of the older ten-seed A-tuned fixed-count cells (128/256 KiB, 2 MiB) are not overwritten.
 RES_FC = os.path.join(os.path.dirname(RES), "fu_results_fc.json") if os.path.exists(os.path.join(os.path.dirname(RES), "fu_results_fc.json")) else os.path.join(HERE, "results_fc.json")
 recs_fc = json.load(open(RES_FC)) if os.path.exists(RES_FC) else []
 
@@ -1052,11 +1076,11 @@ def figure_fixedcount():
     """Per rung: the ladder at fixed 32 KiB units (solid) against the fixed-count rule, K = 32 at
     every size (dashed, hollow); both ten-seed medians with ±1 s.d. bars (seeds 7-16, lanes fu-fc
     and fu-fc10). Rows: p50, p99, all bytes received per node in copies of the compressed payload.
-    A tuned also carries the older ten-seed fixed-count points (grey hollow squares) as the
+    A-tuned also carries the older ten-seed fixed-count points (grey hollow squares) as the
     same-binary check."""
     steps = [("bare", "segmentation alone\n(full-mesh push, sequential publish)"), ("lad_batch", "+ batch publishing"),
              ("lad_split", "+ announce instead of push\n(push r = 2, announce the rest)"), ("lad_phase", "+ the phase\n(push budget decays with IDONTWANT)"),
-             ("atuned", "+ disciplined pulls\n= A tuned")]
+             ("atuned", "+ disciplined pulls\n= A-tuned")]
     colors = LADDER_COLORS[1:] + ["#1f77b4"]
     fig, axes = plt.subplots(3, len(steps), figsize=(3.1 * len(steps), 9.0), sharex=True)  # y per panel: the shape within a rung is the point
     keys = [(kib, pay) for pay, kib in PAYS]
@@ -1091,7 +1115,7 @@ def figure_fixedcount():
                 fy = [conv(x, v) for x, v in zip(fx, fy)]; flo = [conv(x, v) for x, v in zip(fx, flo)]; fhi = [conv(x, v) for x, v in zip(fx, fhi)]
             if fx:
                 curve(ax, fx, fy, flo, fhi, c, m, "K = 32 at every size (unit follows size)" if row == 0 else None, ms=6, lw=1.0, ls="--", hollow=True)
-            # the older ten-seed fixed-count cells (A tuned only)
+            # the older ten-seed fixed-count cells (A-tuned only)
             oxs, oys, olo, ohi = series(arm, [(kib, dict(pay=pay + "-fc")) for kib, pay in keys], key)
             if oxs:
                 if scale == "copies":

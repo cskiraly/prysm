@@ -46,34 +46,35 @@ parallel -j 4 --colsep ' ' -a cells/figure2_ladder.txt ./runcell.sh {1} {2} {3} 
 - **Code.** The first commit of this branch is the research tree at the commit the fleet binary
   was built from, minus the notes; the second pins the two forks as published modules in place
   of the vendored copies, byte-identical to them. The binary was `go test -c` of
-  `beacon-chain/p2p/segmentintegrationtest` (md5 `e51a66896b3fea9ff7d28d7c74db22ce`), built with
-  go1.26.5 on linux/amd64. Bazel builds the same packages and the beacon
-  node from the same pins; nogo's `maligned` analyzer flags two structs in the harness's test
-  file, left as they ran, so build with `--norun_validations`.
+  `beacon-chain/p2p/segmentintegrationtest` (md5 `e51a66896b3fea9ff7d28d7c74db22ce`), with the
+  Go toolchain named in the branch's `go.mod`. Bazel builds the same packages from the same pins.
 - **Hosts.** Two: a 40-thread Xeon E5-2630 v4 box with 251 GB running 6 to 20 cells at a time
   under GNU parallel, and a Ryzen 9 8945HS laptop running one to three. Every cell is virtual
   time, so counts and virtual-clock latencies do not depend on the host; the agreement gate
   between the two (one cell, same seed, same environment) was counts within 1 to 2 percent and
   latency percentiles within the same-seed noise floor of about 5 percent, which is also how much
-  scheduling alone moves a fixed-seed uncoded cell between two runs on one host. The coded arms
-  with stop-pull swing more: two runs of one compress-first cell differed by 10 percent in the
-  median and 8 percent in bytes, because the stop rule races the clock. Compare medians across
-  seeds, never one cell against one cell.
+  scheduling alone moves a fixed-seed cell between two runs on one host.
 - **Per cell.** `GOMAXPROCS=2`, the Go garbage collector at its defaults, `-test.count=1` so the
   test cache never replays a result, `SEGMENT_DET_RAND=1` with `SEGMENT_SEED` from the cell list
   so two arms at one seed see the same topology and the same random draws. The `.time` file of
   each cell records its wall time and peak memory.
-- **Seeds.** The cell lists name them; the post's rule is ten seeds per published point, and a
-  figure plots the median across seeds of each seed's statistic with bars of one sample standard
-  deviation.
+- **Seeds.** The cell lists name them; the post's rule is ten seeds per published point at 500
+  nodes (the network-size sweep's points above 500 nodes have three), and a figure plots the
+  median across seeds of each seed's statistic with bars of one sample standard deviation.
+- **Ids.** Where an arm sets `SEGMENT_STRUCTURED_IDS`, the harness's message id is a 101-byte
+  layout (magic, version, slot, block root, group id, index, content id); the `variant-a` series
+  ships a 56-byte one (root, index, content id). Control bytes scale with the width, so the
+  control panels of the post are upper bounds for the series; the closing figure's three tiers
+  all carry the 101-byte id.
 - **The extractor's checks.** A log without its `.done` marker is skipped (the cell did not
   finish). A log without a result line is recorded with `harness: unparsed` and excluded by the
   figures' record selection. A percentile the harness could not compute, because a receiver never
   completed inside the horizon, is recorded as null and drawn hollow. A cell that reached the
   test timeout is flagged `timeout`. Fault cells carry the harness's own exposure lines, so a
   withholding cell that withheld nothing is visible as such.
-- **Raw logs.** The per-cell logs, time records and markers of every published cell are attached
-  to the release tag as a gzipped tarball; `fu_extract.py` over that directory regenerates
+- **Raw logs.** The per-cell logs and markers of every published cell, with the time record where
+  the fleet kept one (1 976 of the 2 396 cells behind the figures), are attached to the release
+  tag as a gzipped tarball; `fu_extract.py` over that directory regenerates
   `results/fu_results.json`.
 
 ## Reading the results file
