@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Q2: does segmentation reduce store-and-forward delay? See notes/experiments.md.
+// Q2: does segmentation reduce store-and-forward delay?
 //
 // This is the transport-only arm. No topic validator is registered, so gossipsub forwards
 // immediately after reading an RPC, and the per-hop CPU cost of Prysm's real validator -- two

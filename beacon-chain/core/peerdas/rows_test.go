@@ -231,8 +231,8 @@ func TestBlobsForRowSubnet_OccupancyBelowSubnetCount(t *testing.T) {
 
 func TestBlobsForRowSubnet_AboveSubnetCount(t *testing.T) {
 	// Above ROW_SUBNET_COUNT the mapping stops being injective: subnets carry several rows.
-	// The wire format does not yet handle two rows in one group (notes/rowdas/design.md 6.1),
-	// but the mapping must still be total and lossless.
+	// The wire format does not yet handle two rows in one group, but the mapping must still be
+	// total and lossless.
 	rowSubnetCount := params.BeaconConfig().RowSubnetCount
 	blobCount := rowSubnetCount + rowSubnetCount/2
 	const slot = primitives.Slot(5)

@@ -3,8 +3,8 @@
 // tracer that accounts for every byte on the wire.
 //
 // It exists because two studies want the same substrate. It was written for the payload
-// segmentation work (notes/) and promoted here, unchanged in behaviour, for the RowDAS work
-// (notes/rowdas/). Anything specific to one study -- which environment variables select an arm,
+// segmentation work and promoted here, unchanged in behaviour, for the RowDAS work.
+// Anything specific to one study -- which environment variables select an arm,
 // what a payload means, which fork options an experiment sweeps -- stays in that study's
 // package and reaches this one through NetworkConfig.PubsubOpts and NetworkConfig.PerNodeOpts.
 //

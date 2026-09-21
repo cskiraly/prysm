@@ -2,27 +2,27 @@ package blocks
 
 // Request de-confliction for partial messages.
 //
-// The problem, measured (notes/rowdas/experiments.md R3 and R2): a node's `requests` bitmap is
-// everything it lacks, the same bitmap goes to every mesh peer, and each peer independently serves
-// whatever it holds of that set. Nothing de-conflicts, so received bytes are linear in mesh degree
-// with a coefficient of one -- 9.7x the information-theoretic minimum on the row axis at a median
-// mesh of 9, against 1.8x on the column axis, which mostly escapes it because the proposer is a
-// single source and pooled custody is not.
+// The problem, measured (R3 and R2): a node's `requests` bitmap is everything it lacks, the same
+// bitmap goes to every mesh peer, and each peer independently serves whatever it holds of that
+// set. Nothing de-conflicts, so received bytes are linear in mesh degree with a coefficient of one
+// -- 9.7x the information-theoretic minimum on the row axis at a median mesh of 9, against 1.8x on
+// the column axis, which mostly escapes it because the proposer is a single source and pooled
+// custody is not.
 //
 // This is the same failure gossipsub's IWANT path had before the discipline in
 // `third_party/go-libp2p-pubsub/phaseforward.go`, but it cannot reuse that fix: partial messages
 // ride `rpc.Partial` and never emit IWANT, and the extension is parts-agnostic, so there is no
 // request identity at the router layer to hang a discipline on. It has to live here.
 //
-// What this implements, and deliberately not more. `notes/design-space.md` section 10 scopes the
-// (N, q, g) kernel down to the *inner per-ID launch scheduler* and lists four things a deployable
-// request path needs around it -- a candidate policy, admission limits, attempt/deadline semantics,
-// and a censoring-aware estimator feeding q. That document also records which levers measured
-// badly: a per-peer response-time quantile needs a censoring-aware hierarchical estimator to mean
-// anything (variant B's `srtt+4·rttvar` is explicitly "a rough precedent, not an implementation"),
-// and the coordinated push-grace sweep *doubled* completion time. So:
+// What this implements, and deliberately not more. The (N, q, g) kernel is scoped down to the
+// *inner per-ID launch scheduler*, and a deployable request path needs four more things around it
+// -- a candidate policy, admission limits, attempt/deadline semantics, and a censoring-aware
+// estimator feeding q. Two levers also measured badly: a per-peer response-time quantile needs a
+// censoring-aware hierarchical estimator to mean anything (variant B's `srtt+4·rttvar` is
+// explicitly "a rough precedent, not an implementation"), and the coordinated push-grace sweep
+// *doubled* completion time. So:
 //
-//	built here    "one peer per missing part" -- which section 10 lists as current-and-right for
+//	built here    "one peer per missing part" -- the current-and-right shape for
 //	              variant B -- with the fanout as a parameter, a timeout that scales with what was
 //	              asked rather than a bare constant, and a replacement that prefers a peer not
 //	              already asked. That last one is listed as *unbuilt* for variant B, so it is
@@ -59,16 +59,15 @@ package blocks
 // On reassignment waiting for the next publish: this is not a shortcut, it is the same choice the
 // nqg series made, and for the same reason. Its `canRequestIWant` says so directly -- "the deferred
 // pull happens on the next IHAVE once the grace has elapsed (IHAVEs re-gossip each heartbeat), not
-// from a timer". Neither implementation has the per-peer timer callback that the idealized loop in
-// design-space.md section 10 describes; both re-aim on the next event, which for us is the next
-// publish and for gossipsub is the next IHAVE, and both are therefore bounded by the heartbeat.
+// from a timer". Neither implementation has the per-peer timer callback that the idealized loop
+// describes; both re-aim on the next event, which for us is the next publish and for gossipsub
+// is the next IHAVE, and both are therefore bounded by the heartbeat.
 //
 // What nqg does have and this does not: a *per-peer* expiry horizon, adaptive from observed response
 // times (`iwantHorizon`, `IWantAdaptiveHorizon`, fed by `fulfillIWant`). That is the q of (N, q, g),
-// and section 10 is explicit that it needs a censoring-aware hierarchical estimator to mean
-// anything. claimTTL here is base + per-part, clamped -- the same class of thing as variant B's
-// `srtt+4·rttvar`, which that document calls "a rough precedent, not an implementation". Recorded as
-// the follow-up in notes/rowdas/TODO.md D8.
+// and it needs a censoring-aware hierarchical estimator to mean anything. claimTTL here is
+// base + per-part, clamped -- the same class of thing as variant B's `srtt+4·rttvar`, itself only
+// "a rough precedent, not an implementation". Recorded as a follow-up.
 //
 // One thing that looked like a requirement and is not: a tie-break keyed on node identity, so that
 // different nodes do not all pick the same peer for the same part. Two nodes that both lack part i
@@ -84,7 +83,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// RequestN is N from notes/design-space.md section 10: "target plausible parallelism **per needed
+// RequestN is N from the (N, q, g) formulation: "target plausible parallelism **per needed
 // ID**". Here the needed ID is a part -- one cell of one group -- so RequestN is the maximum number
 // of peers that may hold a live claim on the same part at the same time. Named for N rather than
 // coining a second word for it, because this repository already carries a lot of reasoning in those
@@ -93,13 +92,13 @@ import (
 // One is byte-optimal and is the liveness-riskiest: a part asked only of a withholder stalls until
 // the claim lapses, and a part whose only holder is saturated waits behind that peer's uplink rather
 // than being served opportunistically by whoever is free. Two is the "ask k peers, take the first"
-// hedge that section 10 lists as trading bytes for tail latency; measured at 1.49x the bytes for no
-// convergence gain on the pooling exchange (TODO.md D8), so one is the setting.
+// hedge that trades bytes for tail latency; measured at 1.49x the bytes for no convergence gain
+// on the pooling exchange, so one is the setting.
 //
-// Note what N is *not*, per the same section: it does not bound node load. With K missing parts it
-// admits up to K x N plausible requests. That is safe here in a way it is not in general, because K
-// is bounded by the part count of a single group -- 128 cells -- rather than by an open-ended stream
-// of message ids, so no separate admission layer is needed.
+// Note what N is *not*: it does not bound node load. With K missing parts it admits up to K x N
+// plausible requests. That is safe here in a way it is not in general, because K is bounded by the
+// part count of a single group -- 128 cells -- rather than by an open-ended stream of message ids,
+// so no separate admission layer is needed.
 //
 // A var rather than a const so the experiments can sweep it; production takes the default.
 var RequestN = 1
@@ -112,20 +111,17 @@ var RequestN = 1
 // The bound exists because re-asking a peer that did not answer is right only when the request
 // never reached it -- and that case is now visible at its source, since a claim is committed only
 // after queue admission. A peer that received the request and stayed silent is withholding or
-// unable, and asking it again is waste that it can induce for free. See notes/rowdas/plan-repair.md
-// section 4.
+// unable, and asking it again is waste that it can induce for free.
 //
 // A var so experiments can sweep it: the R5 withholding arm is where it earns or loses its keep.
 var MaxClaimLapses = 3
 
-// Request-claim tuning. These are clamps, not an estimator; the estimator is the follow-up recorded
-// in notes/rowdas/TODO.md D8.
+// Request-claim tuning. These are clamps, not an estimator; the estimator is a follow-up.
 const (
 	// requestClaimBase must cover a round trip plus the peer's queueing delay. Below that, a
 	// lapsed claim is re-aimed at a different peer while the first is still in flight and both
 	// send -- which is the duplication this file exists to remove, reintroduced by a too-short
-	// timeout. notes/design-space.md section 10 calls the fixed-timeout version "current, and
-	// known wrong" for exactly this reason.
+	// timeout. The fixed-timeout version is "current, and known wrong" for exactly this reason.
 	requestClaimBase = 300 * time.Millisecond
 
 	// requestClaimPerPart scales the claim with what was actually asked of that peer, which is
@@ -339,8 +335,8 @@ func (c *requestClaims) assign(
 		}
 
 		// Candidates: peers that say they hold this part and do not already hold a claim on it.
-		// Preferring one never asked before is the "prefer a peer not already asked" rule that
-		// notes/design-space.md section 10 lists as unbuilt for variant B.
+		// Preferring one never asked before is the "prefer a peer not already asked" rule,
+		// which variant B leaves unbuilt.
 		var fresh, retry []peer.ID
 		for _, p := range peers {
 			if c.holdsClaim(part, p, now) {

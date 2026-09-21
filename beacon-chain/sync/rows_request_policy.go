@@ -17,7 +17,7 @@ package sync
 // A pooling node therefore asks widely until it can recover, and only for its own columns' cells
 // after that. Asking for a *specific* subset up to the threshold was the first attempt and it is
 // wrong: R9's withholding shape cut the nodes reaching the threshold from 8 to 1, because a blind
-// subset asks for cells no peer holds while missing the ones they do. See TODO.md D11.
+// subset asks for cells no peer holds while missing the ones they do.
 //
 // Deliberately not included here: delaying the request so the column path gets first refusal.
 // That trades latency for bytes and needs the frontier measured rather than guessed; it is R7's

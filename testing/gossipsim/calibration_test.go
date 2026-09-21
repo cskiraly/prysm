@@ -1,10 +1,10 @@
 package gossipsim
 
-// Link-model calibration (notes/rowdas/plan-repair.md section 6, item 8).
+// Link-model calibration.
 //
 // Every latency figure the RowDAS harness has produced rests on the assumption that a simulated
 // "50 Mbps, 25 ms" node behaves like one. Nothing had checked it. These three measurements do,
-// in the order the plan asks for: one raw simulated flow, so the rate link is characterised
+// in the order that isolates each layer: one raw simulated flow, so the rate link is characterised
 // without QUIC in the way; one QUIC/libp2p flow, which adds congestion control, ACKs and
 // retransmission on top; then the fanout the experiments actually run -- one uplink shared by
 // several concurrent receivers, which is where FQ-CoDel's per-flow queues and the per-node (not

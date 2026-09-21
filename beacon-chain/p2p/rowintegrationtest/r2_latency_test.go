@@ -29,7 +29,7 @@ package rowintegrationtest
 // should bite the tail. `rows+push` should be the worst of the three, since on a healthy network
 // its traffic buys nothing.
 //
-// The falsification condition from experiments.md is median or p95 in `rows` worse than `base`
+// The falsification condition is median or p95 in `rows` worse than `base`
 // beyond seed noise; that would make RowDAS a latency regression regardless of its CPU win.
 
 import (

@@ -3283,7 +3283,7 @@ func TestPartialColumnBroadcaster_Publish_Gloas(t *testing.T) {
 	}
 
 	// Re-publishing the same group reuses the existing verifier: deterministic group id keys the
-	// store, so no second verifier is created (the §1 anti-double-publish principle).
+	// store, so no second verifier is created (the anti-double-publish principle).
 	require.NoError(t, h.broadcaster.Publish(t.Context(), func(yield func(string, blocks.PartialDataColumn) bool) {
 		yield(topic, *column)
 	}))

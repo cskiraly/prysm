@@ -35,10 +35,7 @@ import (
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/config/params"
-	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
-	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
-	"github.com/golang/snappy"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
@@ -88,207 +85,20 @@ func TestQ6RealisticMesh(t *testing.T) {
 	if envMbps("SEGMENT_UP_MBPS", 0) > 0 || envMbps("SEGMENT_DOWN_MBPS", 0) > 0 {
 		rates = []int{envMbps("SEGMENT_UP_MBPS", defaultRate)}
 	}
-	// Which arms to run. "phase" is variant A over the forked gossipsub's phase forwarding
-	// (WithPhaseForwarding): push max(0, r - IDONTWANT-holders) mesh peers, immediate IHAVE
-	// to the rest. r comes from SEGMENT_A_PHASE_R (default 2).
-	arms := []string{"whole", "segmented"}
-	if v := os.Getenv("SEGMENT_ARMS"); v != "" {
-		arms = nil
-		for _, f := range strings.Split(v, ",") {
-			f = strings.TrimSpace(f)
-			switch f {
-			case "whole", "segmented", "phase":
-				arms = append(arms, f)
-			default:
-				t.Fatalf("bad SEGMENT_ARMS entry %q", f)
-			}
-		}
-	}
-	phaseR := 2
-	if v := os.Getenv("SEGMENT_A_PHASE_R"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k < 0 {
-			t.Fatalf("bad SEGMENT_A_PHASE_R %q", v)
-		}
-		phaseR = k // 0 = gossipsub-native pull-only: announce everything, push nothing.
-	}
-	// SEGMENT_STOP_PULL is the receiver-side decline-on-complete half of the coded-group
-	// byte-suppression design (TODO.md 2026-08-31): once a node holds enough distinct segments
-	// to complete, its request gate vetoes IWANTs for every further segment id. Pull side only;
-	// mesh pushes are untouched. Structured ids are required because the veto has to recognize
-	// a segment announcement it will never fetch.
-	stopPull := os.Getenv("SEGMENT_STOP_PULL") != ""
-	if stopPull && !structuredIDsEnabled() {
-		t.Fatal("SEGMENT_STOP_PULL requires SEGMENT_STRUCTURED_IDS")
-	}
-	// SEGMENT_STOP_PULL_H=h makes the gate predictive (Q91): a node declines an ask while its
-	// held shards plus its asks in flight would exceed K + h, and a declined announcement is
-	// replayed through the fork's deferral ledger on the next delivery, so a stalled ask costs a
-	// move-on rather than a strand. h = 0 (unset) is the reactive gate: decline only after K.
-	stopPullH := 0
-	if v := os.Getenv("SEGMENT_STOP_PULL_H"); v != "" {
-		h, err := strconv.Atoi(v)
-		if err != nil || h < 1 || !stopPull {
-			t.Fatalf("bad SEGMENT_STOP_PULL_H %q (want >= 1, with SEGMENT_STOP_PULL)", v)
-		}
-		stopPullH = h
-	}
-	// SEGMENT_TAIL_HEDGE_K=k with SEGMENT_TAIL_H=h: once a node is within h messages of
-	// completing, the IWANT discipline asks up to k announcers per missing id at once (the
-	// fork's WithIWantTailHedge). The watch goroutine, which already counts each node's
-	// progress, is what calls EnterTailHedge. Needs the discipline and the offer table.
-	tailK, tailH := 0, 0
-	if v := os.Getenv("SEGMENT_TAIL_HEDGE_K"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k < 2 {
-			t.Fatalf("bad SEGMENT_TAIL_HEDGE_K %q (want >= 2)", v)
-		}
-		h, err := strconv.Atoi(os.Getenv("SEGMENT_TAIL_H"))
-		if err != nil || h < 1 {
-			t.Fatalf("bad SEGMENT_TAIL_H %q (want >= 1)", os.Getenv("SEGMENT_TAIL_H"))
-		}
-		if os.Getenv("SEGMENT_IWANT_DISCIPLINE_MS") == "" || os.Getenv("SEGMENT_OFFER_TABLE") == "" {
-			t.Fatal("SEGMENT_TAIL_HEDGE_K requires SEGMENT_IWANT_DISCIPLINE_MS and SEGMENT_OFFER_TABLE")
-		}
-		tailK, tailH = k, h
-	}
-	// SEGMENT_TAIL_BOUNDS=perID,perGroup,perPeer bounds the tail hedge (0 = off) and
-	// SEGMENT_TAIL_SCHEDULE=1 makes its fan-out follow the pieces still missing, k(m) = 1 + ⌈h/m⌉
-	// capped at k (hedge-and-adaptivity plan, E2). Either makes the watch goroutine report the
-	// node's deficit to the router on every arrival in the tail and clear the tail on completion.
-	var tailBounds [3]int
-	tailBounded := false
-	if v := os.Getenv("SEGMENT_TAIL_BOUNDS"); v != "" {
-		if tailK == 0 {
-			t.Fatal("SEGMENT_TAIL_BOUNDS requires SEGMENT_TAIL_HEDGE_K")
-		}
-		if n, err := fmt.Sscanf(v, "%d,%d,%d", &tailBounds[0], &tailBounds[1], &tailBounds[2]); err != nil || n != 3 {
-			t.Fatalf("bad SEGMENT_TAIL_BOUNDS %q (want perID,perGroup,perPeer)", v)
-		}
-		tailBounded = true
-	}
-	tailSchedule := os.Getenv("SEGMENT_TAIL_SCHEDULE") != ""
-	if tailSchedule && tailK == 0 {
-		t.Fatal("SEGMENT_TAIL_SCHEDULE requires SEGMENT_TAIL_HEDGE_K")
-	}
-	// SEGMENT_GROUP_PUSH is the sender-side half: stop pushing a group's members to a peer
-	// that has IDONTWANT-evidenced enough distinct members to complete, announce instead.
-	// Rides the phase path's announce machinery, so it exists only on the phase arm.
-	groupPush := os.Getenv("SEGMENT_GROUP_PUSH") != ""
-	if groupPush && !structuredIDsEnabled() {
-		t.Fatal("SEGMENT_GROUP_PUSH requires SEGMENT_STRUCTURED_IDS")
-	}
-	// SEGMENT_LINK_MOD=m activates each (segment, mesh link) with probability 1/m, decided by
-	// a symmetric hash of the unordered peer pair and the segment's structural prefix — the
-	// geth-style subgraph trick: a wide mesh whose per-segment effective degree is mesh/m,
-	// with the subgraph rotating per segment. Requires structured ids to recognize segments.
-	linkMod := uint64(0)
-	if v := os.Getenv("SEGMENT_LINK_MOD"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k < 2 {
-			t.Fatalf("bad SEGMENT_LINK_MOD %q (want >= 2)", v)
-		}
-		if !structuredIDsEnabled() {
-			t.Fatal("SEGMENT_LINK_MOD requires SEGMENT_STRUCTURED_IDS")
-		}
-		linkMod = uint64(k) // lint:ignore uintcast -- bounded small positive by the check above.
-	}
-	// SEGMENT_LINK_ENFORCE makes the link filter bilateral: announcements over inactive mesh
-	// links are declined and pushes over them counted — the receiver-side hardening, since
-	// the symmetric predicate lets a receiver verify what a compliant sender would have sent.
-	linkEnforce := os.Getenv("SEGMENT_LINK_ENFORCE") != ""
-	if linkEnforce && linkMod == 0 {
-		t.Fatal("SEGMENT_LINK_ENFORCE requires SEGMENT_LINK_MOD")
-	}
 	params.SetupTestConfigCleanup(t)
-	sk, err := bls.RandKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Payload size is fixed at 1 MiB by default; the knob exists to find where whole-message
-	// diffusion crosses the deadline, which sets how urgent segmentation is.
-	payloadLen := 1 << 20
-	if v := os.Getenv("SEGMENT_PAYLOAD_BYTES"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k <= 0 {
-			t.Fatalf("bad SEGMENT_PAYLOAD_BYTES %q: %v", v, err)
-		}
-		payloadLen = k
-	}
-	payload := mainnetLikePayload(payloadLen, 11)
-	// SEGMENT_COMPRESS_FIRST snappy-compresses the payload before it is segmented and coded, so
-	// parity is computed over compressed bytes and no shard is compressible on the wire (the
-	// gossip encoder still runs, as in production). SEGMENT_FIXED_COUNT=K sizes the segments to
-	// give exactly K of them whatever the length being segmented. Completion counts distinct
-	// messages, so the receiving side is unchanged; the whole-message arm keeps the raw payload.
-	wirePayload := payload
-	if os.Getenv("SEGMENT_COMPRESS_FIRST") != "" {
-		wirePayload = snappy.Encode(nil, payload)
-	}
-	segSize := segmentSizeBytes(t)
-	if v := os.Getenv("SEGMENT_FIXED_COUNT"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k <= 0 {
-			t.Fatalf("bad SEGMENT_FIXED_COUNT %q", v)
-		}
-		segSize = (len(wirePayload) + k - 1) / k
-	}
-	segs := segmentedArm(t, wirePayload, segSize, sk, primitives.Slot(2048))
-	if v := os.Getenv("SEGMENT_PARITY"); v != "" {
-		// Reed-Solomon coded gossip messages: K+parity on the wire, any K completing a node.
-		par, err := strconv.Atoi(v)
-		if err != nil || par <= 0 {
-			t.Fatalf("bad SEGMENT_PARITY %q", v)
-		}
-		segs = codedArm(t, wirePayload, segSize, par, sk, primitives.Slot(2048))
-	}
-	whole := wholeArm(t, payload)
-
-	// SEGMENT_WARMUP diffuses an unrelated payload of the same shape first, so every QUIC
-	// connection has left slow start before the measured publish. Different content on purpose:
-	// the same bytes would be suppressed by the seen cache and warm nothing.
-	warmOn := os.Getenv("SEGMENT_WARMUP") != ""
-	var warmSegs, warmWhole wireArm
-	if warmOn {
-		warmPayload := mainnetLikePayload(payloadLen, 12)
-		warmWhole = wholeArm(t, warmPayload)
-		warmSegs = segmentedArm(t, warmPayload, segmentSizeBytes(t), sk, primitives.Slot(2049))
-	}
+	cell := q6CellFromEnv(t)
 
 	for _, oneWay := range latencies {
 		for _, rate := range rates {
 			for _, n := range sizes {
-				for _, armName := range arms {
-					arm, warm := whole, warmWhole
-					if armName != "whole" {
-						arm, warm = segs, warmSegs
-					}
+				for _, armName := range cell.arms {
 					runDiffusion(t, diffusionParams{
 						n:        n,
 						rate:     rate,
 						latency:  oneWay,
 						deadline: failureDeadline(t),
 						seed:     meshGraphSeed(t),
-					}, &q6Variant{
-						armName:      armName,
-						arm:          arm,
-						warm:         warm,
-						whole:        whole,
-						phaseR:       phaseR,
-						regime:       regimeRuleFor(t, meshLinks(t, n, rate), n),
-						rate:         rate,
-						oneWay:       oneWay,
-						stopPull:     stopPull,
-						stopPullH:    stopPullH,
-						tailK:        tailK,
-						tailBounds:   tailBounds,
-						tailBounded:  tailBounded,
-						tailSchedule: tailSchedule,
-						tailH:        tailH,
-						groupPush:    groupPush,
-						linkMod:      linkMod,
-						linkEnforce:  linkEnforce,
-					})
+					}, cell.variant(t, armName, rate, oneWay, n))
 				}
 			}
 		}
@@ -298,6 +108,7 @@ func TestQ6RealisticMesh(t *testing.T) {
 // q6Variant is variant A: the whole payload, or K segments, or K+parity coded segments, all on
 // one gossip topic, optionally over the forked phase-forwarding router.
 type q6Variant struct {
+	unit    int // the segment size the arm was cut at; 0 for the whole message
 	armName string
 	arm     wireArm
 	// warm is an unrelated payload of the same shape, diffused before the measured one so
@@ -473,6 +284,10 @@ func (v *q6Variant) deferral(i int) *pubsub.RequestDeferral {
 }
 
 func (v *q6Variant) name() string { return v.armName }
+
+func (v *q6Variant) wireForm() wireForm {
+	return wireForm{msgs: len(v.arm.msgs), need: v.arm.completeAt(), unit: v.unit, total: v.arm.total, idBytes: idWidth(v.arm.msgs[0])}
+}
 
 func (v *q6Variant) pubsubOpts(t *testing.T, i int) []pubsub.Option {
 	var opts []pubsub.Option
@@ -707,44 +522,54 @@ func (r *q6Run) prePublish(t *testing.T, ctx context.Context, wg *sync.WaitGroup
 	}
 }
 
+// watchNode reads one node's subscription until the arm's completion count of distinct known
+// messages has arrived, driving the node's stop-pull gate and tail hedge on the way. False means
+// the context ended first. q6Run.watch runs it for every receiver in-process; the Shadow node
+// runs it once, for itself.
+func (v *q6Variant) watchNode(ctx context.Context, idx int, ps *pubsub.PubSub, sub *pubsub.Subscription) bool {
+	arm := v.arm
+	seen := make(map[digest]bool, len(arm.msgs))
+	inTail := false
+	for len(seen) < arm.completeAt() {
+		msg, err := sub.Next(ctx)
+		if err != nil {
+			return false
+		}
+		if _, ok := arm.known[digestOf(msg.Data)]; ok {
+			seen[digestOf(msg.Data)] = true
+			if v.stopPull {
+				v.gate(idx).delivered(msg.ID, len(seen))
+				if v.stopPullH > 0 {
+					v.deferral(idx).Replay() // a slot freed: re-offer what the cap declined
+				}
+			}
+		}
+		if v.tailK > 0 && !inTail && len(seen) >= arm.completeAt()-v.tailH {
+			inTail = true
+			v.tailEntered.Add(1)
+			ps.EnterTailHedge()
+		}
+		if inTail && (v.tailBounded || v.tailSchedule) && len(seen) < arm.completeAt() {
+			ps.TailProgress(arm.completeAt() - len(seen))
+		}
+	}
+	if inTail && (v.tailBounded || v.tailSchedule) {
+		ps.ExitTailHedge()
+	}
+	if v.stopPull {
+		v.gate(idx).done.Store(true)
+	}
+	return true
+}
+
 func (r *q6Run) watch(ctx context.Context, wg *sync.WaitGroup, start time.Time, signal func(int, time.Duration)) {
-	arm := r.v.arm
 	for i := 1; i < r.n; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			seen := make(map[digest]bool, len(arm.msgs))
-			inTail := false
-			for len(seen) < arm.completeAt() {
-				msg, err := r.subs[idx].Next(ctx)
-				if err != nil {
-					return
-				}
-				if _, ok := arm.known[digestOf(msg.Data)]; ok {
-					seen[digestOf(msg.Data)] = true
-					if r.v.stopPull {
-						r.v.gate(idx).delivered(msg.ID, len(seen))
-						if r.v.stopPullH > 0 {
-							r.v.deferral(idx).Replay() // a slot freed: re-offer what the cap declined
-						}
-					}
-				}
-				if r.v.tailK > 0 && !inTail && len(seen) >= arm.completeAt()-r.v.tailH {
-					inTail = true
-					r.v.tailEntered.Add(1)
-					r.nw.Pubsubs[idx].EnterTailHedge()
-				}
-				if inTail && (r.v.tailBounded || r.v.tailSchedule) && len(seen) < arm.completeAt() {
-					r.nw.Pubsubs[idx].TailProgress(arm.completeAt() - len(seen))
-				}
+			if r.v.watchNode(ctx, idx, r.nw.Pubsubs[idx], r.subs[idx]) {
+				signal(idx, time.Since(start))
 			}
-			if inTail && (r.v.tailBounded || r.v.tailSchedule) {
-				r.nw.Pubsubs[idx].ExitTailHedge()
-			}
-			if r.v.stopPull {
-				r.v.gate(idx).done.Store(true)
-			}
-			signal(idx, time.Since(start))
 		}(i)
 	}
 }
@@ -781,33 +606,40 @@ func (r *q6Run) publish(ctx context.Context, t *testing.T) error {
 		}
 		return nil
 	}
-	// SEGMENT_PUBLISH_MODE=fcfs is the batch-publishing counterfactual: segments published
-	// sequentially in index order, each fanning to the full mesh before the next enters —
-	// the in-order cut-through pipeline, with none of the batch's first-copy prioritisation
-	// or peer rotation. Segment k's first copy leaves the source ~D times later than under
-	// the batch, so this prices the batch's reordering/path-diversity contribution.
-	if os.Getenv("SEGMENT_PUBLISH_MODE") == "fcfs" {
-		for mi, m := range arm.msgs {
-			if omit[mi] {
-				continue
-			}
-			if err := r.topics[0].Publish(ctx, m); err != nil {
-				return err
-			}
-		}
-		return seedHolders()
-	}
-	var batch pubsub.MessageBatch
-	for mi, m := range arm.msgs {
-		if omit[mi] {
-			continue
-		}
-		if err := r.topics[0].AddToBatch(ctx, &batch, m); err != nil {
-			return err
-		}
-	}
-	if err := r.nw.Pubsubs[0].PublishBatch(&batch); err != nil {
+	if err := r.v.publishFrom(ctx, r.topics[0], r.nw.Pubsubs[0], omit); err != nil {
 		return err
 	}
 	return seedHolders()
+}
+
+// publishFrom sends the arm's messages from one node, the ids in omit left out: as one batch, or
+// sequentially under SEGMENT_PUBLISH_MODE=fcfs. q6Run.publish wraps it with the last-piece
+// screen's placed holders; the Shadow node, one process per node, calls it directly.
+// SEGMENT_PUBLISH_MODE=fcfs is the batch-publishing counterfactual: segments published
+// sequentially in index order, each fanning to the full mesh before the next enters —
+// the in-order cut-through pipeline, with none of the batch's first-copy prioritisation
+// or peer rotation. Segment k's first copy leaves the source ~D times later than under
+// the batch, so this prices the batch's reordering/path-diversity contribution.
+func (v *q6Variant) publishFrom(ctx context.Context, topic *pubsub.Topic, ps *pubsub.PubSub, omit map[int]bool) error {
+	if os.Getenv("SEGMENT_PUBLISH_MODE") == "fcfs" {
+		for mi, m := range v.arm.msgs {
+			if omit[mi] {
+				continue
+			}
+			if err := topic.Publish(ctx, m); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	var batch pubsub.MessageBatch
+	for mi, m := range v.arm.msgs {
+		if omit[mi] {
+			continue
+		}
+		if err := topic.AddToBatch(ctx, &batch, m); err != nil {
+			return err
+		}
+	}
+	return ps.PublishBatch(&batch)
 }

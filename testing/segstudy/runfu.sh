@@ -98,7 +98,7 @@ case $arm in
   am_k64)       TESTP="TestQ6RealisticMesh$"; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_SIZE_BYTES=16384 $FINAL" ;;
   am_k8k)       TESTP="TestQ6RealisticMesh$"; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_SIZE_BYTES=8192 $FINAL" ;;   # Q85: 8 KiB segments (size-adaptive rules)
   # Q86 (2026-09-11): tail hedging on A tuned — atail_k<K>h<H>: once within H messages of completion, ask up to K announcers per missing id.
-  # E1 (2026-09-13, hedge-and-adaptivity plan): the tail hedge's window on a given unit. atail_u<U>_k<k>h<h> = A tuned at U-byte units with fan-out k and window h
+  # E1 (2026-09-13): the tail hedge's window on a given unit. atail_u<U>_k<k>h<h> = A tuned at U-byte units with fan-out k and window h
   # (absolute pieces; the cell list carries the fraction of K each stands for); atuned_u<U> = the no-hedge control at that unit.
   atail_u[0-9]*_k[0-9]*h[0-9]*) [[ $arm =~ ^atail_u([0-9]+)_k([0-9]+)h([0-9]+)$ ]]; TESTP="TestQ6RealisticMesh$"; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_SIZE_BYTES=${BASH_REMATCH[1]} $FINAL SEGMENT_TAIL_HEDGE_K=${BASH_REMATCH[2]} SEGMENT_TAIL_H=${BASH_REMATCH[3]}" ;;
   atuned_u[0-9]*) [[ $arm =~ ^atuned_u([0-9]+)$ ]]; TESTP="TestQ6RealisticMesh$"; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_SIZE_BYTES=${BASH_REMATCH[1]} $FINAL" ;;
@@ -129,7 +129,7 @@ case $arm in
   # Identical to aadaptcf from 512 KiB up, so only 128 / 256 / 384 KiB need cells.
   aadaptcfd) TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$((P/16384)) SEGMENT_PARITY=$((P/16384)) SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $FINAL" ;;
   aadapt2)   TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 393216 ] && AR=3; [ $P -le 262144 ] && AR=4; AD="$FINAL SEGMENT_TAIL_HEDGE_K=3 SEGMENT_TAIL_H=4"; [ $P -lt 524288 ] && AD=""; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 $AD" ;;
-  # E1 composed arm (2026-09-13, hedge-and-adaptivity plan §5): aadapt2 unchanged from 512 KiB up; below it the discipline and a
+  # E1 composed arm (2026-09-13): aadapt2 unchanged from 512 KiB up; below it the discipline and a
   # fractional tail hedge h = max(1, K/8) at k = 3 (E1: the gain is flat from h/K = 1/8 up and the bytes climb past it) — acomp keeps
   # aadapt2's push degrees (4 to 256 KiB, 3 at 384), acompd drops one push where the hedge is added, as Figure 6's dashed line does above 512 KiB.
   acomp|acompd) TESTP="TestQ6RealisticMesh$"; AR=2; [ $P -le 393216 ] && AR=3; [ $P -le 262144 ] && AR=4; H=4; if [ $P -lt 524288 ]; then H=$((P/16384/8)); [ $H -lt 1 ] && H=1; [ $arm = acompd ] && AR=$((AR-1)); fi; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_SIZE_BYTES=16384 $FINAL SEGMENT_TAIL_HEDGE_K=3 SEGMENT_TAIL_H=$H" ;;
@@ -172,7 +172,7 @@ case $fault in
   wh[0-9]*)   COMMON="$COMMON SEGMENT_FAIL_WITHHOLD_PCT=${fault#wh}" ;;
   sil[0-9]*)  COMMON="$COMMON SEGMENT_FAIL_WITHHOLD_PCT=${fault#sil} SEGMENT_FAIL_RELAY_SILENCE=1" ;;
   whsp[0-9]*) f=${fault#whsp}; COMMON="$COMMON SEGMENT_FAIL_WITHHOLD_PCT=$f SEGMENT_FAIL_IDW_SPOOF_PCT=$f" ;;
-  # E7 screens (2026-09-13, hedge-and-adaptivity plan): slow<P>d<D>[f<n>|s<n>] = P% announcers serve after D ms (f<n>: the first n asks fast then slow; s<n>: the reverse);
+  # E7 screens (2026-09-13): slow<P>d<D>[f<n>|s<n>] = P% announcers serve after D ms (f<n>: the first n asks fast then slow; s<n>: the reverse);
   # cap<P> = P% withholders that also re-announce every id they hear (offer capture); last<P>w<W>h<H> = the last W ids leave from H placed holders, P% withholders withhold
   # only those ids and hearsay-announce them (needs structured ids, 32 KiB units: index floor KA-W); narrow0w<W>h<H> = the placement alone; rd<P> = P% slow readers (100 ms per read).
   slow[0-9]*d[0-9]*) [[ $fault =~ ^slow([0-9]+)d([0-9]+)(f([0-9]+)|s([0-9]+))?$ ]] || { echo "bad fault $fault"; exit 2; }

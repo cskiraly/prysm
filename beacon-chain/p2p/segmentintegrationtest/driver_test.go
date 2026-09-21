@@ -202,7 +202,7 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			// neither alone empties the links: the measured publish would contend with
 			// warm-up bytes still in flight and read as the warm-up making things slower.
 			// Virtual time, so the sleep is free, and quic-go does not shrink the congestion
-			// window when a connection idles (notes/transport-warmup.md §2).
+			// window when a connection idles.
 			time.Sleep(warmupDrain)
 			settle(false)
 			// SEGMENT_WARMUP_ONLY stops here, before anything is published. With QLOGDIR set,
@@ -313,6 +313,9 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		return
 	}
 	v.report(t, stats)
+	if w, ok := v.(wireFormer); ok {
+		t.Logf("        %s", w.wireForm())
+	}
 	if stats.gateSummary != "" {
 		t.Logf("        %s", stats.gateSummary)
 	}

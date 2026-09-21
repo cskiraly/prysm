@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Structured segment message ids -- measurement-plan section 21, stage 1.
+// Structured segment message ids -- stage 1 of the gated-pull design.
 //
 // Today's ids are content hashes, so an announcement does not say which block would authorize
 // the message it advertises. That is what stops a receiver from declining to request what it

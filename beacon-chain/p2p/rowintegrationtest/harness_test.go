@@ -544,8 +544,8 @@ type networkOpts struct {
 	// that, the base and rows arms get *different physical graphs* and every paired comparison is
 	// confounded. It is latent while every node is a member -- a subnet containing the whole network
 	// needs no cover edges, and both arms measured 2048 edges at 128 nodes -- and it bites the moment
-	// membership goes sparse. Found by an adversarial review of notes/rowdas/plan-repair.md before it
-	// could corrupt a measurement.
+	// membership goes sparse. Found by an adversarial review of the repair plan before it could
+	// corrupt a measurement.
 	//
 	// Nil falls back to rowMembers, which is right for every experiment where membership does not
 	// vary by arm.
@@ -811,8 +811,8 @@ func newNetwork(t *testing.T, o networkOpts) (*rowNetwork, func()) {
 		// neighbours the topology gave each member. With 8 subscribers and inSubnetDegree 4 the
 		// meshes settle at 4-5, so a band floor of Dlo=6 can never be met and the arm times out
 		// after three minutes -- which is what sparse membership hit the first time it was run.
-		// Raising inSubnetDegree (Step 4 of plan-repair.md) is what makes a floor of 6 reachable;
-		// this cap is what stops the harness demanding the unreachable in the meantime.
+		// Raising inSubnetDegree is what makes a floor of 6 reachable; this cap is what
+		// stops the harness demanding the unreachable in the meantime.
 		lo := max(0, min(members-1, gsp.Dlo))
 		// Only when membership is sparse. With every node a member, the global layer supplies
 		// in-topic neighbours too and meshes reach 8-11, so capping by inSubnetDegree there would

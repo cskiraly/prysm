@@ -491,8 +491,7 @@ func (p *PartialDataRow) ExtendFromVerifiedCell(columnIndex uint64, cell, proof 
 		return false
 	}
 	// The cell arrived, so any request claim on it is settled. This is the analogue of nqg's
-	// fulfillIWant, and it is also where a response-time estimator would attach if one is built
-	// (notes/rowdas/TODO.md D8).
+	// fulfillIWant, and it is also where a response-time estimator would attach if one is built.
 	if p.requestClaimLedger != nil {
 		p.requestClaimLedger.settle(columnIndex)
 	}

@@ -157,9 +157,8 @@ func TestAssignKeepsLiveClaims(t *testing.T) {
 	}
 }
 
-// TestAssignReassignsAfterLapseAndPrefersAFreshPeer covers the rule notes/design-space.md section 10
-// lists as *unbuilt* for variant B: "a lapsed claim can currently go straight back to the peer that
-// did not answer".
+// TestAssignReassignsAfterLapseAndPrefersAFreshPeer covers the rule variant B leaves *unbuilt*:
+// "a lapsed claim can currently go straight back to the peer that did not answer".
 func TestAssignReassignsAfterLapseAndPrefersAFreshPeer(t *testing.T) {
 	const length = 1
 	a, b := peer.ID("a"), peer.ID("b")
@@ -274,8 +273,8 @@ func TestSettleClearsLapses(t *testing.T) {
 }
 
 // TestClaimTTLScalesWithWhatWasAsked pins why the timeout is not a bare constant: a peer asked for
-// sixty cells needs longer than one asked for two, and notes/design-space.md section 10 calls the
-// fixed version "current, and known wrong".
+// sixty cells needs longer than one asked for two, and the fixed version is "current, and known
+// wrong".
 func TestClaimTTLScalesWithWhatWasAsked(t *testing.T) {
 	require.Equal(t, requestClaimBase+requestClaimPerPart, claimTTL(1))
 	require.Equal(t, true, claimTTL(60) > claimTTL(1), "more parts asked should mean a longer claim")

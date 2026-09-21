@@ -112,9 +112,9 @@ func RowSubnetForBlob(blobIndex uint64, slot primitives.Slot) (uint64, error) {
 // blobs and 128 subnets only 6 subnets carry anything, so most nodes have no row duty in most
 // slots. Callers must treat an empty result as "nothing to do", not as an error.
 //
-// More than one index is returned only when the blob count exceeds ROW_SUBNET_COUNT. See
-// notes/rowdas/design.md section 6.1: the wire format does not yet carry two independent
-// bitmaps for one group, so that case is reported here but not handled downstream.
+// More than one index is returned only when the blob count exceeds ROW_SUBNET_COUNT: the wire
+// format does not yet carry two independent bitmaps for one group, so that case is reported
+// here but not handled downstream.
 func BlobsForRowSubnet(subnet uint64, slot primitives.Slot, blobCount uint64) ([]uint64, error) {
 	rowSubnetCount := params.BeaconConfig().RowSubnetCount
 	if rowSubnetCount == 0 {

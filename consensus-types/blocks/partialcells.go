@@ -49,8 +49,8 @@ type partialParts interface {
 	// defersAnnouncements says whether news that is not on the recipient's critical path -- a
 	// request *removal*, and availability growth -- may wait for a packet going there anyway
 	// rather than buying its own. True on the row axis; false on the column axis, which keeps the
-	// shipped announce-everything-now behaviour until it gets the mechanism in a commit of its own
-	// (notes/rowdas/plan-repair.md section 5.4).
+	// shipped announce-everything-now behaviour until it gets the mechanism in a commit of its
+	// own.
 	defersAnnouncements() bool
 	// availabilityIsUrgent says the current availability must not be held: it is news other
 	// nodes act on at once. A complete row is the case -- its announcement is the cancellation
@@ -82,9 +82,9 @@ func availabilityMaxDelay() time.Duration { return RequestAvailabilityMaxDelay }
 // packet to the same peer before a packet is spent on it. The effective delay is this divided by
 // RequestN: at N=1 the peer being told is the one already sending, so the cancellation is worth
 // little and can wait; at N>1 the other claim-holders are worth telling, because their
-// transmission may not have been dispatched. The packet arithmetic is in plan-repair.md section
-// 5.3 -- 42 B of metadata against a 2 KB cell means a piggybacked cancellation costs nothing and a
-// dedicated one pays only if the peer probably has not dispatched.
+// transmission may not have been dispatched. The packet arithmetic: 42 B of metadata against a
+// 2 KB cell means a piggybacked cancellation costs nothing and a dedicated one pays only if the
+// peer probably has not dispatched.
 //
 // A var so R3 can sweep it; 500 ms is a starting point, not a measurement.
 var RequestCancellationMaxDelay = 500 * time.Millisecond
@@ -103,7 +103,7 @@ var partialClock = time.Now
 //
 // It exists because a metadata storm was diagnosed three times over from aggregate counters and got
 // the mechanism wrong each time: the driving term could not be separated from the amplifying one
-// without knowing which comparison in partialForPeer fired. See notes/rowdas/plan-repair.md.
+// without knowing which comparison in partialForPeer fired.
 type ActionReason uint8
 
 const (
@@ -291,7 +291,7 @@ func assignRequests(
 // assigned is the subset of the parts we lack that this peer is being asked for. A nil bitlist
 // falls back to asking for everything, which is what a caller with no peer context gets.
 //
-// What earns a metadata packet, and what does not (plan-repair.md section 5.2):
+// What earns a metadata packet, and what does not:
 //
 //	first contact, first metadata     always
 //	request addition                  always -- it unblocks our own pull; nobody else asks for us

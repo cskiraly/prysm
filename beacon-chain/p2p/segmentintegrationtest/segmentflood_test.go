@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// The unknown-group flood -- notes/adversarial-cell-design.md, experiment A.
+// The unknown-group flood -- adversarial experiment A.
 //
 // What it attacks. A receiver cannot authenticate a segment group before it holds the slot's
 // commitments, so between a candidate's arrival and that installation it can only buffer. The

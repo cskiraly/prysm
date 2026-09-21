@@ -29,8 +29,7 @@ var ErrEnvelopeMalformed = fmt.Errorf("segment publish input malformed")
 //
 // auth carries the segmentation parameters only. Its Slot and Signature fields are not
 // consulted: the signature belonged to a scheme this package replaced, and the slot to an
-// anchor that is no longer on the wire. Both are vestigial in the proto, tracked in
-// notes/TODO.md.
+// anchor that is no longer on the wire. Both are vestigial in the proto.
 func SegmentMessagesForEnvelope(
 	signed *ethpb.SignedExecutionPayloadEnvelope,
 	auth *ethpb.PayloadSegmentAuth,

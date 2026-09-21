@@ -7,8 +7,8 @@ package segmentintegrationtest
 // (initialCongestionWindow=32 packets x InitialPacketSize=1280), so a sender that puts more than
 // that on a link in one burst pays slow start. Our figures start their clock at publish, on
 // connections that have carried only control traffic -- which is application-limited and so does
-// not grow the window. See notes/transport-warmup.md for the full account, including the fact that
-// 40 KiB is 3.2x what RFC 9002 recommends, which is why the threshold is worth being able to move.
+// not grow the window. 40 KiB is 3.2x what RFC 9002 recommends, which is why the threshold is
+// worth being able to move.
 //
 // Why a raw stream rather than a warm-up topic. A decoy publish warms the transport *and* fills
 // the seen cache, message cache and IDONTWANT state, and the second effect can outweigh the first
@@ -54,9 +54,8 @@ const warmupDrain = 5 * time.Second
 // SEGMENT_INITIAL_CWND_PACKETS. Unset leaves quic-go's own value.
 //
 // This is the alternative to warming: instead of sending traffic to grow the window past its
-// starting point, start it where you want. It sends nothing, so unlike every warm-up in
-// notes/transport-warmup.md §4 it perturbs no other layer -- no protocol state, no queues, no RTT
-// estimates.
+// starting point, start it where you want. It sends nothing, so unlike every traffic-based
+// warm-up it perturbs no other layer -- no protocol state, no queues, no RTT estimates.
 //
 // It sets the *default* rather than a Config field because go-libp2p's quicreuse builds its own
 // quic.Config from an unexported package variable, so the field is unreachable from here. Needs

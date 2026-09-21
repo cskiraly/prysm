@@ -168,9 +168,8 @@ func TestR3DuplicationVersusMeshDegree(t *testing.T) {
 //
 // Assignment at fanout 1 is byte-optimal: each missing cell is asked of exactly one peer that holds
 // it, so received bytes approach the information-theoretic minimum. It is also the shape with the
-// least redundancy, and notes/design-space.md section 10 names the cost -- "ask k peers, take the
-// first: trades bytes for tail latency" -- so the parameter exists to be measured rather than
-// argued about.
+// least redundancy, and its cost has a name -- "ask k peers, take the first: trades bytes for tail
+// latency" -- so the parameter exists to be measured rather than argued about.
 //
 // The case that motivated this: R1(b) measured recovered-row propagation getting *slower* under
 // assignment, 783 ms to 939 ms. A recovered row has exactly one source, so every peer's assignment

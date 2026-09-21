@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Bounded deferred admission -- measurement-plan section 21, stage 5.
+// Bounded deferred admission -- stage 5 of the gated-pull design.
 //
 // The receiver gate governs what a node *asks for*. It cannot govern what arrives: a peer may push
 // an unsolicited segment on a subscribed topic, and the bytes and the initial parse happen whatever
@@ -786,7 +786,7 @@ func TestSegmentAdmission(t *testing.T) {
 	// the slot's commitments install, a fabricated root is rejected before it can occupy a slot,
 	// so the width of this hole is delta_install. Recorded rather than fixed, because the obvious
 	// fix -- bounding roots per sender rather than globally -- is a design change, not a tuning
-	// one. See notes/adversarial-cell-design.md.
+	// one.
 	t.Run("a root table filled by one peer refuses an honest root despite its reservation", func(t *testing.T) {
 		caps := admissionCaps{globalBytes: 1 << 20, perRootBytes: 1 << 20, hardBytes: 4 << 20,
 			reservePeer: 1, maxRoots: 4}

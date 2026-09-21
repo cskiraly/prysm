@@ -190,10 +190,8 @@ func custodyTopics(seed uint64, node, n, s int) []int {
 // TestVariantCDiffusion drives the topic-per-segment variant on the standard mesh.
 func TestVariantCDiffusion(t *testing.T) {
 	sizes := []int{30}
-	payloadLen := 1 << 19
 	if os.Getenv("SEGMENT_SLOW_TESTS") != "" {
 		sizes = []int{30, 500}
-		payloadLen = 1 << 20
 	}
 	if v := os.Getenv("SEGMENT_MESH_SIZES"); v != "" {
 		sizes = nil
@@ -205,81 +203,12 @@ func TestVariantCDiffusion(t *testing.T) {
 			sizes = append(sizes, k)
 		}
 	}
-	if v := os.Getenv("SEGMENT_PAYLOAD_BYTES"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil {
-			t.Fatalf("bad SEGMENT_PAYLOAD_BYTES %q: %v", v, err)
-		}
-		payloadLen = k
-	}
-	phaseR := 0
-	if v := os.Getenv("SEGMENT_C_PHASE_R"); v != "" {
-		k, err := strconv.Atoi(v)
-		if err != nil || k <= 0 {
-			t.Fatalf("bad SEGMENT_C_PHASE_R %q", v)
-		}
-		phaseR = k
-	}
-	// Custody margins to sweep: S = K + R per node. Absent, every node joins every topic.
-	var extras []int
-	if v := os.Getenv("SEGMENT_SUB_EXTRA"); v != "" {
-		for _, f := range strings.Split(v, ",") {
-			k, err := strconv.Atoi(strings.TrimSpace(f))
-			if err != nil || k < 0 {
-				t.Fatalf("bad SEGMENT_SUB_EXTRA %q", v)
-			}
-			extras = append(extras, k)
-		}
-	}
-
 	params.SetupTestConfigCleanup(t)
-	sk, err := bls.RandKey()
-	require.NoError(t, err)
-	payload := mainnetLikePayload(payloadLen, 11)
-	arm := segmentedArm(t, payload, segmentSizeBytes(t), sk, primitives.Slot(2048))
-	parity := 0
-	if v := os.Getenv("SEGMENT_PARITY"); v != "" {
-		// Coded topics: K+parity indices on the wire, one topic each, any K completing a node.
-		par, err := strconv.Atoi(v)
-		if err != nil || par <= 0 {
-			t.Fatalf("bad SEGMENT_PARITY %q", v)
-		}
-		arm = codedArm(t, payload, segmentSizeBytes(t), par, sk, primitives.Slot(2048))
-		parity = par
-	}
-	topicCount := len(arm.msgs)
-	if len(extras) > 0 && parity == 0 {
-		t.Fatalf("SEGMENT_SUB_EXTRA needs a coded group (SEGMENT_PARITY > 0): at K = N the only custody set that completes is every topic, which is plain variant C")
-	}
-	for _, extra := range extras {
-		if extra >= parity {
-			t.Fatalf("R=%d must stay below the parity margin N-K=%d, or S exceeds what coding can excuse", extra, parity)
-		}
-	}
-	// One cell per custody margin; a single cell with no custody when none is asked for.
-	custodies := []*int{nil}
-	if len(extras) > 0 {
-		custodies = custodies[:0]
-		for i := range extras {
-			custodies = append(custodies, &extras[i])
-		}
-	}
-
+	cell := cCellFromEnv(t)
 	for _, n := range sizes {
-		for _, extra := range custodies {
-			name := fmt.Sprintf("n=%d/T=%d", n, topicCount)
-			if arm.need > 0 {
-				name = fmt.Sprintf("%s/K=%d", name, arm.need)
-			}
-			v := &variantC{arm: arm, topicCount: topicCount, phaseR: phaseR}
-			if extra != nil {
-				v.custody, v.extra = true, *extra
-				name = fmt.Sprintf("%s/S=K+%d", name, *extra)
-			}
-			if phaseR > 0 {
-				name = fmt.Sprintf("%s/phase-r=%d", name, phaseR)
-			}
-			t.Run(name, func(t *testing.T) {
+		for _, extra := range cell.custodies() {
+			v := cell.variant(extra)
+			t.Run(cell.name(n, v), func(t *testing.T) {
 				runDiffusion(t, diffusionParams{
 					n:        n,
 					rate:     defaultRate,
@@ -292,9 +221,118 @@ func TestVariantCDiffusion(t *testing.T) {
 	}
 }
 
+// cCell is what the environment says about a variant C cell: the group (plain, or coded with
+// SEGMENT_PARITY), one topic per index, the phase push degree and the custody margins to sweep.
+// Factored out of TestVariantCDiffusion so the Shadow node builds the same group from the same
+// knobs.
+type cCell struct {
+	arm        wireArm
+	unit       int // the segment size
+	topicCount int
+	parity     int
+	phaseR     int
+	extras     []int // SEGMENT_SUB_EXTRA: custody margins R, S = K + R per node
+}
+
+// cCellFromEnv reads the cell's knobs and builds the group. params.SetupTestConfigCleanup must
+// have run.
+func cCellFromEnv(t *testing.T) cCell {
+	t.Helper()
+	var c cCell
+	payloadLen := 1 << 19
+	if os.Getenv("SEGMENT_SLOW_TESTS") != "" {
+		payloadLen = 1 << 20
+	}
+	if v := os.Getenv("SEGMENT_PAYLOAD_BYTES"); v != "" {
+		k, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("bad SEGMENT_PAYLOAD_BYTES %q: %v", v, err)
+		}
+		payloadLen = k
+	}
+	if v := os.Getenv("SEGMENT_C_PHASE_R"); v != "" {
+		k, err := strconv.Atoi(v)
+		if err != nil || k <= 0 {
+			t.Fatalf("bad SEGMENT_C_PHASE_R %q", v)
+		}
+		c.phaseR = k
+	}
+	// Custody margins to sweep: S = K + R per node. Absent, every node joins every topic.
+	if v := os.Getenv("SEGMENT_SUB_EXTRA"); v != "" {
+		for _, f := range strings.Split(v, ",") {
+			k, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil || k < 0 {
+				t.Fatalf("bad SEGMENT_SUB_EXTRA %q", v)
+			}
+			c.extras = append(c.extras, k)
+		}
+	}
+	sk, err := bls.RandKey()
+	require.NoError(t, err)
+	payload := mainnetLikePayload(payloadLen, 11)
+	c.unit = segmentSizeBytes(t)
+	c.arm = segmentedArm(t, payload, c.unit, sk, primitives.Slot(2048))
+	if v := os.Getenv("SEGMENT_PARITY"); v != "" {
+		// Coded topics: K+parity indices on the wire, one topic each, any K completing a node.
+		par, err := strconv.Atoi(v)
+		if err != nil || par <= 0 {
+			t.Fatalf("bad SEGMENT_PARITY %q", v)
+		}
+		c.arm = codedArm(t, payload, c.unit, par, sk, primitives.Slot(2048))
+		c.parity = par
+	}
+	c.topicCount = len(c.arm.msgs)
+	if len(c.extras) > 0 && c.parity == 0 {
+		t.Fatalf("SEGMENT_SUB_EXTRA needs a coded group (SEGMENT_PARITY > 0): at K = N the only custody set that completes is every topic, which is plain variant C")
+	}
+	for _, extra := range c.extras {
+		if extra >= c.parity {
+			t.Fatalf("R=%d must stay below the parity margin N-K=%d, or S exceeds what coding can excuse", extra, c.parity)
+		}
+	}
+	return c
+}
+
+// custodies is one cell per custody margin; a single cell with no custody when none is asked for.
+func (c cCell) custodies() []*int {
+	if len(c.extras) == 0 {
+		return []*int{nil}
+	}
+	out := make([]*int, len(c.extras))
+	for i := range c.extras {
+		out[i] = &c.extras[i]
+	}
+	return out
+}
+
+// variant is the cell's variant C at one custody margin (nil: every node joins every topic).
+func (c cCell) variant(extra *int) *variantC {
+	v := &variantC{arm: c.arm, unit: c.unit, topicCount: c.topicCount, phaseR: c.phaseR}
+	if extra != nil {
+		v.custody, v.extra = true, *extra
+	}
+	return v
+}
+
+// name is the subtest's name for one variant at n nodes.
+func (c cCell) name(n int, v *variantC) string {
+	name := fmt.Sprintf("n=%d/T=%d", n, c.topicCount)
+	if c.arm.need > 0 {
+		name = fmt.Sprintf("%s/K=%d", name, c.arm.need)
+	}
+	if v.custody {
+		name = fmt.Sprintf("%s/S=K+%d", name, v.extra)
+	}
+	if c.phaseR > 0 {
+		name = fmt.Sprintf("%s/phase-r=%d", name, c.phaseR)
+	}
+	return name
+}
+
 // variantC is the topic-per-segment strategy: every node subscribes to every segment topic,
 // or under custody to an S-of-N subset of a coded group.
 type variantC struct {
+	unit       int // the segment size
 	arm        wireArm
 	topicCount int
 	phaseR     int
@@ -304,6 +342,10 @@ type variantC struct {
 }
 
 func (v *variantC) name() string { return "variantC" }
+
+func (v *variantC) wireForm() wireForm {
+	return wireForm{msgs: len(v.arm.msgs), need: v.arm.completeAt(), unit: v.unit, total: v.arm.total, idBytes: idWidth(v.arm.msgs[0])}
+}
 
 // subscriptions is how many topics a node other than the publisher joins.
 func (v *variantC) subscriptions() int {
@@ -323,30 +365,112 @@ func (v *variantC) pubsubOpts(t *testing.T, _ int) []pubsub.Option {
 func (v *variantC) setup(t *testing.T, nw *simNetwork, p diffusionParams) diffusionRun {
 	n := nw.Len()
 	subs := make([][]*pubsub.Subscription, n)
-	pubTopics := make([]*pubsub.Topic, v.topicCount)
+	var pubTopics []*pubsub.Topic
+	for i, ps := range nw.Pubsubs {
+		topics, ss := v.joinNode(t, ps, i, p.seed)
+		subs[i] = ss
+		if i == 0 {
+			pubTopics = topics
+		}
+	}
+	return &cRun{v: v, nw: nw, subs: subs, pubTopics: pubTopics, n: n}
+}
+
+// topicsOf is the topic indices node idx joins: every index for the publisher and, without
+// custody, for everyone; a deterministic S-of-N subset under custody.
+func (v *variantC) topicsOf(seed uint64, idx int) []int {
+	if v.custody && idx > 0 {
+		return custodyTopics(seed, idx, v.topicCount, v.subscriptions())
+	}
 	all := make([]int, v.topicCount)
 	for j := range all {
 		all[j] = j
 	}
-	// The publisher joins every topic; every other node too, unless custody gives it a subset.
-	for i, ps := range nw.Pubsubs {
-		mine := all
-		if v.custody && i > 0 {
-			mine = custodyTopics(p.seed, i, v.topicCount, v.subscriptions())
-		}
-		for _, j := range mine {
-			th, err := ps.Join(segmentTopicIndexed(j))
-			require.NoError(t, err)
-			registerProcValidator(t, ps, segmentTopicIndexed(j))
-			if i == 0 {
-				pubTopics[j] = th
+	return all
+}
+
+// joinNode joins node idx's topics on ps and subscribes to each: the handles and subscriptions
+// in topic order (the publisher's handles are what publishFrom needs). The in-process setup
+// calls it for every node; the Shadow node, one process per node, once.
+func (v *variantC) joinNode(t *testing.T, ps *pubsub.PubSub, idx int, seed uint64) ([]*pubsub.Topic, []*pubsub.Subscription) {
+	t.Helper()
+	var topics []*pubsub.Topic
+	var subs []*pubsub.Subscription
+	for _, j := range v.topicsOf(seed, idx) {
+		th, err := ps.Join(segmentTopicIndexed(j))
+		require.NoError(t, err)
+		registerProcValidator(t, ps, segmentTopicIndexed(j))
+		sub, err := th.Subscribe(pubsub.WithBufferSize(subscriptionBuffer))
+		require.NoError(t, err)
+		topics = append(topics, th)
+		subs = append(subs, sub)
+	}
+	return topics, subs
+}
+
+// watchNode drains one node's subscriptions, each on its own goroutine on wg, into a shared
+// counter of distinct known segments, and calls onDone once the arm's completion count has
+// arrived (every one for a plain group, any K for a coded one). The goroutines run until ctx
+// ends, so a completed node keeps reading and its subscriptions never overflow.
+func (v *variantC) watchNode(ctx context.Context, wg *sync.WaitGroup, subs []*pubsub.Subscription, onDone func()) {
+	need := v.arm.completeAt()
+	var mu sync.Mutex
+	seen := make(map[digest]bool, len(subs))
+	for _, sub := range subs {
+		wg.Add(1)
+		go func(sub *pubsub.Subscription) {
+			defer wg.Done()
+			for {
+				msg, err := sub.Next(ctx)
+				if err != nil {
+					return
+				}
+				d := digestOf(msg.Data)
+				if _, ok := v.arm.known[d]; !ok {
+					continue
+				}
+				mu.Lock()
+				if !seen[d] {
+					seen[d] = true
+					if len(seen) == need {
+						onDone()
+					}
+				}
+				mu.Unlock()
 			}
-			sub, err := th.Subscribe(pubsub.WithBufferSize(subscriptionBuffer))
-			require.NoError(t, err)
-			subs[i] = append(subs[i], sub)
+		}(sub)
+	}
+}
+
+// drainSubs reads subscriptions that nobody watches (the publisher's own) so they do not fill
+// and report messages undeliverable, which reads exactly like a slow link.
+func drainSubs(ctx context.Context, wg *sync.WaitGroup, subs []*pubsub.Subscription) {
+	for _, sub := range subs {
+		wg.Add(1)
+		go func(sub *pubsub.Subscription) {
+			defer wg.Done()
+			for {
+				if _, err := sub.Next(ctx); err != nil {
+					return
+				}
+			}
+		}(sub)
+	}
+}
+
+// publishFrom publishes the group from the publisher's per-topic handles as one batch, the ids
+// in omit left out.
+func (v *variantC) publishFrom(ctx context.Context, topics []*pubsub.Topic, ps *pubsub.PubSub, omit map[int]bool) error {
+	var batch pubsub.MessageBatch
+	for j, m := range v.arm.msgs {
+		if omit[j] {
+			continue
+		}
+		if err := topics[j].AddToBatch(ctx, &batch, m); err != nil {
+			return err
 		}
 	}
-	return &cRun{v: v, nw: nw, subs: subs, pubTopics: pubTopics, n: n}
+	return ps.PublishBatch(&batch)
 }
 
 func (v *variantC) onTimeout(t *testing.T, completed, n int) {
@@ -397,60 +521,13 @@ func (r *cRun) cancel() {
 }
 
 func (r *cRun) watch(ctx context.Context, wg *sync.WaitGroup, start time.Time, signal func(int, time.Duration)) {
-	// A node is done when it has seen the arm's completion count of distinct segments across its
-	// per-topic subscriptions (every one for a plain arm, any K for a coded one); each
-	// subscription is drained by its own goroutine into a shared per-node counter.
-	need := r.v.arm.completeAt()
 	for i := 1; i < r.n; i++ {
-		var mu sync.Mutex
-		seen := make(map[digest]bool, len(r.subs[i]))
 		node := i
-		for _, sub := range r.subs[i] {
-			wg.Add(1)
-			go func(sub *pubsub.Subscription) {
-				defer wg.Done()
-				for {
-					msg, err := sub.Next(ctx)
-					if err != nil {
-						return
-					}
-					if _, ok := r.v.arm.known[digestOf(msg.Data)]; !ok {
-						continue
-					}
-					mu.Lock()
-					if !seen[digestOf(msg.Data)] {
-						seen[digestOf(msg.Data)] = true
-						if len(seen) == need {
-							signal(node, time.Since(start))
-						}
-					}
-					mu.Unlock()
-				}
-			}(sub)
-		}
+		r.v.watchNode(ctx, wg, r.subs[i], func() { signal(node, time.Since(start)) })
 	}
-	// The publisher's own subscriptions still need draining or they overflow.
-	for _, sub := range r.subs[0] {
-		wg.Add(1)
-		go func(sub *pubsub.Subscription) {
-			defer wg.Done()
-			for {
-				if _, err := sub.Next(ctx); err != nil {
-					return
-				}
-			}
-		}(sub)
-	}
+	drainSubs(ctx, wg, r.subs[0])
 }
 
 func (r *cRun) publish(ctx context.Context, t *testing.T) error {
-	var batch pubsub.MessageBatch
-	omit := failPublishOmit(t, len(r.v.arm.msgs))
-	for j, m := range r.v.arm.msgs {
-		if omit[j] {
-			continue
-		}
-		require.NoError(t, r.pubTopics[j].AddToBatch(ctx, &batch, m))
-	}
-	return r.nw.Pubsubs[0].PublishBatch(&batch)
+	return r.v.publishFrom(ctx, r.pubTopics, r.nw.Pubsubs[0], failPublishOmit(t, len(r.v.arm.msgs)))
 }

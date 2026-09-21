@@ -9,9 +9,9 @@ package rowintegrationtest
 // the cheapest of the R-questions and the one that decides whether R4(b), the network run, is
 // worth building.
 //
-// Prediction, written before running (notes/rowdas/experiments.md R4a): coverage saturates
-// fast. The coupon-collector shape means m = 25 members at k = 4 columns each should already
-// cover 64 distinct columns with high probability, so m = 94 is comfortable. The interesting
+// Prediction, written before running (R4a): coverage saturates fast. The coupon-collector shape
+// means m = 25 members at k = 4 columns each should already cover 64 distinct columns with high
+// probability, so m = 94 is comfortable. The interesting
 // regime is therefore *small* m -- a sparse row subnet -- not a mainnet-sized one, and the
 // threshold should be sharp in m and much weaker in k.
 

@@ -1,19 +1,19 @@
 package segmentintegrationtest
 
-// The two-publisher driver -- measurement-plan section 20.
+// The two-publisher driver.
 //
 // Every cell before this measured payload diffusion from a single publisher at t=0, with the block
-// nowhere in the model. That made the authority gate untestable in its real form: stages 2 and 3 of
-// section 21 had to fake authority with a synthetic offset, which models *universal inversion* --
-// every node lacking the block when the first segment arrives -- and that is the reverse of the
-// honest Gloas ordering.
+// nowhere in the model. That made the authority gate untestable in its real form: stages 2 and 3
+// of the gate work had to fake authority with a synthetic offset, which models *universal
+// inversion* -- every node lacking the block when the first segment arrives -- and that is the
+// reverse of the honest Gloas ordering.
 //
 // Here the ordering is real. The proposer publishes a block; the builder is a node in the network
 // that publishes segments only once the block reaches it; every node's authority to authenticate a
 // segment arrives when *its own* copy of the block installs. The block therefore has a structural
 // head start of one builder hop, and inversion becomes something to measure rather than to assume.
 //
-// Step 1 of the plan's build order: no behavioural gate. Gates run in shadow -- every decision
+// Step 1 of the build order: no behavioural gate. Gates run in shadow -- every decision
 // recorded, none acted on -- so the race being measured is the ungated one while still producing
 // the numbers that decide whether the gate and the sender-side evidence are worth building.
 

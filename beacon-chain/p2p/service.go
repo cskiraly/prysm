@@ -180,7 +180,7 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	if features.Get().SegmentedPayloadGossip == features.SegmentedPayloadPartial {
 		// Both broadcasters install a partial-messages extension, and gossipsub holds exactly
 		// one -- with one PeerState type. Refusing is the honest response; a union PeerState
-		// covering both applications is recorded in notes/TODO.md.
+		// covering both applications is a known follow-up.
 		if s.partialColumnBroadcaster != nil {
 			return nil, errors.New(
 				"--segmented-payload-gossip=partial cannot run alongside --partial-data-columns: " +

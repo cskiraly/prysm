@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Repeated-payload harness (measurement-plan section 15 gap 5).
+// Repeated-payload harness.
 //
 // Every other mesh test publishes one payload and tears down. Real block propagation is one
 // payload per slot, forever, on a standing peer set, where each node reaches a new block

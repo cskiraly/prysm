@@ -63,9 +63,9 @@ type Config struct {
 	// 400 ms) was that this is a correctness knob, and under heterogeneous latency no single
 	// constant is correct for both an 8 ms neighbour and a 110 ms one.
 	AdaptiveRequestTimeout bool
-	// WithholdServes is the F1 failure injection (notes/measurement-plan.md section 15): the
-	// node keeps announcing, receiving and pushing, but never answers a peer's wants. Test
-	// harness only; a production configuration must never set it.
+	// WithholdServes is the F1 failure injection: the node keeps announcing, receiving and
+	// pushing, but never answers a peer's wants. Test harness only; a production
+	// configuration must never set it.
 	WithholdServes bool
 	// CompressSegments snappy-compresses each segment inside the partial message, as the
 	// topic encoder does for an ordinary gossip message. The partial path never passes through
@@ -415,8 +415,8 @@ func (b *Broadcaster) Counters() Counters {
 // ServeTopic marks a topic as one we exchange segments on.
 //
 // An RPC naming any other topic is refused outright. Without this the group-state surface is
-// keyed by a peer-controlled topic id, which is the pre-admission problem recorded in
-// notes/TODO.md; restricting it to topics we actually joined is the cheap half of the fix.
+// keyed by a peer-controlled topic id, which is the known pre-admission problem; restricting it
+// to topics we actually joined is the cheap half of the fix.
 func (b *Broadcaster) ServeTopic(topic string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

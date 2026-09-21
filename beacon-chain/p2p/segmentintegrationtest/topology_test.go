@@ -184,7 +184,7 @@ func procCost() time.Duration {
 
 // procWorkers is SEGMENT_PROC_WORKERS, the validators a node runs concurrently under procCost;
 // default 4. Set explicitly because gossipsub's own default is the host's CPU count, which
-// would make the result depend on the box.
+// would make the result depend on the host running the test.
 func procWorkers() int {
 	if n, err := strconv.Atoi(os.Getenv("SEGMENT_PROC_WORKERS")); err == nil && n > 0 {
 		return n
@@ -242,10 +242,29 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 		t.Fatalf("bad SEGMENT_LATENCY_MODEL %q", os.Getenv("SEGMENT_LATENCY_MODEL"))
 	}
 
-	// Order matters and matches the baseline: the caller's options first, then this study's
-	// environment-driven substrate options, so an environment setting still wins a conflict
-	// with a caller setting rather than the other way round.
-	opts := append([]pubsub.Option{}, cfg.pubsubOpts...)
+	opts, perNode := substrateOpts(t, n, cfg.links, cfg.pubsubOpts, cfg.perNodeOpts)
+
+	return gossipsim.New(t, gossipsim.NetworkConfig{
+		Links:           cfg.links,
+		Edges:           cfg.edges,
+		Latency:         latency,
+		PubsubOpts:      opts,
+		PerNodeOpts:     perNode,
+		Overrides:       meshOverrides(),
+		LibraryDefaults: cfg.libraryDefaults,
+		WallClock:       cfg.wallClock,
+	})
+}
+
+// substrateOpts translates this study's environment into the network-wide pubsub options and the
+// per-node ones, in the order the baseline used: the caller's options first, then the
+// environment's, so an environment setting still wins a conflict with a caller setting. links
+// feed the regime rule; perNodeBase is the caller's per-node options (tracer, ids, the variant's).
+// Shared by the in-process constructor below and the Shadow node, which builds one node of the
+// same network in its own process.
+func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCount, base []pubsub.Option, perNodeBase func(int) []pubsub.Option) ([]pubsub.Option, func(int) []pubsub.Option) {
+	t.Helper()
+	opts := append([]pubsub.Option{}, base...)
 
 	t.Cleanup(func() { t.Logf("        %s", announceStats.Line()) })
 	// SEGMENT_CONTROL_COALESCE=1 folds a control-only RPC into the control-only RPC already
@@ -293,14 +312,14 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 	// regime rule chooses per node (regimeRuleFor): collected here and applied to every node
 	// unless the rule is on, in which case perNode gives it to the large-R nodes only.
 	var reqOpts []pubsub.Option
-	rr := regimeRuleFor(t, cfg.links, n)
+	rr := regimeRuleFor(t, links, n)
 	if v := os.Getenv("SEGMENT_IWANT_DISCIPLINE_MS"); v != "" {
 		ms, err := strconv.Atoi(v)
 		if err != nil || ms <= 0 {
 			t.Fatalf("bad SEGMENT_IWANT_DISCIPLINE_MS %q", v)
 		}
 		reqOpts = append(reqOpts, pubsub.WithIWantDiscipline(time.Duration(ms)*time.Millisecond))
-		// IHAVE-commitment enforcement (adversarial-cell-design tier-B #8): a request
+		// IHAVE-commitment enforcement (adversarial tier-B #8): a request
 		// expiring undelivered is a broken promise by its announcer; k breaks park the
 		// peer's announcements for the TTL. Requires the discipline, hence nested here.
 		if os.Getenv("SEGMENT_IHAVE_PARK") != "" {
@@ -373,8 +392,8 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 		// got -- the difference between "brake didn't help" and "brake never fired".
 		opts = append(opts, pubsub.WithAdaptiveHedge(dInit, dMin, dMax, target, qHigh, &adaptMinE, &adaptMaxOcc))
 	}
-	// F2b real queue pressure (measurement-plan section 15): a hash-selected fraction of
-	// nodes run a slowed outbound writer, so their rpcQueue overflows naturally. The
+	// F2b real queue pressure: a hash-selected fraction of nodes run a slowed outbound
+	// writer, so their rpcQueue overflows naturally. The
 	// overflow drops surface through the tracer's droppedRPCs, already summed as `drops`.
 	sendDelaySet := failSendDelaySet(t, n)
 	sendDelay := envDuration("SEGMENT_FAIL_SEND_DELAY_MS", 0)
@@ -389,8 +408,8 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 	detRand := os.Getenv("SEGMENT_DET_RAND") != ""
 	detSeed := int64(meshGraphSeed(t))
 
-	// F1 withholding (measurement-plan section 15): a fixed-size node set, selected by
-	// ranking hash(fail seed, index) so the schedule is identical across arms, answers
+	// F1 withholding: a fixed-size node set, selected by ranking hash(fail seed, index)
+	// so the schedule is identical across arms, answers
 	// IWANTs never (silent) or whole after a delay (slow). Publisher excluded -- that is
 	// F5's job. Exposure is counted in the fork and logged, not assumed.
 	var withheld atomic.Int64
@@ -399,8 +418,8 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 	if os.Getenv("SEGMENT_FAIL_WITHHOLD_MODE") == "slow" {
 		withholdDelay = envDuration("SEGMENT_FAIL_WITHHOLD_SLOW_MS", 800*time.Millisecond)
 	}
-	// E7 extensions of the withholder (hedge-and-adaptivity plan): a structural-index floor that
-	// restricts the injection to the ids at or above it (the last-piece screen), a count-ordered
+	// E7 extensions of the withholder: a structural-index floor that restricts the injection
+	// to the ids at or above it (the last-piece screen), a count-ordered
 	// prefix (fast then slow, or slow then fast: the median-poisoning screen's timed strategies),
 	// and hearsay announcing (the capture screen). All ride the withholder set.
 	withholdFrom := -1
@@ -488,8 +507,8 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 		})
 	}
 
-	// F2a per-class admission loss (measurement-plan section 15): every node sheds the
-	// configured class at queue admission with the given probability, decisions stateless
+	// F2a per-class admission loss: every node sheds the configured class at queue admission
+	// with the given probability, decisions stateless
 	// per (node seed, class, message id, destination address). Systemic, unlike F1's node
 	// subset -- queue pressure hits everyone.
 	var classDropped atomic.Int64
@@ -515,8 +534,8 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 		if rr.active && rr.large(i) {
 			out = append(out, reqOpts...)
 		}
-		if cfg.perNodeOpts != nil {
-			out = append(out, cfg.perNodeOpts(i)...)
+		if perNodeBase != nil {
+			out = append(out, perNodeBase(i)...)
 		}
 		if detRand {
 			out = append(out, pubsub.WithDeterministicRand(detSeed*1000003+int64(i)))
@@ -555,17 +574,7 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 		}
 		return out
 	}
-
-	return gossipsim.New(t, gossipsim.NetworkConfig{
-		Links:           cfg.links,
-		Edges:           cfg.edges,
-		Latency:         latency,
-		PubsubOpts:      opts,
-		PerNodeOpts:     perNode,
-		Overrides:       meshOverrides(),
-		LibraryDefaults: cfg.libraryDefaults,
-		WallClock:       cfg.wallClock,
-	})
+	return opts, perNode
 }
 
 // Connectivity degree, mesh degree, and why they must differ.
@@ -626,7 +635,7 @@ func envMbps(name string, def int) int {
 // SEGMENT_UP_MBPS or SEGMENT_DOWN_MBPS is set the link is asymmetric (an unset side falls back
 // to the symmetric rate for the uplink and a generous 10x for the downlink); otherwise the link
 // is symmetric at SEGMENT_MESH_MBPS, defaulting to defaultRate. The asymmetric, upload-bound
-// form is the base — see the note on asymmetricLinks and measurement-plan §16.
+// form is the base — see the note on asymmetricLinks.
 //
 // SEGMENT_BUILDER_UP_MBPS carves node 0 out as a well-provisioned builder with a symmetric
 // datacenter link, leaving the rest on the validator link above. In Gloas the payload is
@@ -699,7 +708,7 @@ func meshLinks(t *testing.T, n, defaultRate int) []simlibp2p.NodeLinkSettingsAnd
 	return out
 }
 
-// regimeRule is the oracle regime rule (hedge-and-adaptivity plan, E4/E5): SEGMENT_A_REGIME_RULE=1
+// regimeRule is the oracle regime rule (E4/E5): SEGMENT_A_REGIME_RULE=1
 // makes each node choose its A parameters from R, the payload's wire time on its own configured
 // uplink over the propagation round trip (SEGMENT_A_REGIME_RTT_MS, default 50), instead of from
 // the payload size alone: push degree r = 4 for R ≤ 0.85, 3 for R ≤ 1.3, 2 above; the request
@@ -793,6 +802,9 @@ func segmentSizeBytes(t *testing.T) int {
 	t.Helper()
 	v := os.Getenv("SEGMENT_SIZE_BYTES")
 	if v == "" {
+		if strictCells() {
+			t.Fatal("SEGMENT_STRICT: SEGMENT_SIZE_BYTES (or SEGMENT_FIXED_COUNT) must be set; the unit is part of the arm, not a default")
+		}
 		return segments.DefaultSegmentSize
 	}
 	k, err := strconv.Atoi(v)
@@ -856,8 +868,8 @@ func phasePubsubOptsMatch(t *testing.T, r int, match func(string) bool) []pubsub
 	if os.Getenv("SEGMENT_PHASE_FIXED_BUDGET") != "" {
 		opts = append(opts, pubsub.WithPhaseFixedBudget())
 	}
-	// Selection policy for the pushed subset (design-space §13): default sel=rank; "rr" is
-	// sender-side round-robin.
+	// Selection policy for the pushed subset: default sel=rank; "rr" is sender-side
+	// round-robin.
 	switch os.Getenv("SEGMENT_PHASE_SEL") {
 	case "", "rank":
 	case "rr":
@@ -1068,7 +1080,7 @@ func TestTopologyScaleCost(t *testing.T) {
 
 // TestMultiNodeTopologyForms is the smoke test for the helper itself: a topology larger than two
 // nodes comes up, meshes, and carries a message to a node that is not adjacent to the publisher.
-// It says nothing about timing -- see notes/experiments.md for what a timing claim needs.
+// It says nothing about timing.
 func TestMultiNodeTopologyForms(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const nodes = 4
@@ -1207,9 +1219,9 @@ func narrowHolders(t *testing.T, n int) (w int, holders []int) {
 	return w, holders
 }
 
-// failPublishOmit selects w shard indices the publisher never sends (F5 source omission,
-// measurement-plan section 15). Hash-ranked from a domain-separated fail seed so the set
-// is deterministic and stable across arms at a given w. For a coded arm with margin R,
+// failPublishOmit selects w shard indices the publisher never sends (F5 source omission).
+// Hash-ranked from a domain-separated fail seed so the set is deterministic and stable across
+// arms at a given w. For a coded arm with margin R,
 // w <= R is tolerated by construction; for an uncoded arm any w >= 1 leaves the omitted
 // segments unreachable, so completion is right-censored — the positive control that the
 // harness detects permanent omission as non-completion, not as a slow tail.
@@ -1241,7 +1253,7 @@ func failPublishOmit(t *testing.T, total int) map[int]bool {
 
 // failSelect returns the fixed-size non-publisher node set for a failure mode: pct percent
 // of n-1, ranked by hash(domain seed, index), stateless and identical across arms
-// (measurement-plan section 15 determinism). domain separates one mode's set from another's
+// (a determinism requirement). domain separates one mode's set from another's
 // at the same seed. Returns nil when pctEnv is unset.
 func failSelect(t *testing.T, n int, pctEnv string, domain uint64) map[int]bool {
 	t.Helper()
@@ -1278,9 +1290,8 @@ func failSendDelaySet(t *testing.T, n int) map[int]bool {
 }
 
 // failureDeadline is the slot-relevant completion deadline that rate@ reports against,
-// 4 s unless SEGMENT_DEADLINE_MS overrides it (measurement-plan section 15, phase 0). It
-// does not stop the run — completion beyond it still lands in the CDF; censoring happens
-// only at the harness timeout.
+// 4 s unless SEGMENT_DEADLINE_MS overrides it (phase 0). It does not stop the run — completion
+// beyond it still lands in the CDF; censoring happens only at the harness timeout.
 func failureDeadline(t *testing.T) time.Duration {
 	t.Helper()
 	v := os.Getenv("SEGMENT_DEADLINE_MS")
@@ -1301,8 +1312,8 @@ func failureDeadline(t *testing.T) time.Duration {
 var announceStats = &pubsub.IHaveRPCStats{}
 
 // meshGraphSeed is the seed every mesh experiment uses, 7 unless SEGMENT_SEED overrides it.
-// One seed per run is a known limitation, recorded in notes/TODO.md; the override is what a
-// multi-seed sweep varies, so cells with different seeds differ in topology but nothing else.
+// One seed per run is a known limitation; the override is what a multi-seed sweep varies, so
+// cells with different seeds differ in topology but nothing else.
 func meshGraphSeed(t *testing.T) uint64 {
 	t.Helper()
 	v := os.Getenv("SEGMENT_SEED")

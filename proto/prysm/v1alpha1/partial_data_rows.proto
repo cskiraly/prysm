@@ -38,7 +38,7 @@ message PartialDataRowSidecar {
   // cross-check: a mismatch is a REJECT, which surfaces a sender computing the mapping
   // against the wrong slot instead of letting it fail later as an invalid proof. It is also
   // the field a multi-row-per-subnet rule would need once the blob count can exceed
-  // ROW_SUBNET_COUNT; see notes/rowdas/design.md section 6.1.
+  // ROW_SUBNET_COUNT.
   uint64 row_index = 1;
   bytes cells_present_bitmap = 2 [
     (ethereum.eth.ext.ssz_max) = "number_of_columns.size",

@@ -146,8 +146,8 @@ func updateRowPeerStateFromIncomingRPC(peerState blocks.PartialDataColumnPeerSta
 		if err != nil {
 			// Anything the shared merge rejects is a malformed message, and on a row topic
 			// that is the peer's fault. The shared helper returns a plain error because the
-			// column path is shipped and its scoring is not this branch's decision to change;
-			// see notes/rowdas/TODO.md.
+			// column path is shipped and its scoring is not this branch's decision to
+			// change.
 			return peerState, nil, errors.Wrap(errMalformedPartialMessage, err.Error())
 		}
 		// Both bitmaps, not just Available. Requests is the one cellsToSendToPeer intersects

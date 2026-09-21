@@ -2,7 +2,7 @@ package kzg
 
 // What does recovering a row actually cost, and how much of it is the proofs?
 //
-// RowDAS prices its reconstruction duty in these numbers (notes/rowdas/TODO.md D5), and the first
+// RowDAS prices its reconstruction duty in these numbers, and the first
 // pricing used RecoverCellsAndKZGProofs throughout without checking how much of that is the proof
 // computation rather than the erasure decode. These two benchmarks are the split.
 

@@ -57,8 +57,7 @@ type RowCallbacks interface {
 	// complete locally takes longer than the whole phase-1 window, or never.
 	//
 	// The claim is unverified, which is why both halves are required and why the callback should
-	// treat it as a reason to push the work later rather than to drop it. See notes/rowdas/TODO.md
-	// D5.
+	// treat it as a reason to push the work later rather than to drop it.
 	RowServedElsewhere(topic string, groupID []byte, rowIndex uint64)
 	// RowRequestInterest reports what this node can use of a row: `keep` is the cells it
 	// stores, i.e. the cells of the columns it custodies, and `poolToThreshold` is whether it
@@ -247,7 +246,7 @@ func (p *PartialColumnBroadcaster) onIncomingRowRPC(
 	}
 	if isGloas {
 		// Rows share the block's column group id, and the Gloas column form is not emitted
-		// for rows yet. See notes/rowdas/design.md section 4.
+		// for rows yet.
 		p.logger.WithFields(logrus.Fields{"peer": from, "topic": topicID}).Debug("Ignoring gloas-form row group id")
 		return errRowGroupIDNotFulu
 	}
@@ -342,8 +341,7 @@ func rowIndexForSubnet(rowSubnet uint64, slot primitives.Slot, blobCount uint64)
 		return blobIndices[0], nil
 	default:
 		// Only reachable when the blob count exceeds ROW_SUBNET_COUNT, which the wire format
-		// does not handle yet: one group id cannot carry two independent bitmaps. See
-		// notes/rowdas/design.md section 6.1.
+		// does not handle yet: one group id cannot carry two independent bitmaps.
 		return 0, errRowSubnetMultiRow
 	}
 }

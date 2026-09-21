@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Q10: does the configuration we actually ship help? See notes/experiments.md.
+// Q10: does the configuration we actually ship help?
 //
 // Every timing arm before this compared segmented gossip against whole-message gossip, which
 // describes a protocol we do not ship. `publishEnvelopeSegments` runs *after*

@@ -200,10 +200,10 @@ func JoinAndSubscribe(t *testing.T, nw *Network, topicStr string, wallClock bool
 // StartBackgroundTraffic makes every node flood a separate gossip topic with random-entropy
 // messages for the run's duration, so the payload under study competes with co-resident load for
 // the same per-node uplinks and outbound queues -- the pressure a single payload cannot create
-// (F2b finding; notes/measurement-plan.md section 15 gap 1, standing in for attestation, blob and
-// DAS gossip). interval and msgBytes set each node's own publish cadence and size; the aggregate
-// seen by any node is that times its mesh in-degree, as with real gossip. Returns a stop func and
-// a per-node sent-bytes counter for verified exposure. A non-positive interval is a no-op.
+// (F2b finding, standing in for attestation, blob and DAS gossip). interval and msgBytes set each
+// node's own publish cadence and size; the aggregate seen by any node is that times its mesh
+// in-degree, as with real gossip. Returns a stop func and a per-node sent-bytes counter for
+// verified exposure. A non-positive interval is a no-op.
 //
 // The publisher goroutines live in the caller's synctest bubble and must be stopped before it
 // exits: cancel the returned context, then the caller's own defer wg.Wait already drains them.

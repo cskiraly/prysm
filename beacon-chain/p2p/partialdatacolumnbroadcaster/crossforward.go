@@ -258,7 +258,7 @@ func (p *PartialColumnBroadcaster) pushColumnFromRow(row *blocks.PartialDataRow,
 	}
 	// Request nothing. A column left to its default asks for every cell it lacks, and asking a
 	// subnet we do not custody for cells is the pull direction, which is a separate arm gated on
-	// a framework change (notes/rowdas/TODO.md F1). Pushing must not smuggle it in.
+	// a framework change. Pushing must not smuggle it in.
 	if err := column.SetPartsRequests(bitfield.NewBitlist(column.KzgCommitmentCount())); err != nil {
 		return blocks.PartialDataColumn{}, errors.Wrap(err, "clear parts requests on push column")
 	}

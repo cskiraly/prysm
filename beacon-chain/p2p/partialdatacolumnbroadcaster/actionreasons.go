@@ -27,8 +27,6 @@ import (
 // short-circuits the availability test, so a single label per action would mis-attribute. The
 // counters are therefore keyed by the whole reason set, and Fold sums whichever bits a caller asks
 // about.
-//
-// See notes/rowdas/plan-repair.md section 3.
 
 // actionReasonCounts tallies publish actions by reason set and by axis.
 type actionReasonCounts struct {

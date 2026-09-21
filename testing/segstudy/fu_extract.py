@@ -133,7 +133,7 @@ def parse(path):
                        partial_rx_rpcs=int(prxr), publisher_bytes=int(pub), dropped_rpcs=int(dropped),
                        full_gossip_rx_node_bytes=int(fg_rx),
                        # B's data travels as partial-message bytes: per-node receive = partial rx / n, plus any
-                       # full-gossip bytes. Uncompressed wire (measurement plan §13).
+                       # full-gossip bytes. Uncompressed wire.
                        rx_node_bytes=int(prx) // n + int(fg_rx))
         return rec
     rec["harness"] = "unparsed"

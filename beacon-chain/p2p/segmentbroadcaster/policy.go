@@ -40,8 +40,8 @@ const (
 	PushNone
 	// PushPhase pushes eagerly early and falls back to announce late, using the number of
 	// peers known to hold a segment as the local estimate of how far it has diffused. This
-	// is PPPT's push-pull phase transition (notes/references/pppt-push-pull.md) with the
-	// bitmap state standing in for a hop counter: a segment is volunteered to its top
+	// is PPPT's push-pull phase transition with the bitmap state standing in for a hop
+	// counter: a segment is volunteered to its top
 	// max(0, replication - knownHolders) rendezvous peers, so the push degree decays to
 	// zero exactly where duplicates concentrate -- late in the diffusion.
 	PushPhase

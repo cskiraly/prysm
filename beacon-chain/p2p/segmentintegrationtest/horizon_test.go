@@ -6,7 +6,7 @@ package segmentintegrationtest
 // path returned before aggregating), and no cell had ever reported how long its requests took
 // to be answered, how many were still open, or how much of its writers' time the transport held.
 // The snapshot is passive: it reads the tracers, the routers' request ledgers and their outbound
-// queues, and decides nothing (hedge-and-adaptivity plan, E0).
+// queues, and decides nothing (E0).
 
 import (
 	"fmt"

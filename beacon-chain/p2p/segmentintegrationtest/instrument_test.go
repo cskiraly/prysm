@@ -6,8 +6,8 @@ package segmentintegrationtest
 // generators were written here and promoted to testing/gossipsim so the RowDAS study could use
 // the same substrate. The aliases below keep this package's names.
 //
-// The two tests are unchanged. They are what justifies trusting every byte figure in
-// notes/experiments.md, so they stay next to the study that quotes them.
+// The two tests are unchanged. They are what justifies trusting every byte figure the study
+// reports, so they stay next to it.
 
 import (
 	"bytes"

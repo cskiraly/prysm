@@ -4,11 +4,10 @@ package segmentintegrationtest
 //
 // What this establishes, and what it deliberately does not. It establishes that the mechanism
 // works over a real simulated network -- negotiation, bitmap exchange, push, pull, reassembly,
-// authentication -- and it reports the quantity the design is judged on: bytes received per
-// node. It does not yet establish the Q13 result. Two harness gaps stand in the way and are
-// recorded in notes/TODO.md: connectivity degree still equals D, so there are no non-mesh
-// peers and the announce path to them is untested, and the mesh arms have no warm-up so
-// everything here includes QUIC slow start.
+// authentication -- and it reports the quantity the design is judged on: bytes received per node.
+// It does not yet establish the Q13 result. Two known harness gaps stand in the way: connectivity
+// degree still equals D, so there are no non-mesh peers and the announce path to them is untested,
+// and the mesh arms have no warm-up so everything here includes QUIC slow start.
 //
 // The three arms are the policy knob, not three designs. See segmentbroadcaster.Policy.
 
@@ -100,14 +99,9 @@ func segmentMessagesFor(t *testing.T, sk bls.SecretKey, slot primitives.Slot, pa
 // payload commits to, so a descriptor that would be refused on the network is refused here.
 // Nothing in this path is stubbed except the commitment lookup, which stands in for the bid
 // field the block will eventually carry.
-func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, pushDivisor int, pk []byte, slot primitives.Slot) []*variantBNode {
+func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, pushDivisor int, groups int) []*variantBNode {
 	t.Helper()
-	logger := logrus.New()
-	if os.Getenv("SEGMENT_DEBUG") != "" {
-		logger.SetLevel(logrus.DebugLevel)
-	} else {
-		logger.SetLevel(logrus.ErrorLevel)
-	}
+	logger := bLogger()
 	withholdSet := failWithholdSet(t, n)
 	if len(withholdSet) > 0 {
 		t.Cleanup(func() {
@@ -116,60 +110,80 @@ func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, rep
 	}
 	out := make([]*variantBNode, n)
 	for i := range out {
-		out[i] = &variantBNode{
-			done: make(chan struct{}),
-			broadcaster: segmentbroadcaster.New(context.Background(), logger, segmentbroadcaster.Config{
-				Policy:         policy,
-				WithholdServes: withholdSet[i],
-				Replication:    replication,
-				// Coordinated pushing. The divisor is the connectivity degree, so a receiver
-				// expects one pushed copy per segment: each of its ~degree in-neighbours
-				// volunteers with probability 1/degree. Zero keeps the uncoordinated rule.
-				PushDivisor: pushDivisor,
-				// Must cover a round trip plus the sender's transmission of what it volunteered,
-				// on the same reasoning as RequestTimeout -- and past it everything missing is
-				// requested regardless, so a lost push cannot strand a segment.
-				PushGrace: envDuration("SEGMENT_PUSH_GRACE_MS", 16*defaultLatency),
-				// The request timeout has to cover a round trip *plus* the time for the peer
-				// to transmit everything asked of it, not just a round trip. Here that is
-				// 50 ms RTT + 512 KB at 50 Mbps = ~132 ms at minimum, and more when several
-				// peers ask the same peer at once.
-				//
-				// Getting this wrong is expensive and does not look like a timing problem: a
-				// claim that lapses early is re-aimed at a *different* peer, and both send, so
-				// the duplication the variant exists to remove comes straight back. Measured
-				// on the split arm: 1.55 copies per node at 75 ms against 1.05 at 400 ms.
-				RequestTimeout: requestTimeoutOverride(16 * defaultLatency),
-				RetryInterval:  envDuration("SEGMENT_RETRY_INTERVAL_MS", 4*defaultLatency),
-				// Fresh-claim cap per peer per pass: pipelines the pull instead of mobbing
-				// the first holder. Zero keeps the claim-everything behaviour.
-				ClaimPerPeer: envCount("SEGMENT_CLAIM_PER_PEER", 0),
-				// Coded groups only: claims kept outstanding beyond K (the tail surplus coded A
-				// gets from stop-pull's over-ask). Zero claims exactly what completes the node.
-				RequestSurplus: envCount("SEGMENT_CLAIM_SURPLUS", 0),
-				// Pushes in RPCs of at most this many segments, round-robin across peers, instead of
-				// one bundle per peer (A's batch-publishing order). Zero keeps the bundle.
-				PushChunk: envCount("SEGMENT_PUSH_CHUNK", 0),
-				// Per-peer announce batching window (rowdas announce policy). Zero sends
-				// every metadata change immediately.
-				AnnounceWindow: envDuration("SEGMENT_ANNOUNCE_WINDOW_MS", 0),
-				// Failure memory for the withholding row: avoid a peer after this many
-				// lapsed claims, for SEGMENT_STRIKE_TTL_MS. Zero keeps no memory.
-				StrikeCap: envCount("SEGMENT_STRIKE_CAP", 0),
-				StrikeTTL: envDuration("SEGMENT_STRIKE_TTL_MS", 0),
-				// Coded groups only: hold new requests back this long so in-flight pushes
-				// count toward K first. Zero requests immediately, as plain groups always do.
-				RequestDefer: envDuration("SEGMENT_REQUEST_DEFER_MS", 0),
-				// Per-peer claim expiry from measured claim-to-arrival times, for
-				// heterogeneous-latency runs where no fixed constant fits every pair.
-				AdaptiveRequestTimeout: os.Getenv("SEGMENT_ADAPTIVE_TIMEOUT") != "",
-				// Snappy each segment inside the part, as the gossip encoder does for
-				// variant A's messages; off is the raw wire every B row before 2026-09-08 ran on.
-				CompressSegments: os.Getenv("SEGMENT_PARTIAL_COMPRESS") != "",
-			}),
-		}
+		out[i] = newVariantBNode(logger, policy, replication, pushDivisor, withholdSet[i], groups)
 	}
 	return out
+}
+
+// bLogger is the broadcasters' logger: errors only, or debug under SEGMENT_DEBUG.
+func bLogger() *logrus.Logger {
+	logger := logrus.New()
+	if os.Getenv("SEGMENT_DEBUG") != "" {
+		logger.SetLevel(logrus.DebugLevel)
+	} else {
+		logger.SetLevel(logrus.ErrorLevel)
+	}
+	return logger
+}
+
+// newVariantBNode is one node's broadcaster on the cell's policy and knobs; withhold puts it on
+// the withholding set, groups is how many envelopes complete it. The in-process cell builds
+// every node; the Shadow node, one process per node, builds its own.
+func newVariantBNode(logger *logrus.Logger, policy segmentbroadcaster.Policy, replication, pushDivisor int, withhold bool, groups int) *variantBNode {
+	node := &variantBNode{
+		done: make(chan struct{}),
+		broadcaster: segmentbroadcaster.New(context.Background(), logger, segmentbroadcaster.Config{
+			Policy:         policy,
+			WithholdServes: withhold,
+			Replication:    replication,
+			// Coordinated pushing. The divisor is the connectivity degree, so a receiver
+			// expects one pushed copy per segment: each of its ~degree in-neighbours
+			// volunteers with probability 1/degree. Zero keeps the uncoordinated rule.
+			PushDivisor: pushDivisor,
+			// Must cover a round trip plus the sender's transmission of what it volunteered,
+			// on the same reasoning as RequestTimeout -- and past it everything missing is
+			// requested regardless, so a lost push cannot strand a segment.
+			PushGrace: envDuration("SEGMENT_PUSH_GRACE_MS", 16*defaultLatency),
+			// The request timeout has to cover a round trip *plus* the time for the peer
+			// to transmit everything asked of it, not just a round trip. Here that is
+			// 50 ms RTT + 512 KB at 50 Mbps = ~132 ms at minimum, and more when several
+			// peers ask the same peer at once.
+			//
+			// Getting this wrong is expensive and does not look like a timing problem: a
+			// claim that lapses early is re-aimed at a *different* peer, and both send, so
+			// the duplication the variant exists to remove comes straight back. Measured
+			// on the split arm: 1.55 copies per node at 75 ms against 1.05 at 400 ms.
+			RequestTimeout: requestTimeoutOverride(16 * defaultLatency),
+			RetryInterval:  envDuration("SEGMENT_RETRY_INTERVAL_MS", 4*defaultLatency),
+			// Fresh-claim cap per peer per pass: pipelines the pull instead of mobbing
+			// the first holder. Zero keeps the claim-everything behaviour.
+			ClaimPerPeer: envCount("SEGMENT_CLAIM_PER_PEER", 0),
+			// Coded groups only: claims kept outstanding beyond K (the tail surplus coded A
+			// gets from stop-pull's over-ask). Zero claims exactly what completes the node.
+			RequestSurplus: envCount("SEGMENT_CLAIM_SURPLUS", 0),
+			// Pushes in RPCs of at most this many segments, round-robin across peers, instead of
+			// one bundle per peer (A's batch-publishing order). Zero keeps the bundle.
+			PushChunk: envCount("SEGMENT_PUSH_CHUNK", 0),
+			// Per-peer announce batching window (rowdas announce policy). Zero sends
+			// every metadata change immediately.
+			AnnounceWindow: envDuration("SEGMENT_ANNOUNCE_WINDOW_MS", 0),
+			// Failure memory for the withholding row: avoid a peer after this many
+			// lapsed claims, for SEGMENT_STRIKE_TTL_MS. Zero keeps no memory.
+			StrikeCap: envCount("SEGMENT_STRIKE_CAP", 0),
+			StrikeTTL: envDuration("SEGMENT_STRIKE_TTL_MS", 0),
+			// Coded groups only: hold new requests back this long so in-flight pushes
+			// count toward K first. Zero requests immediately, as plain groups always do.
+			RequestDefer: envDuration("SEGMENT_REQUEST_DEFER_MS", 0),
+			// Per-peer claim expiry from measured claim-to-arrival times, for
+			// heterogeneous-latency runs where no fixed constant fits every pair.
+			AdaptiveRequestTimeout: os.Getenv("SEGMENT_ADAPTIVE_TIMEOUT") != "",
+			// Snappy each segment inside the part, as the gossip encoder does for
+			// variant A's messages; off is the raw wire every B row before 2026-09-08 ran on.
+			CompressSegments: os.Getenv("SEGMENT_PARTIAL_COMPRESS") != "",
+		}),
+	}
+	node.remaining.Store(int32(max(groups, 1))) // lint:ignore uintcast -- a small env count
+	return node
 }
 
 // requestTimeoutOverride lets a sweep vary the one timing knob announce-then-pull has.
@@ -212,21 +226,9 @@ func envDuration(name string, def time.Duration) time.Duration {
 
 // TestVariantBDiffusion is the end-to-end claim for variant B, across all three arms.
 func TestVariantBDiffusion(t *testing.T) {
-	segmentSize := segmentSizeBytes(t)
-	// Small by default so the package stays inside its Bazel budget; the sizes that matter for
-	// a comparison against variant A are opt-in, exactly as Q6's are.
-	//
-	// 30 is not a measurement size either -- the standing operating point is n=500 with a 1 MiB
-	// payload (see notes/experiments.md) -- but it is the smallest size that is not actively
-	// misleading. A mesh experiment needs connectivity degree above Dhi=12 for any peer to be
-	// outside the mesh, so it needs at least 14 nodes; below that, gossip and announce paths
-	// cannot run whatever the graph. meshGraph refuses to build such a network rather than
-	// quietly producing one.
 	sizes := []int{30}
-	payloadLen := 1 << 19
 	if os.Getenv("SEGMENT_SLOW_TESTS") != "" {
 		sizes = []int{30, 150, 500}
-		payloadLen = 1 << 20
 	}
 	if v := os.Getenv("SEGMENT_MESH_SIZES"); v != "" {
 		sizes = nil
@@ -238,40 +240,86 @@ func TestVariantBDiffusion(t *testing.T) {
 			sizes = append(sizes, k)
 		}
 	}
-	// The r of design-space dimension 9. split is r=1 and pays a round trip for what it does
-	// not cover; PushAll is effectively r=len(peers). Nothing between had been run.
-	replications := []int{1}
+	params.SetupTestConfigCleanup(t)
+	cell := bCellFromEnv(t)
+	for _, n := range sizes {
+		for _, policy := range cell.policies {
+			for _, replication := range cell.replications {
+				usesR := policy == segmentbroadcaster.PushSplit || policy == segmentbroadcaster.PushPhase
+				if !usesR && replication != cell.replications[0] {
+					continue
+				}
+				for _, parity := range cell.parities {
+					name := fmt.Sprintf("n=%d/%s", n, policy.String())
+					if usesR {
+						name = fmt.Sprintf("n=%d/%s/r=%d", n, policy.String(), replication)
+					}
+					if parity > 0 {
+						name = fmt.Sprintf("%s/p=%d", name, parity)
+					}
+					t.Run(name, func(t *testing.T) {
+						runDiffusion(t, diffusionParams{
+							n:        n,
+							rate:     defaultRate,
+							latency:  defaultLatency,
+							deadline: failureDeadline(t),
+							seed:     meshGraphSeed(t),
+						}, cell.variant(t, n, policy, replication, parity))
+					})
+				}
+			}
+		}
+	}
+}
+
+// bCell is what the environment says about a variant B cell: the segment size, the payload, the
+// policies, replications and parities to sweep, the push divisor and the group count. Factored
+// out of TestVariantBDiffusion so the Shadow node builds the same groups from the same knobs.
+type bCell struct {
+	segmentSize  int
+	payload      []byte
+	policies     []segmentbroadcaster.Policy
+	replications []int
+	parities     []int
+	pushDivisor  int
+	groups       int
+	pk           []byte
+	slot         primitives.Slot
+}
+
+// bCellFromEnv reads the cell's knobs. params.SetupTestConfigCleanup must have run.
+func bCellFromEnv(t *testing.T) bCell {
+	t.Helper()
+	c := bCell{segmentSize: segmentSizeBytes(t), replications: []int{1}, parities: []int{0}, slot: primitives.Slot(2048)}
+	payloadLen := 1 << 19
+	if os.Getenv("SEGMENT_SLOW_TESTS") != "" {
+		payloadLen = 1 << 20
+	}
 	if v := os.Getenv("SEGMENT_REPLICATION"); v != "" {
-		replications = nil
+		c.replications = nil
 		for _, f := range strings.Split(v, ",") {
 			k, err := strconv.Atoi(strings.TrimSpace(f))
 			if err != nil {
 				t.Fatalf("bad SEGMENT_REPLICATION %q: %v", v, err)
 			}
-			replications = append(replications, k)
+			c.replications = append(c.replications, k)
 		}
 	}
-	// 0 = uncoordinated (rendezvous ranking). Set to the connectivity degree to coordinate.
-	pushDivisor := 0
 	if v := os.Getenv("SEGMENT_PUSH_DIVISOR"); v != "" {
 		k, err := strconv.Atoi(v)
 		if err != nil {
 			t.Fatalf("bad SEGMENT_PUSH_DIVISOR %q: %v", v, err)
 		}
-		pushDivisor = k
+		c.pushDivisor = k
 	}
-	// The parity axis of design-space dimension 1. Zero is the K-of-K baseline; p parity
-	// segments make the group any-K-of-(K+p), so a push of *any* new index is progress and
-	// requests are budgeted at K rather than at everything.
-	parities := []int{0}
 	if v := os.Getenv("SEGMENT_PARITY"); v != "" {
-		parities = nil
+		c.parities = nil
 		for _, f := range strings.Split(v, ",") {
 			k, err := strconv.Atoi(strings.TrimSpace(f))
 			if err != nil {
 				t.Fatalf("bad SEGMENT_PARITY %q: %v", v, err)
 			}
-			parities = append(parities, k)
+			c.parities = append(c.parities, k)
 		}
 	}
 	if v := os.Getenv("SEGMENT_PAYLOAD_BYTES"); v != "" {
@@ -281,22 +329,15 @@ func TestVariantBDiffusion(t *testing.T) {
 		}
 		payloadLen = k
 	}
-	// SEGMENT_B_GROUPS=g cuts the payload into g groups, each a partial message on its own topic:
-	// variant B's per-link bitmaps inside each group, variant C's independent meshes across
-	// groups (design-space §2, the fourth mapping). 1 is variant B as measured everywhere else.
-	groups := envCount("SEGMENT_B_GROUPS", 1)
-	if groups < 1 {
-		t.Fatalf("bad SEGMENT_B_GROUPS %d (want >= 1)", groups)
+	c.groups = envCount("SEGMENT_B_GROUPS", 1)
+	if c.groups < 1 {
+		t.Fatalf("bad SEGMENT_B_GROUPS %d (want >= 1)", c.groups)
 	}
-	params.SetupTestConfigCleanup(t)
 	sk, err := bls.RandKey()
 	require.NoError(t, err)
-	pk := sk.PublicKey().Marshal()
-	const slot = primitives.Slot(2048)
-	payload := mainnetLikePayload(payloadLen, 11)
-
-	// Which arms to run, so a sweep over another axis need not pay for all three.
-	policies := []segmentbroadcaster.Policy{
+	c.pk = sk.PublicKey().Marshal()
+	c.payload = mainnetLikePayload(payloadLen, 11)
+	c.policies = []segmentbroadcaster.Policy{
 		segmentbroadcaster.PushSplit,
 		segmentbroadcaster.PushAll,
 		segmentbroadcaster.PushNone,
@@ -308,72 +349,55 @@ func TestVariantBDiffusion(t *testing.T) {
 			"none":  segmentbroadcaster.PushNone,
 			"phase": segmentbroadcaster.PushPhase,
 		}
-		policies = nil
+		c.policies = nil
 		for _, f := range strings.Split(v, ",") {
 			p, ok := byName[strings.TrimSpace(f)]
 			if !ok {
 				t.Fatalf("bad SEGMENT_POLICIES %q", v)
 			}
-			policies = append(policies, p)
+			c.policies = append(c.policies, p)
 		}
 	}
+	return c
+}
 
-	for _, n := range sizes {
-		for _, policy := range policies {
-			for _, replication := range replications {
-				// r only means anything for split and phase; running the other arms once each
-				// keeps the grid honest instead of reporting the same cell repeatedly.
-				usesR := policy == segmentbroadcaster.PushSplit || policy == segmentbroadcaster.PushPhase
-				if !usesR && replication != replications[0] {
-					continue
-				}
-				for _, parity := range parities {
-					name := fmt.Sprintf("n=%d/%s", n, policy.String())
-					if usesR {
-						name = fmt.Sprintf("n=%d/%s/r=%d", n, policy.String(), replication)
-					}
-					if parity > 0 {
-						name = fmt.Sprintf("%s/p=%d", name, parity)
-					}
-					t.Run(name, func(t *testing.T) {
-						parts := splitPayload(payload, groups)
-						msgsByGroup := make([][]*segments.SegmentMessage, 0, groups)
-						for _, part := range parts {
-							msgs := segmentMessagesFor(t, sk, slot, part, segmentSize, parity)
-							require.Equal(t, true, len(msgs) > 1)
-							msgsByGroup = append(msgsByGroup, msgs)
-						}
-						runDiffusion(t, diffusionParams{
-							n:        n,
-							rate:     defaultRate,
-							latency:  defaultLatency,
-							deadline: failureDeadline(t),
-							seed:     meshGraphSeed(t),
-						}, &variantB{
-							n:           n,
-							replication: replication,
-							pushDivisor: pushDivisor,
-							policy:      policy,
-							pk:          pk,
-							slot:        slot,
-							payload:     payload,
-							groups:      groups,
-							parts:       parts,
-							msgs:        msgsByGroup[0],
-							msgsByGroup: msgsByGroup,
-						})
-					})
-				}
-			}
+// variant is the cell's variant B at n nodes on one policy, replication and parity: the payload
+// cut into groups and each group's segment messages.
+func (c bCell) variant(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, parity int) *variantB {
+	t.Helper()
+	parts := splitPayload(c.payload, c.groups)
+	msgsByGroup := make([][]*segments.SegmentMessage, 0, c.groups)
+	wireBytes := 0
+	for _, part := range parts {
+		msgs := segmentMessagesFor(t, nil, c.slot, part, c.segmentSize, parity)
+		require.Equal(t, true, len(msgs) > 1)
+		msgsByGroup = append(msgsByGroup, msgs)
+		for _, m := range msgs {
+			enc, err := m.Marshal()
+			require.NoError(t, err)
+			wireBytes += len(enc)
 		}
+	}
+	return &variantB{
+		n:           n,
+		unit:        c.segmentSize,
+		wireBytes:   wireBytes,
+		replication: replication,
+		pushDivisor: c.pushDivisor,
+		policy:      policy,
+		pk:          c.pk,
+		slot:        c.slot,
+		payload:     c.payload,
+		groups:      c.groups,
+		parts:       parts,
+		msgs:        msgsByGroup[0],
+		msgsByGroup: msgsByGroup,
 	}
 }
 
-// variantB is the announce-then-pull strategy: segments ride one topic as partial-message parts,
-// and a per-node broadcaster negotiates, pushes, pulls, and reassembles. Unlike A/C/D the receive
-// path is owned by the broadcaster and completion is a callback (OnEnvelope), not a subscription
-// scan; the run's watchers translate that callback into the driver's signal.
 type variantB struct {
+	unit        int // the segment size
+	wireBytes   int // the groups' segment messages, encoded
 	n           int
 	replication int
 	pushDivisor int
@@ -389,6 +413,17 @@ type variantB struct {
 }
 
 func (v *variantB) name() string { return "variantB" }
+
+// wireForm: every group's messages, the required count summed, the segment size, the encoded
+// segment messages' bytes; no gossip message ids on this path.
+func (v *variantB) wireForm() wireForm {
+	w := wireForm{unit: v.unit, total: v.wireBytes}
+	for _, msgs := range v.msgsByGroup {
+		w.msgs += len(msgs)
+		w.need += int(msgs[0].Descriptor.Required()) // lint:ignore uintcast -- bounded by MaxSegments.
+	}
+	return w
+}
 
 // topicNames is the envelope topic for a single group, or one topic per group.
 func (v *variantB) topicNames() []string {
@@ -419,10 +454,7 @@ func (v *variantB) pubsubOpts(t *testing.T, i int) []pubsub.Option {
 	// bubble never counts as a durable block, so synctest could not advance virtual time and every
 	// cell would crawl in real time. The driver adds the tracer to what AppendPubSubOpts returns.
 	if v.nodes == nil {
-		v.nodes = newVariantBNodes(t, v.n, v.policy, v.replication, v.pushDivisor, v.pk, v.slot)
-		for _, node := range v.nodes {
-			node.remaining.Store(int32(max(v.groups, 1))) // lint:ignore uintcast -- a small env count
-		}
+		v.nodes = newVariantBNodes(t, v.n, v.policy, v.replication, v.pushDivisor, v.groups)
 	}
 	return v.nodes[i].broadcaster.AppendPubSubOpts(nil)
 }
@@ -431,61 +463,79 @@ func (v *variantB) setup(t *testing.T, nw *simNetwork, _ diffusionParams) diffus
 	n := nw.Len()
 	topics := v.topicNames()
 	r := &bRun{v: v, nw: nw, topic: topics[0], topics: topics, n: n}
-
 	// The coordinated push predicate is a function of the sender's own id, and the broadcaster is
 	// constructed before any host exists.
 	for i, node := range v.nodes {
 		node.broadcaster.SetSelf(nw.Hosts[i].ID())
 	}
-
-	// Start each loop. They run on the run's own wait group and are stopped inside the bubble in
-	// cancel(): a goroutine still running when the bubble exits is a deadlock panic, not a leak
-	// warning.
 	for i, node := range v.nodes {
-		r.loopWg.Add(1)
-		target := node
-		isPublisher := i == 0
-		go func() {
-			defer r.loopWg.Done()
-			err := target.broadcaster.Start(segmentbroadcaster.Callbacks{
-				Auth: segmentauth.New(commitmentForGroups(t, v.msgsByGroup)),
-				OnEnvelope: func(envelope []byte) error {
-					// One callback per group; the node is complete when every group is in.
-					require.Equal(t, true, v.isPart(envelope))
-					if !isPublisher && target.remaining.Add(-1) == 0 {
-						target.once.Do(func() { close(target.done) })
-					}
-					return nil
-				},
-			})
-			require.NoError(t, err)
-		}()
+		v.startNode(t, node, i == 0, &r.loopWg)
 	}
-
-	// One topic for everyone (one per group when the payload is split), joined requesting
-	// partial messages. That option is what makes gossipsub skip these peers on the
-	// full-message path and route segments to them instead.
 	for i, ps := range nw.Pubsubs {
-		for _, topic := range topics {
-			th, err := ps.Join(topic, pubsub.RequestPartialMessages())
-			require.NoError(t, err)
-			sub, err := th.Subscribe(pubsub.WithBufferSize(subscriptionBuffer))
-			require.NoError(t, err)
-			// Drain: an unread subscription fills and pubsub then reports messages
-			// undeliverable, which reads exactly like a slow link. Not on any wait group -- it
-			// exits when the subscription is cancelled in cancel(), which synctest still waits for.
-			go func() {
-				for {
-					if _, err := sub.Next(context.Background()); err != nil {
-						return
-					}
-				}
-			}()
-			r.subs = append(r.subs, sub)
-			v.nodes[i].broadcaster.ServeTopic(topic)
-		}
+		r.subs = append(r.subs, v.joinNode(t, ps, v.nodes[i])...)
 	}
 	return r
+}
+
+// startNode starts a node's broadcaster loop on wg, with the cell's commitment and the
+// completion rule: one envelope callback per group, done when every group is in. The loop is
+// stopped inside the bubble by the run's cancel: a goroutine still running when the bubble
+// exits is a deadlock panic, not a leak warning.
+func (v *variantB) startNode(t *testing.T, node *variantBNode, isPublisher bool, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := node.broadcaster.Start(segmentbroadcaster.Callbacks{
+			Auth: segmentauth.New(commitmentForGroups(t, v.msgsByGroup)),
+			OnEnvelope: func(envelope []byte) error {
+				require.Equal(t, true, v.isPart(envelope))
+				if !isPublisher && node.remaining.Add(-1) == 0 {
+					node.once.Do(func() { close(node.done) })
+				}
+				return nil
+			},
+		})
+		require.NoError(t, err)
+	}()
+}
+
+// joinNode joins the group topics on ps requesting partial messages -- the option that makes
+// gossipsub skip this peer on the full-message path and route segments to it instead -- drains
+// each subscription (an unread one fills and reads exactly like a slow link) and serves the
+// topics from the node's broadcaster. Returns the subscriptions for the teardown.
+func (v *variantB) joinNode(t *testing.T, ps *pubsub.PubSub, node *variantBNode) []*pubsub.Subscription {
+	t.Helper()
+	var subs []*pubsub.Subscription
+	for _, topic := range v.topicNames() {
+		th, err := ps.Join(topic, pubsub.RequestPartialMessages())
+		require.NoError(t, err)
+		sub, err := th.Subscribe(pubsub.WithBufferSize(subscriptionBuffer))
+		require.NoError(t, err)
+		// Not on any wait group -- it exits when the subscription is cancelled, which synctest
+		// still waits for.
+		go func() {
+			for {
+				if _, err := sub.Next(context.Background()); err != nil {
+					return
+				}
+			}
+		}()
+		subs = append(subs, sub)
+		node.broadcaster.ServeTopic(topic)
+	}
+	return subs
+}
+
+// publishFrom publishes every group at once from the publisher's broadcaster, in topic order:
+// the publisher's queue then carries one copy of each group's segments before any group's
+// second copy, as batch publishing does for variant A.
+func (v *variantB) publishFrom(node *variantBNode) error {
+	for g, topic := range v.topicNames() {
+		if err := node.broadcaster.Publish(topic, v.msgsByGroup[g]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (v *variantB) onTimeout(t *testing.T, completed, n int) {
@@ -598,15 +648,8 @@ func (r *bRun) watch(ctx context.Context, wg *sync.WaitGroup, start time.Time, s
 	}
 }
 
-func (r *bRun) publish(_ context.Context, t *testing.T) error {
-	// Every group at once, in topic order: the publisher's queue then carries one copy of each
-	// group's segments before any group's second copy, as batch publishing does for variant A.
-	for g, topic := range r.topics {
-		if err := r.v.nodes[0].broadcaster.Publish(topic, r.v.msgsByGroup[g]); err != nil {
-			return err
-		}
-	}
-	return nil
+func (r *bRun) publish(_ context.Context, _ *testing.T) error {
+	return r.v.publishFrom(r.v.nodes[0])
 }
 
 // TestVariantBServesAPeerThatOnlyAsks isolates the pull path from the push path.
@@ -618,13 +661,12 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 	params.SetupTestConfigCleanup(t)
 	sk, err := bls.RandKey()
 	require.NoError(t, err)
-	pk := sk.PublicKey().Marshal()
 	const slot = primitives.Slot(2048)
 	payload := mainnetLikePayload(1<<17, 5)
 	msgs := segmentMessagesFor(t, sk, slot, payload, segments.DefaultSegmentSize, 0)
 
 	synctest.Test(t, func(t *testing.T) {
-		nodes := newVariantBNodes(t, 2, segmentbroadcaster.PushNone, 1, 0, pk, slot)
+		nodes := newVariantBNodes(t, 2, segmentbroadcaster.PushNone, 1, 0, 1)
 		nw, stop := newSimNetwork(t, networkConfig{
 			links: uniformLinks(2, defaultRate),
 			edges: line(2),

@@ -38,12 +38,11 @@ type RecvEvent struct {
 	What Digest
 }
 
-// CompletionStats summarises per-node completion under right-censoring (measurement-plan
-// section 15, phase 0). times holds the durations of the nodes that completed; population
-// is every non-publisher node, so censored nodes rank above every finite time. A quantile
-// is reported only when it is actually reached — never computed over completers alone —
-// and the rate is against the experiment deadline, not the harness timeout. max is
-// deliberately absent: it is undefined under censoring.
+// CompletionStats summarises per-node completion under right-censoring (phase 0). times holds the
+// durations of the nodes that completed; population is every non-publisher node, so censored nodes
+// rank above every finite time. A quantile is reported only when it is actually reached — never
+// computed over completers alone — and the rate is against the experiment deadline, not the
+// harness timeout. max is deliberately absent: it is undefined under censoring.
 func CompletionStats(times []time.Duration, population int, deadline time.Duration) string {
 	sorted := append([]time.Duration(nil), times...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
@@ -76,9 +75,8 @@ type ControlCounts struct {
 	IwantIdsSent, IwantIdsRecv   int
 	IdontwantSent, IdontwantRecv int
 	GraftSent, PruneSent         int
-	// Encoded bytes of the whole control section (IHAVE/IWANT/IDONTWANT/GRAFT/PRUNE),
-	// measurement-plan section 13 layer 3. Payload equivalents exclude these; this counter
-	// is what lets a report say by how much.
+	// Encoded bytes of the whole control section (IHAVE/IWANT/IDONTWANT/GRAFT/PRUNE).
+	// Payload equivalents exclude these; this counter is what lets a report say by how much.
 	BytesSent, BytesRecv int
 }
 

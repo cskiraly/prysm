@@ -389,7 +389,7 @@ var (
 	}
 	// RowDASPull enables EIP-8371's optional pull direction. Off by default: it costs bandwidth
 	// on subnets this node does not custody, and whether it pays for itself is exactly what
-	// experiment R9 in notes/rowdas/ is meant to settle.
+	// experiment R9 is meant to settle.
 	RowDASPull = &cli.BoolFlag{
 		Name:  "row-das-pull",
 		Usage: "Ask non-custodied column subnets for the cells a row is missing (EIP-8371 optional pull direction). Requires --row-das",

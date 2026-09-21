@@ -14,7 +14,7 @@ numbers, byte for byte, with the two forks it measured pinned as modules.
 | `runcell.sh` | one fleet cell: `runcell.sh ARM SEED FAULT NET PAY [N]` runs `runfu.sh` under `/usr/bin/time -v` and writes `logs/<tag>.log`, `.time` and `.done`; a cell whose `.done` exists is skipped, so a cell list can be rerun to fill gaps |
 | `cells/figure<N>_<name>.txt` | the cells each figure of the post draws, one per line in `runcell.sh` argument order (`ARM SEED FAULT NET PAY N`); `part1_all.txt` is their union, `results_all.txt` every cell in the results file, `fixedcount_all.txt` the fixed-count cells of section 5 (kept in their own results file because their arm names collide with the fixed-size cells) |
 | `fu_extract.py` | one JSON record per cell log: `fu_extract.py logs/ results/mine.json` |
-| `fu_figures.py` | the figures and the tables: `fu_figures.py results/fu_results.json figures/` renders the post's nine figures; `--all` adds the second post's and the background's, which also read the side files in `results/` |
+| `fu_figures.py` | the figures and the tables: `fu_figures.py results/fu_results.json figures/` renders the post's nine figures; `--all` adds the second post's, which also read the side files in `results/` |
 | `results/fu_results.json` | the extracted records behind the published figures; `fu_results_fc.json` the fixed-count cells; `fu_q65_p99.json`, `tradeoff_realistic.py`, `bandwidth_sweep.py` and `payload_sweep.py` are data from the first post that the `--all` figures read |
 | `render.sh` | extract `logs/` into `results/fu_results.json` and render the post's figures |
 

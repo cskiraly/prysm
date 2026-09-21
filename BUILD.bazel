@@ -18,6 +18,8 @@ exports_files([
 # gazelle:build_tags bazel
 # gazelle:exclude tools/analyzers/**/testdata/**
 # gazelle:exclude .claude
+# gazelle:exclude third_party/go-libp2p-pubsub
+# gazelle:exclude third_party/simnet
 gazelle(
     name = "gazelle",
     prefix = prefix,

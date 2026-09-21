@@ -4,8 +4,7 @@ package rowintegrationtest
 //
 // The intuition that real KZG makes a network experiment slow turns out to be wrong here, and
 // this test is what says so. Verification is microseconds per batch; the fixed costs are the
-// trusted setup and gossipsub's mesh formation, and faking the crypto touches neither. See
-// notes/rowdas/measurement-plan.md section 4.
+// trusted setup and gossipsub's mesh formation, and faking the crypto touches neither.
 
 import (
 	"testing"

@@ -215,8 +215,7 @@ func (s *Service) rowServedElsewhereSeen(key rowReconstructionKey) bool {
 // the slot where reconstruction competes with attestation work.
 //
 // What it does *not* yet do is decide at phase 3 whether the work is still needed. The signal for
-// that is on the wire too -- peers still requesting cells of this row -- and it is the next step;
-// see notes/rowdas/TODO.md D5.
+// that is on the wire too -- peers still requesting cells of this row -- and it is the next step.
 func (s *Service) rowServedElsewhere(groupID []byte, rowIndex uint64) {
 	if s.rowReconstruction == nil || s.rowDuties == nil {
 		return

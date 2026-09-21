@@ -93,12 +93,12 @@ func TestR1bPhase1JitterPricesDuplicateRecoveries(t *testing.T) {
 
 	// Why the trigger had to change. A pooling node stops asking for a row's cells once it holds
 	// enough to recover it, instead of downloading all 128 -- which is the point of RowDAS and
-	// worth 32% of the row axis's bytes (TODO.md D11). But local completion was the only
+	// worth 32% of the row axis's bytes. But local completion was the only
 	// cancellation signal the shipped code had, and a node that stops fetching at the threshold
 	// never reaches it. Measured: 0 of 15 peers complete, against 15 of 15 before the scoping.
 	//
 	// So the signal is the peer's availability bitmap instead, which lands at ~188 ms against a
-	// 600 ms window. TODO.md D5.
+	// 600 ms window.
 	// **What the signal is worth.** With the availability observation as the trigger, the shipped
 	// window collapses most of the duplication rather than none of it -- the observation lands at
 	// ~188 ms against a 600 ms window. It does not collapse all of it, and the reason is a
@@ -413,7 +413,7 @@ func TestR1bRecoveryPropagationPricesTheCancellation(t *testing.T) {
 	//
 	// Both readings say the same thing about the mechanism and the second says it more strongly: a
 	// cancellation that waits for local completion is waiting for the wrong event. The right one is
-	// a peer's availability bitmap, ~50 ms away, which is on the wire and unused. TODO.md D5.
+	// a peer's availability bitmap, ~50 ms away, which is on the wire and unused.
 	if len(delays) > 0 {
 		median := delays[len(delays)/2]
 		require.Equal(t, true, median > 4*gossipsim.DefaultLatency,

@@ -43,8 +43,7 @@ func AsymmetricLinks(n, upBitsPerSecond, downBitsPerSecond int) []simlibp2p.Node
 // instants, so one-MTU pacing already delivers the full rate -- and a window's worth of tokens
 // would be released in zero virtual time, a burst no physical link produces. Measured on the
 // segment study's variant B, the 5 ms window under synctest inflated reissued requests by 46%
-// and last-node completion by 25% (notes/experiments.md Q52) -- instrument artifact, not
-// protocol behaviour.
+// and last-node completion by 25% (Q52) -- instrument artifact, not protocol behaviour.
 const RealClockBurstWindow = 5 * time.Millisecond
 
 // stampBurstWindow applies the clock-appropriate burst window to every link that has not chosen

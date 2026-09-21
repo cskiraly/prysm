@@ -526,8 +526,7 @@ func bitlistWith(length uint64, bits ...uint64) bitfield.Bitlist {
 
 // TestRowCancellationRidesTheNextPacket is the piggyback: when a cells-only action to the peer
 // comes up, the deferred removal is forced onto it -- metadata generation is no longer independent
-// of cell generation, which plan-repair.md section 5.2 listed as the thing that would otherwise be
-// implemented wrongly.
+// of cell generation, which was listed as the thing that would otherwise be implemented wrongly.
 func TestRowCancellationRidesTheNextPacket(t *testing.T) {
 	row, peerStates, actions, loser, clock := cancellationFixture(t)
 	requestsPartial := func(peer.ID) bool { return true }
