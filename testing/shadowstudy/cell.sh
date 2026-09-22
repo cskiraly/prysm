@@ -11,6 +11,10 @@ LAB=${LAB:-$(cd "$STUDY/../../.." && pwd)/eth-networking-lab}
 RES=${RES:-$STUDY/../results}
 sub=${1:?substrate}; arm=${2:?arm}; seed=${3:?seed}; tr=${4:?transport}; N=${5:?n}; pay=${6:?pay}; net=${7:-home}
 suffix=""; [ "$net" = home ] || suffix="_$net"
+# The queue discipline is part of a Shadow cell's identity (runcell.sh puts it in the record's
+# name), so it is part of the label the skip is decided on; without it a lane run under a second
+# discipline finds the first one's records and calls every cell done.
+[ "${QDISC:-fifo}" = fifo ] || suffix="${suffix}_${QDISC}"
 case $sub in
   shadow)  label="${arm}_${seed}_${tr}_${pay}_n${N}${suffix}" ;;
   harness) label="${arm}_${seed}_harness_${pay}_n${N}${suffix}"

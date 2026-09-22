@@ -313,7 +313,9 @@ func TestShadowNode(t *testing.T) {
 	peerOf := func(j int) (peer.AddrInfo, error) {
 		return shadowsim.AddrInfo(seed, e.Transport, e.IP(j), e.Port, j)
 	}
-	require.NoError(t, shadowsim.DialEdges(ctx, h, e.Index, pairs, peerOf, 30*time.Second))
+	// The deadline is the cell's, not a constant: a real host sets up a few hundred connection
+	// endpoints per second, so a large mesh needs longer than the 30s default.
+	require.NoError(t, shadowsim.DialEdges(ctx, h, e.Index, pairs, peerOf, e.DialTimeout, e.DialSlots))
 	t.Logf("node %d: %d connections up at %.3fs", e.Index, len(h.Network().Peers()), shadowsim.SimSeconds(time.Now()))
 
 	shadowsim.SleepUntil(start.Add(e.SubscribeAt))
