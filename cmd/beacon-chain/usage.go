@@ -114,6 +114,7 @@ var appHelpFlagGroups = []flagGroup{
 			cmd.P2PTCPPort,
 			cmd.P2PUDPPort,
 			cmd.PubsubQueueSize,
+			cmd.GossipTopicPriority,
 			cmd.RelayNode,
 			cmd.StaticPeers,
 			flags.BlobBatchLimit,

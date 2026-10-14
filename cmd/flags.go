@@ -190,6 +190,11 @@ var (
 		Usage: "The size of the pubsub validation and outbound queue for the node.",
 		Value: 1000,
 	}
+	// GossipTopicPriority sends gossip to each peer in order of topic priority.
+	GossipTopicPriority = &cli.BoolFlag{
+		Name:  "gossip-topic-priority",
+		Usage: "(Experimental) Send gossip to each peer in order of topic priority (blocks, then blobs and data columns, then aggregates, then attestations, then the rest) instead of first come first served, evicting lower priority messages when the outbound queue is full.",
+	}
 	// ForceClearDB removes any previously stored data at the data directory.
 	ForceClearDB = &cli.BoolFlag{
 		Name:  "force-clear-db",

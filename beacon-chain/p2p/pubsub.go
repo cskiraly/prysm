@@ -170,6 +170,10 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 		pubsub.WithPeerScoreInspect(s.peerInspector, time.Minute),
 		pubsub.WithGossipSubParams(pubsubGossipParam()),
 		pubsub.WithRawTracer(&gossipTracer{host: s.host, allowedTopics: filt}),
+		pubsub.WithOutboundRPCObserver(observeOutboundRPC),
+	}
+	if s.cfg.GossipTopicPriority {
+		psOpts = append(psOpts, pubsub.WithTopicPriority(gossipTopicPriority))
 	}
 
 	if len(s.cfg.StaticPeers) > 0 {
