@@ -318,3 +318,5 @@ tool (
 	go.uber.org/mock/mockgen
 	gotest.tools/gotestsum
 )
+
+replace github.com/libp2p/go-libp2p-pubsub => github.com/cskiraly/go-libp2p-pubsub v0.0.0-20261015083151-8be89489bdf6
