@@ -121,6 +121,7 @@ var appFlags = []cli.Flag{
 	cmd.PubsubQueueSize,
 	cmd.GossipTopicPriority,
 	cmd.GossipTopicPriorityOrder,
+	cmd.GossipUplinkPriority,
 	cmd.DataDirFlag,
 	cmd.VerbosityFlag,
 	cmd.LogVModuleFlag,

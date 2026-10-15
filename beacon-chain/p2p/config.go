@@ -47,6 +47,7 @@ type Config struct {
 	MaxPeers              uint
 	QueueSize             uint
 	GossipPriorityOrder   string
+	GossipUplinkPriority  bool
 	AllowListCIDR         string
 	DenyListCIDR          []string
 	IPColocationWhitelist []*net.IPNet

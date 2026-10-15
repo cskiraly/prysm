@@ -116,6 +116,7 @@ var appHelpFlagGroups = []flagGroup{
 			cmd.PubsubQueueSize,
 			cmd.GossipTopicPriority,
 			cmd.GossipTopicPriorityOrder,
+			cmd.GossipUplinkPriority,
 			cmd.RelayNode,
 			cmd.StaticPeers,
 			flags.BlobBatchLimit,

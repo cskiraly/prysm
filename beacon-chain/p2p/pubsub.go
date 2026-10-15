@@ -178,6 +178,9 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 			log.WithError(err).Error("Could not parse the gossip topic priority order, sending gossip without priorities")
 		} else {
 			psOpts = append(psOpts, pubsub.WithTopicPriority(prio))
+			if s.cfg.GossipUplinkPriority {
+				psOpts = append(psOpts, pubsub.WithUplinkPriority(uplinkPriorityMaxWait))
+			}
 		}
 	}
 

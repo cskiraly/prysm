@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,6 +27,10 @@ var gossipPriorityPresets = map[string]string{
 		">" + GossipBlockMessage + "," + GossipExecutionPayloadEnvelopeMessage + "," + GossipExecutionPayloadBidMessage +
 		">" + GossipDataColumnSidecarMessage + "," + GossipBlobSidecarMessage,
 }
+
+// uplinkPriorityMaxWait bounds how long --gossip-uplink-priority holds back
+// gossip to one peer for higher priority gossip to others.
+const uplinkPriorityMaxWait = 100 * time.Millisecond
 
 // DefaultGossipPriorityOrder is the order used by --gossip-topic-priority.
 const DefaultGossipPriorityOrder = "blocks-first"

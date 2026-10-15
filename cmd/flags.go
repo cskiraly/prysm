@@ -202,6 +202,12 @@ var (
 			"or groups of comma separated topic names (e.g. beacon_block, data_column_sidecar) from highest to lowest priority, " +
 			"separated by '>'; unlisted topics come last.",
 	}
+	// GossipUplinkPriority applies the gossip topic priority across peers.
+	GossipUplinkPriority = &cli.BoolFlag{
+		Name: "gossip-uplink-priority",
+		Usage: "(Experimental) With --gossip-topic-priority(-order), apply the priority across peers: hold back gossip " +
+			"to one peer while higher priority gossip is queued for another, so higher priority topics get the uplink first.",
+	}
 	// ForceClearDB removes any previously stored data at the data directory.
 	ForceClearDB = &cli.BoolFlag{
 		Name:  "force-clear-db",
