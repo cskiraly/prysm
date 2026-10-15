@@ -46,7 +46,7 @@ type Config struct {
 	PingInterval          time.Duration
 	MaxPeers              uint
 	QueueSize             uint
-	GossipTopicPriority   bool
+	GossipPriorityOrder   string
 	AllowListCIDR         string
 	DenyListCIDR          []string
 	IPColocationWhitelist []*net.IPNet

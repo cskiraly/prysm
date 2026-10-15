@@ -120,6 +120,7 @@ var appFlags = []cli.Flag{
 	cmd.P2PColocationWhitelist,
 	cmd.PubsubQueueSize,
 	cmd.GossipTopicPriority,
+	cmd.GossipTopicPriorityOrder,
 	cmd.DataDirFlag,
 	cmd.VerbosityFlag,
 	cmd.LogVModuleFlag,

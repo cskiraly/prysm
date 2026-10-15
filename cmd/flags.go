@@ -195,6 +195,13 @@ var (
 		Name:  "gossip-topic-priority",
 		Usage: "(Experimental) Send gossip to each peer in order of topic priority (blocks, then blobs and data columns, then aggregates, then attestations, then the rest) instead of first come first served, evicting lower priority messages when the outbound queue is full.",
 	}
+	// GossipTopicPriorityOrder sets the topic priority order of --gossip-topic-priority.
+	GossipTopicPriorityOrder = &cli.StringFlag{
+		Name: "gossip-topic-priority-order",
+		Usage: "(Experimental) Like --gossip-topic-priority, with the given order: blocks-first (the default), votes-first, " +
+			"or groups of comma separated topic names (e.g. beacon_block, data_column_sidecar) from highest to lowest priority, " +
+			"separated by '>'; unlisted topics come last.",
+	}
 	// ForceClearDB removes any previously stored data at the data directory.
 	ForceClearDB = &cli.BoolFlag{
 		Name:  "force-clear-db",

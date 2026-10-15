@@ -172,8 +172,13 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 		pubsub.WithRawTracer(&gossipTracer{host: s.host, allowedTopics: filt}),
 		pubsub.WithOutboundRPCObserver(observeOutboundRPC),
 	}
-	if s.cfg.GossipTopicPriority {
-		psOpts = append(psOpts, pubsub.WithTopicPriority(gossipTopicPriority))
+	if s.cfg.GossipPriorityOrder != "" {
+		prio, err := parseGossipPriorityOrder(s.cfg.GossipPriorityOrder)
+		if err != nil {
+			log.WithError(err).Error("Could not parse the gossip topic priority order, sending gossip without priorities")
+		} else {
+			psOpts = append(psOpts, pubsub.WithTopicPriority(prio))
+		}
 	}
 
 	if len(s.cfg.StaticPeers) > 0 {

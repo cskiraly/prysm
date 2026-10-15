@@ -726,7 +726,7 @@ func (b *BeaconNode) registerP2P(cliCtx *cli.Context) error {
 		UDPPort:               cliCtx.Uint(cmd.P2PUDPPort.Name),
 		MaxPeers:              cliCtx.Uint(cmd.P2PMaxPeers.Name),
 		QueueSize:             cliCtx.Uint(cmd.PubsubQueueSize.Name),
-		GossipTopicPriority:   cliCtx.Bool(cmd.GossipTopicPriority.Name),
+		GossipPriorityOrder:   gossipTopicPriorityOrder(cliCtx),
 		AllowListCIDR:         cliCtx.String(cmd.P2PAllowList.Name),
 		DenyListCIDR:          slice.SplitCommaSeparated(cliCtx.StringSlice(cmd.P2PDenyList.Name)),
 		IPColocationWhitelist: colocationWhitelist,
@@ -1239,4 +1239,16 @@ func hasNetworkFlag(cliCtx *cli.Context) bool {
 		}
 	}
 	return false
+}
+
+// gossipTopicPriorityOrder is the outbound gossip priority order set by
+// --gossip-topic-priority-order or --gossip-topic-priority, or "" for none.
+func gossipTopicPriorityOrder(cliCtx *cli.Context) string {
+	if order := cliCtx.String(cmd.GossipTopicPriorityOrder.Name); order != "" {
+		return order
+	}
+	if cliCtx.Bool(cmd.GossipTopicPriority.Name) {
+		return p2p.DefaultGossipPriorityOrder
+	}
+	return ""
 }

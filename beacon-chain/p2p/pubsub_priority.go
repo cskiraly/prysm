@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -9,28 +10,56 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// Outbound gossip priorities, used with --gossip-topic-priority: lower values
-// are sent first. Messages on the critical path of block import come first,
-// then the aggregated votes, then the unaggregated ones, then the rest.
-const (
-	prioBlock = iota
-	prioBlockData
-	prioAggregate
-	prioVote
-	prioOther
-)
+// Outbound gossip priority orders for --gossip-topic-priority(-order): groups
+// of topic families separated by ">", highest priority first; families not
+// listed come after the last group.
+var gossipPriorityPresets = map[string]string{
+	// Messages on the critical path of block import first, then the aggregated
+	// votes, then the unaggregated ones, then the rest.
+	"blocks-first": GossipBlockMessage + "," + GossipExecutionPayloadEnvelopeMessage + "," + GossipExecutionPayloadBidMessage +
+		">" + GossipDataColumnSidecarMessage + "," + GossipBlobSidecarMessage +
+		">" + GossipAggregateAndProofMessage + "," + GossipContributionAndProofMessage + "," + GossipPayloadAttestationMessageMessage +
+		">" + GossipAttestationMessage + "," + GossipSyncCommitteeMessage,
+	// Votes (small, deadline bound) first, then blocks, then block data.
+	"votes-first": GossipAttestationMessage + "," + GossipSyncCommitteeMessage + "," + GossipAggregateAndProofMessage + "," +
+		GossipContributionAndProofMessage + "," + GossipPayloadAttestationMessageMessage +
+		">" + GossipBlockMessage + "," + GossipExecutionPayloadEnvelopeMessage + "," + GossipExecutionPayloadBidMessage +
+		">" + GossipDataColumnSidecarMessage + "," + GossipBlobSidecarMessage,
+}
 
-var topicFamilyPriority = map[string]int{
-	GossipBlockMessage:                     prioBlock,
-	GossipExecutionPayloadEnvelopeMessage:  prioBlock,
-	GossipExecutionPayloadBidMessage:       prioBlock,
-	GossipDataColumnSidecarMessage:         prioBlockData,
-	GossipBlobSidecarMessage:               prioBlockData,
-	GossipAggregateAndProofMessage:         prioAggregate,
-	GossipContributionAndProofMessage:      prioAggregate,
-	GossipPayloadAttestationMessageMessage: prioAggregate,
-	GossipAttestationMessage:               prioVote,
-	GossipSyncCommitteeMessage:             prioVote,
+// DefaultGossipPriorityOrder is the order used by --gossip-topic-priority.
+const DefaultGossipPriorityOrder = "blocks-first"
+
+// parseGossipPriorityOrder parses a preset name or an order spec into a
+// pubsub.TopicPriorityFn.
+func parseGossipPriorityOrder(spec string) (pubsub.TopicPriorityFn, error) {
+	if preset, ok := gossipPriorityPresets[spec]; ok {
+		spec = preset
+	}
+	prios := make(map[string]int)
+	groups := strings.Split(spec, ">")
+	if len(groups) > pubsub.MaxTopicPriority {
+		return nil, fmt.Errorf("gossip priority order %q has more than %d groups", spec, pubsub.MaxTopicPriority)
+	}
+	for i, group := range groups {
+		for _, family := range strings.Split(group, ",") {
+			family = strings.TrimSpace(family)
+			if family == "" {
+				return nil, fmt.Errorf("empty topic in gossip priority order %q", spec)
+			}
+			if _, dup := prios[family]; dup {
+				return nil, fmt.Errorf("topic %q listed twice in gossip priority order %q", family, spec)
+			}
+			prios[family] = i
+		}
+	}
+	rest := len(groups)
+	return func(topic string) int {
+		if prio, ok := prios[topicFamily(topic)]; ok {
+			return prio
+		}
+		return rest
+	}, nil
 }
 
 var (
@@ -78,14 +107,6 @@ func isDigits(s string) bool {
 		}
 	}
 	return true
-}
-
-// gossipTopicPriority is the pubsub.TopicPriorityFn of --gossip-topic-priority.
-func gossipTopicPriority(topic string) int {
-	if prio, ok := topicFamilyPriority[topicFamily(topic)]; ok {
-		return prio
-	}
-	return prioOther
 }
 
 var queueClassLabels = func() []string {
