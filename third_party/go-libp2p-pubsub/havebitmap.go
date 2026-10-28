@@ -179,11 +179,6 @@ type haveIDs struct {
 type haveState struct {
 	index func(mid string) (root string, index uint32, ok bool)
 	mine  map[string]*haveEntry
-	// tomb is the groups past their active lifetime under v0.5's D′, by heartbeats left: their
-	// mine aged out GROUP_TTL after the last chunk, and only the id is kept, for another holdTTL.
-	tomb map[string]int
-	// own mirrors mine for the writers (ownView).
-	own   ownView
 	mids  map[string]*haveIDs
 	peers map[peer.ID]map[string]*haveEntry
 	// pushed is what we have pushed to each peer per root. The phase announce names a message
@@ -241,13 +236,11 @@ func newHaveState(index func(mid string) (string, uint32, bool)) *haveState {
 	return &haveState{
 		index: index,
 		mine:  make(map[string]*haveEntry),
-		tomb:  make(map[string]int),
 		mids:  make(map[string]*haveIDs),
 		peers: make(map[peer.ID]map[string]*haveEntry),
 
 		pushed:      make(map[peer.ID]map[string]*haveEntry),
 		idontwantOn: true,
-		own:         ownView{bits: make(map[string]*haveBits)},
 	}
 }
 
@@ -334,16 +327,12 @@ func (gs *GossipSubRouter) haveNoteArrival(mid string) {
 	if !ok || len(root) != haveRootLen {
 		return
 	}
-	if h.tomb[root] > 0 {
-		return // past its active lifetime: only the tombstone is left (v0.5's D′)
-	}
 	e := h.mine[root]
 	if e == nil {
 		e = &haveEntry{}
 		h.mine[root] = e
 	}
 	e.bits.Set(index)
-	h.own.set(root, index)
 	e.ttl = h.holdTTL
 	gs.haveLearnID(mid)
 }
@@ -394,9 +383,6 @@ func (gs *GossipSubRouter) haveAbsorb(p peer.ID, mid string) bool {
 	root, enc, ok := decodeHave(mid)
 	if !ok {
 		return false
-	}
-	if gs.expired(root) {
-		return true // a HAVE for a group past its lifetime is ignored, without penalty (v0.5's D′)
 	}
 	roots := h.peers[p]
 	if roots == nil {
@@ -460,21 +446,9 @@ func (gs *GossipSubRouter) haveHeartbeat() {
 	if h == nil {
 		return
 	}
-	for root, n := range h.tomb {
-		if n--; n <= 0 {
-			delete(h.tomb, root)
-			h.own.revive(root)
-		} else {
-			h.tomb[root] = n
-		}
-	}
 	for root, e := range h.mine {
 		if e.ttl--; e.ttl <= 0 {
 			delete(h.mine, root)
-			h.own.forget(root)
-			if gs.v05Expiry() {
-				gs.expireGroup(root)
-			}
 			if h.holders != nil {
 				h.holders.forget(root)
 			}
@@ -587,9 +561,6 @@ type queueHave struct {
 	originSent func(m *pb.Message) (root string, index uint32, ok bool)
 	shared     map[string]*haveBits
 	originMesh map[string]bool
-	// ownHeld, when set, reports whether we hold the frame an ask id names: dispatch drops such
-	// asks (enableStaleAsks).
-	ownHeld func(mid string) bool
 }
 
 // WithHaveDispatch moves two decisions to dispatch time, per peer: cancel drops a queued frame
@@ -623,7 +594,6 @@ func (gs *GossipSubRouter) haveQueue(p peer.ID) *rpcQueue {
 		return nil
 	}
 	q.enableHave(h.msgIndex, h.cancel, h.attach)
-	q.enableStaleAsks(h.ownHeldID)
 	if h.rarest {
 		q.enableRarest(h.haveHolders)
 	}
@@ -711,17 +681,6 @@ func (q *rpcQueue) enableHave(index func(*pb.Message) (string, uint32, bool), ca
 }
 
 // enableProjection installs the dispatch-time projection once (WithHaveDispatchProjection).
-// enableStaleAsks installs the dispatch-time drop of asks for frames we hold by now (the spec's
-// §7.2): an ask queued behind data while its frame arrived from someone else would otherwise leave
-// after our HAVE for the frame, which overtakes it on the urgent lane.
-func (q *rpcQueue) enableStaleAsks(held func(mid string) bool) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.have != nil && q.have.ownHeld == nil {
-		q.have.ownHeld = held
-	}
-}
-
 func (q *rpcQueue) enableProjection(need uint32, fanIn int) {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
@@ -990,150 +949,18 @@ func (h *queueHave) popsBefore(holders int, key uint64, keyed bool, bestHolders 
 
 // haveRevoke clears one index of what the peer claimed: it asked for that frame by index, so
 // whatever bitmap said it held the frame is superseded for it. Router goroutine.
-// HaveRevoked counted the announced bits an ask by index cleared before an ask stopped revoking
-// real HAVEs; it stays zero and is kept for the harness's known answer. AsksForHeldDropped counts
-// asks by index dropped because the asker's own HAVE named the index (the ask was stale), and
-// StaleAsksDropped the ask ids a writer dropped at dispatch because we hold the frame by now.
-// Process-wide, for a harness.
-var HaveRevoked, AsksForHeldDropped, StaleAsksDropped atomic.Int64
-
-// haveRevoke clears index from what the peer claimed (D7 idea 2's suppress, encodeHaveClaim), so
-// its ask after the claim is answered. It never touches what the peer said it holds: an ask that
-// arrives after the asker's own HAVE for the index left its queue before the frame arrived and
-// was overtaken by the HAVE on the urgent lane, and the HAVE is the later word (handleIWant drops
-// such an ask). Router goroutine.
 func (q *rpcQueue) haveRevoke(root string, index uint32) {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
 	if q.have == nil {
 		return
 	}
+	if b := q.have.theirs[root]; b != nil {
+		b.Clear(index)
+	}
 	if c := q.have.claim[root]; c != nil {
 		c.Clear(index)
 	}
-}
-
-// havePeerHolds reports whether p's HAVE for root names index. Router goroutine.
-func (gs *GossipSubRouter) havePeerHolds(p peer.ID, root string, index uint32) bool {
-	h := gs.have
-	if h == nil {
-		return false
-	}
-	e := h.peers[p][root]
-	return e != nil && e.bits.Has(index)
-}
-
-// ownView mirrors what we hold (haveState.mine) for the writers, which drop at dispatch the asks
-// for frames we have received since they were queued (the spec's §7.2) and run off the router's
-// goroutine, where mine lives.
-type ownView struct {
-	mu   sync.RWMutex
-	bits map[string]*haveBits
-	// dead is the groups past their active lifetime (v0.5's D′): every index reads as held, so a
-	// writer drops the asks for them.
-	dead map[string]bool
-}
-
-// kill marks root past its lifetime; revive forgets its tombstone.
-func (o *ownView) kill(root string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	delete(o.bits, root)
-	if o.dead == nil {
-		o.dead = make(map[string]bool)
-	}
-	o.dead[root] = true
-}
-
-func (o *ownView) revive(root string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	delete(o.dead, root)
-}
-
-func (o *ownView) set(root string, index uint32) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	b := o.bits[root]
-	if b == nil {
-		b = &haveBits{}
-		o.bits[root] = b
-	}
-	b.Set(index)
-}
-
-func (o *ownView) or(root string, enc []byte) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	b := o.bits[root]
-	if b == nil {
-		b = &haveBits{}
-		o.bits[root] = b
-	}
-	b.Or(enc)
-}
-
-func (o *ownView) forget(root string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	delete(o.bits, root)
-}
-
-func (o *ownView) has(root string, index uint32) bool {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	if o.dead[root] {
-		return true
-	}
-	b := o.bits[root]
-	return b != nil && b.Has(index)
-}
-
-// ownHeldID reports whether we hold the frame an ask id names: an ask by index, or a frame's id.
-// Any goroutine.
-func (h *haveState) ownHeldID(mid string) bool {
-	root, index, ok := decodeWant(mid)
-	if !ok {
-		if root, index, ok = h.index(mid); !ok || len(root) != haveRootLen {
-			return false
-		}
-	}
-	return h.own.has(root, index)
-}
-
-// dropHeldAsks returns rpc without the ask ids held reports, and how many it dropped; nil when
-// nothing worth writing is left. Never mutates rpc.
-func dropHeldAsks(rpc *RPC, held func(string) bool) (*RPC, int) {
-	n := 0
-	for _, w := range rpc.Control.GetIwant() {
-		for _, mid := range w.GetMessageIDs() {
-			if held(mid) {
-				n++
-			}
-		}
-	}
-	if n == 0 {
-		return rpc, 0
-	}
-	c := rpc.Control
-	ctl := &pb.ControlMessage{Ihave: c.Ihave, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-	for _, w := range c.Iwant {
-		var kept []string
-		for _, mid := range w.GetMessageIDs() {
-			if !held(mid) {
-				kept = append(kept, mid)
-			}
-		}
-		if len(kept) > 0 {
-			ctl.Iwant = append(ctl.Iwant, &pb.ControlIWant{MessageIDs: kept})
-		}
-	}
-	out := shallowRPCCopy(rpc)
-	out.Control = ctl
-	if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-		return nil, n
-	}
-	return out, n
 }
 
 // haveClaim folds the peer's claim bitmap in. Router goroutine.
@@ -1788,18 +1615,9 @@ func (gs *GossipSubRouter) haveNotePushed(p peer.ID, mid string) {
 	if e == nil {
 		e = &haveEntry{first: time.Now()}
 		roots[root] = e
-	} else if gs.v05OfferSkipped() && e.bits.Count() == 0 {
-		// Every push counted to p was skipped or refused (v0.5's A′): the guard's clock starts
-		// again at this one, which p can receive.
-		e.first = time.Now()
 	}
 	e.bits.Set(index)
 	e.ttl = h.pushTTL
-	if gs.v05OfferSkipped() {
-		if q, ok := gs.p.peers[p]; ok {
-			q.unowe(root, index) // pushed now: no longer owed as an offer
-		}
-	}
 }
 
 // haveIHaveIDs returns mids with the structured ids among them replaced by one HAVE per group
@@ -2603,21 +2421,14 @@ func (gs *GossipSubRouter) haveOriginPushed(pushed map[string]map[peer.ID]struct
 	pushed[root][p] = struct{}{}
 }
 
-// haveOrigin sends our HAVE for each group in a publish, once, to the topic's mesh, and under
-// WithOriginHave also to the peers the batch pushed it to: the HAVE a source sends before its data,
-// so no relay pushes its frames back (the spec's §5.1 before P4). Preprocess no longer sends one per
-// message as each is added to a batch, N growing HAVEs before the data. Not under an origin HAVE
-// mode, whose HAVE follows the pops (P4) or the mode's rule. Router goroutine.
+// haveOrigin sends our HAVE for each group in a published batch, once, to the topic's mesh and the peers the batch pushed it to.
 func (gs *GossipSubRouter) haveOrigin(msgs []*Message, pushed map[string]map[peer.ID]struct{}) {
 	h := gs.have
-	if h == nil || !h.idontwantOn || h.originPaced != nil {
+	if h == nil || !h.originHave || !h.idontwantOn {
 		return
 	}
 	sent := make(map[string]bool)
 	for _, msg := range msgs {
-		if !h.originHave && len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
-			continue // by default only where stock IDONTWANT would have gone, above its threshold
-		}
 		root, _, ok := h.index(gs.p.idGen.ID(msg))
 		if !ok || len(root) != haveRootLen || sent[root] || h.mine[root] == nil {
 			continue
@@ -2659,7 +2470,6 @@ func (gs *GossipSubRouter) haveAll(topic, root string, count uint32) {
 		h.mine[root] = e
 	}
 	e.bits.Or(fullHaveBits(count).Bytes())
-	h.own.or(root, fullHaveBits(count).Bytes())
 	e.ttl = h.holdTTL
 	if h.decodeClears && gs.gossipTracer != nil {
 		gs.gossipTracer.fulfillPromisesWhere(func(mid string) bool { return h.haveInRoot(mid, root) })
@@ -2787,9 +2597,6 @@ func (gs *GossipSubRouter) rebuilt(topic string, data [][]byte, cfg RebuiltConfi
 		rt, _, ok := h.index(mid)
 		if !ok || len(rt) != haveRootLen {
 			continue
-		}
-		if gs.expired(rt) {
-			continue // the group passed its lifetime while it decoded (v0.5's D′)
 		}
 		if _, held := gs.mcache.Get(mid); held {
 			continue // it arrived after the decode claim

@@ -4,14 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -131,27 +128,6 @@ type rpcQueue struct {
 	// HoseConfig.PeerCap when one of them is acknowledged or expires.
 	hoseToPeer int
 	peerFree   chan struct{}
-
-	// The writer's side of the v0.5 rules (specv05.go), installed as the queue is made. onAsks
-	// hears the ask ids of each RPC the writer pops, and when (E: the promise starts at the write);
-	// askLoss, when set, is the IWANT class loss drawn there under E. onSkipped hears the pushes
-	// projection skipped (A′). owed is the offers owed to the peer, per group, which ride on the next
-	// RPC out or leave alone; owedAnswers the answers a full queue refused, one per chunk, requeued
-	// as soon as there is room. owedFilter, when set, is the class loss the owed offers must pass;
-	// owedSent counts the indices they carried. Under queueMu.
-	onAsks      func(mids []string, at time.Time)
-	askLoss     func(ids []string) (kept, lost []string)
-	onSkipped   func(msgs []*pb.Message)
-	owed        map[string]*owedGroup
-	owedAnswers []*pb.Message
-	owedFilter  func(*RPC) *RPC
-	owedSent    *atomic.Int64
-}
-
-// owedGroup is one group's offers owed to the peer.
-type owedGroup struct {
-	topic string
-	bits  haveBits
 }
 
 func newRpcQueue(maxSize int) *rpcQueue {
@@ -280,31 +256,9 @@ func (q *rpcQueue) dispatch(rpc *RPC) *RPC {
 	}
 	if projected > 0 {
 		q.projected.Add(int64(projected))
-		if q.onSkipped != nil {
-			// A′: the skipped pushes go back to the router, which no longer counts them and owes
-			// a mesh peer their offer. Read before notePopped below moves the projection.
-			var skipped []*pb.Message
-			for _, m := range rpc.Publish {
-				if !(q.have.cancelOn && q.have.held(m)) && q.have.projectedComplete(m) {
-					skipped = append(skipped, m)
-				}
-			}
-			q.onSkipped(skipped)
-		}
 	}
 	if kept == nil {
 		return nil
-	}
-	if q.have.ownHeld != nil && kept.Control != nil && len(kept.Control.Iwant) > 0 {
-		// Asks for frames we hold by now leave no more (the spec's §7.2).
-		out, dropped := dropHeldAsks(kept, q.have.ownHeld)
-		if dropped > 0 {
-			StaleAsksDropped.Add(int64(dropped))
-			if out == nil {
-				return nil
-			}
-			kept = out
-		}
 	}
 	if out := q.have.attach(kept); out != nil {
 		q.attached.Add(1)
@@ -395,11 +349,9 @@ func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
 	defer unregisterAfterFunc()
 
 	for {
-		q.requeueOwedAnswersLocked()
-		for q.queue.Len() == 0 && len(q.owed) == 0 {
+		for q.queue.Len() == 0 {
 			// Nothing to send: a held slot goes back so another peer's writer can use it.
 			q.releaseCreditLocked()
-			q.releaseHoseGrantLocked()
 			select {
 			case <-ctx.Done():
 				return nil, ErrQueueCancelled
@@ -409,15 +361,6 @@ func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
 			if q.closed {
 				return nil, ErrQueueClosed
 			}
-			q.requeueOwedAnswersLocked()
-		}
-		if q.queue.Len() == 0 {
-			// Only owed offers wait: they leave alone (A′), and take no window slot.
-			q.releaseHoseGrantLocked()
-			if out := q.withOwedLocked(nil); out != nil {
-				return out, nil
-			}
-			continue
 		}
 		if len(q.queue.priority) > 0 {
 			// The urgent lane neither takes nor waits for a slot.
@@ -425,9 +368,7 @@ func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
 			q.queuedBytes -= int64(rpc.size)
 			q.spaceAvailable.Signal()
 			if out := q.dispatch(rpc); out != nil {
-				if out = q.finishPopLocked(out); out != nil {
-					return out, nil
-				}
+				return out, nil
 			}
 			continue
 		}
@@ -523,318 +464,9 @@ func (q *rpcQueue) Pop(ctx context.Context) (*RPC, error) {
 			q.hoseAfterPopLocked(out)
 		}
 		if out != nil {
-			if out = q.finishPopLocked(out); out != nil {
-				return out, nil
-			}
+			return out, nil
 		}
 	}
-}
-
-// releaseHoseGrantLocked returns a window slot this writer was granted and has not used: the frame
-// it waited for was discarded meanwhile (a group past its lifetime, v0.5's D′). Off the v0.5 paths a
-// writer never holds a grant with nothing queued, so this does nothing there. Under queueMu.
-func (q *rpcQueue) releaseHoseGrantLocked() {
-	if q.hoseHolding {
-		q.hoseHolding = false
-		q.hose.unused()
-	}
-}
-
-// finishPopLocked is the last step before an RPC leaves the queue: what is owed rides on it (A′),
-// and its asks are reported as written (E), the ones an IWANT class loss takes included, since that
-// loss stands for the wire. nil when the loss took all it carried. Under queueMu.
-func (q *rpcQueue) finishPopLocked(out *RPC) *RPC {
-	if len(q.owed) > 0 {
-		if with := q.withOwedLocked(out); with != nil {
-			out = with
-		}
-	}
-	if q.onAsks != nil {
-		var mids []string
-		for _, w := range out.GetControl().GetIwant() {
-			mids = append(mids, w.GetMessageIDs()...)
-		}
-		if len(mids) > 0 {
-			if q.askLoss != nil {
-				if kept, lost := q.askLoss(mids); len(lost) > 0 {
-					if out = withAsks(out, kept); out == nil {
-						// All lost on the wire: written all the same, at the write (after any send
-						// delay), and then nothing goes out.
-						return &RPC{asks: mids, lostOnly: true}
-					}
-				}
-			}
-			// The asks are reported when the writer writes the RPC (noteWrite), after any send delay;
-			// an RPC carrying asks is per peer, but it is copied before it is marked.
-			out = shallowRPCCopy(out)
-			out.asks = mids
-		}
-	}
-	return out
-}
-
-// noteAsksWritten reports rpc's asks as written now (E). The writer goroutine, at the write.
-func (q *rpcQueue) noteAsksWritten(rpc *RPC) {
-	if q.onAsks != nil && len(rpc.asks) > 0 {
-		q.onAsks(rpc.asks, time.Now())
-	}
-}
-
-// withAsks returns rpc with its asks replaced by ids (none when ids is empty); nil when nothing
-// else is left to write. Never mutates rpc.
-func withAsks(rpc *RPC, ids []string) *RPC {
-	c := rpc.Control
-	ctl := &pb.ControlMessage{Ihave: c.Ihave, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-	if len(ids) > 0 {
-		ctl.Iwant = []*pb.ControlIWant{{MessageIDs: ids}}
-	}
-	out := shallowRPCCopy(rpc)
-	out.urgent = rpc.urgent
-	out.Control = ctl
-	if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-		return nil
-	}
-	return out
-}
-
-// owe adds bits of root to what is owed to the peer as offers, and wakes the writer. Router
-// goroutine (specv05.go).
-func (q *rpcQueue) owe(topic, root string, bits *haveBits) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.closed {
-		return
-	}
-	if q.owed == nil {
-		q.owed = make(map[string]*owedGroup)
-	}
-	g := q.owed[root]
-	if g == nil {
-		g = &owedGroup{topic: topic}
-		q.owed[root] = g
-	}
-	g.bits.Or(bits.Bytes())
-	q.dataAvailable.Signal()
-}
-
-// unowe drops index of root from what is owed: we pushed it to the peer since. Router goroutine.
-func (q *rpcQueue) unowe(root string, index uint32) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if g := q.owed[root]; g != nil {
-		g.bits.Clear(index)
-	}
-}
-
-// oweAnswer keeps an answer a full queue refused, to be queued once there is room. Router
-// goroutine.
-func (q *rpcQueue) oweAnswer(m *pb.Message) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.closed {
-		return
-	}
-	for _, o := range q.owedAnswers {
-		if o == m || q.sameChunk(o, m) {
-			return // one owed answer per chunk, as the spec's owed_answers bitmap holds
-		}
-	}
-	// (Without a group and index, distinct messages stay distinct, even with equal payloads.)
-	q.owedAnswers = append(q.owedAnswers, m)
-	// The writer may have drained the queue and gone to sleep since the push was refused.
-	q.dataAvailable.Signal()
-}
-
-// sameChunk reports whether a and b are the same chunk: the same group and index, when the queue
-// knows the index function and both have one. Otherwise only the same message object is.
-func (q *rpcQueue) sameChunk(a, b *pb.Message) bool {
-	if q.have != nil {
-		ra, ia, oka := q.have.index(a)
-		rb, ib, okb := q.have.index(b)
-		if oka && okb {
-			return ra == rb && ia == ib
-		}
-	}
-	return false
-}
-
-// requeueOwedAnswersLocked queues the owed answers while the queue has room: from there each is an
-// ordinary answer, which the dispatch-time cancel drops if the peer has claimed it meanwhile.
-// Under queueMu.
-func (q *rpcQueue) requeueOwedAnswersLocked() {
-	for len(q.owedAnswers) > 0 && q.queue.Len() < q.maxSize {
-		m := q.owedAnswers[0]
-		q.owedAnswers[0] = nil
-		q.owedAnswers = q.owedAnswers[1:]
-		rpc := &RPC{RPC: pb.RPC{Publish: []*pb.Message{m}}, solicited: true}
-		rpc.size = proto.Size(&rpc.RPC)
-		q.queue.NormalPush(rpc)
-		q.queuedBytes += int64(rpc.size)
-		if q.queuedBytes > q.peakQueued {
-			q.peakQueued = q.queuedBytes
-		}
-	}
-}
-
-// discardGroup drops a group past its lifetime from the queue (v0.5's D′): what is owed of it, and
-// its frames, offers and asks in every queued RPC; its HAVEs stay. ofMsg and ofID tell a frame and
-// an id of the group. Returns how many frames and ids it dropped. Queued RPCs are shared across
-// peers, so a changed one is replaced by a copy. Router goroutine.
-func (q *rpcQueue) discardGroup(root string, ofMsg func(*pb.Message) bool, ofID func(string) bool) int {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	dropped := 0
-	delete(q.owed, root)
-	answers := q.owedAnswers[:0]
-	for _, m := range q.owedAnswers {
-		if ofMsg(m) {
-			dropped++
-			continue
-		}
-		answers = append(answers, m)
-	}
-	q.owedAnswers = answers
-	filter := func(rpc *RPC) *RPC {
-		n := 0
-		var publish []*pb.Message
-		for _, m := range rpc.Publish {
-			if ofMsg(m) {
-				n++
-				continue
-			}
-			publish = append(publish, m)
-		}
-		ctl := rpc.GetControl()
-		var ihave []*pb.ControlIHave
-		var iwant []*pb.ControlIWant
-		for _, ih := range ctl.GetIhave() {
-			var ids []string
-			for _, id := range ih.GetMessageIDs() {
-				if ofID(id) {
-					n++
-					continue
-				}
-				ids = append(ids, id)
-			}
-			if len(ids) > 0 {
-				ihave = append(ihave, &pb.ControlIHave{TopicID: ih.TopicID, MessageIDs: ids})
-			}
-		}
-		for _, iw := range ctl.GetIwant() {
-			var ids []string
-			for _, id := range iw.GetMessageIDs() {
-				if ofID(id) {
-					n++
-					continue
-				}
-				ids = append(ids, id)
-			}
-			if len(ids) > 0 {
-				iwant = append(iwant, &pb.ControlIWant{MessageIDs: ids})
-			}
-		}
-		if n == 0 {
-			return rpc
-		}
-		dropped += n
-		out := shallowRPCCopy(rpc)
-		out.urgent = rpc.urgent
-		out.Publish = publish
-		if ctl != nil {
-			out.Control = &pb.ControlMessage{Ihave: ihave, Iwant: iwant, Graft: ctl.Graft, Prune: ctl.Prune, Idontwant: ctl.Idontwant, Extensions: ctl.Extensions}
-		}
-		if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-			return nil
-		}
-		out.size = proto.Size(&out.RPC)
-		return out
-	}
-	priority := q.queue.priority[:0]
-	for _, rpc := range q.queue.priority {
-		out := filter(rpc)
-		q.queuedBytes -= int64(rpc.size)
-		if out != nil {
-			q.queuedBytes += int64(out.size)
-			priority = append(priority, out)
-		}
-	}
-	q.queue.priority = priority
-	normal := q.queue.normal[:0]
-	for _, e := range q.queue.normal {
-		out := filter(e.rpc)
-		q.queuedBytes -= int64(e.rpc.size)
-		if out != nil {
-			q.queuedBytes += int64(out.size)
-			normal = append(normal, rankedRPC{rpc: out, rank: e.rank})
-		}
-	}
-	q.queue.normal = normal
-	q.spaceAvailable.Signal()
-	return dropped
-}
-
-// withOwedLocked returns out carrying what is owed, one IHAVE bitmap per group, less what the peer
-// has told us it holds and the frame out carries; an RPC of the owed IHAVEs alone when out is nil.
-// The owed bits are spent either way. nil when nothing is left to send. Under queueMu.
-func (q *rpcQueue) withOwedLocked(out *RPC) *RPC {
-	if len(q.owed) == 0 {
-		return nil
-	}
-	roots := make([]string, 0, len(q.owed))
-	for root := range q.owed {
-		roots = append(roots, root)
-	}
-	sort.Strings(roots)
-	var ihaves []*pb.ControlIHave
-	for _, root := range roots {
-		g := q.owed[root]
-		delete(q.owed, root)
-		b := &g.bits
-		if h := q.have; h != nil {
-			if t := h.theirs[root]; t != nil {
-				b = b.AndNot(t)
-			}
-			if c := h.claim[root]; c != nil {
-				b = b.AndNot(c)
-			}
-			if out != nil {
-				for _, m := range out.Publish {
-					if r, i, ok := h.index(m); ok && r == root {
-						b.Clear(i)
-					}
-				}
-			}
-		}
-		n := b.Count()
-		if n == 0 {
-			continue
-		}
-		topic := g.topic
-		ihaves = append(ihaves, &pb.ControlIHave{TopicID: &topic, MessageIDs: []string{encodeHave(root, b)}})
-		if q.owedSent != nil {
-			q.owedSent.Add(int64(n))
-		}
-	}
-	if len(ihaves) == 0 {
-		return nil
-	}
-	extra := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Ihave: ihaves}}}
-	if q.owedFilter != nil {
-		if extra = q.owedFilter(extra); extra == nil {
-			return nil
-		}
-	}
-	if out == nil {
-		return extra
-	}
-	with := shallowRPCCopy(out)
-	ctl := &pb.ControlMessage{}
-	if c := out.GetControl(); c != nil {
-		ctl = &pb.ControlMessage{Ihave: c.Ihave, Iwant: c.Iwant, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-	}
-	ctl.Ihave = append(append([]*pb.ControlIHave(nil), ctl.Ihave...), extra.GetControl().GetIhave()...)
-	with.Control = ctl
-	return with
 }
 
 func (q *rpcQueue) Close() {

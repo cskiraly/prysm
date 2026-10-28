@@ -696,7 +696,6 @@ type GossipSubRouter struct {
 	offerRetryCtr                                                *atomic.Int64                    // offer-table diagnostics: timer-driven retries sent
 	pullOutstanding                                              map[string]time.Time             // ids pulled and not yet delivered, expiring on the discipline window
 	pullBacklog                                                  []pullCandidate                  // declined candidates (budget or discipline), re-driven as slots free
-	v05                                                          *specV05                         // optional: the rules spec v0.5 added (specv05.go)
 	requestGate                                                  RequestGate                      // optional application veto on requesting an announced id
 	deferred                                                     map[string]*deferredEntry        // declined announcements, replayable when the gate opens
 	deferredMax                                                  int                              // cap on deferred entries
@@ -922,7 +921,6 @@ func (gs *GossipSubRouter) OnClosedOutboundStream(p peer.ID) {
 	delete(gs.outbound, p)
 	delete(gs.unwanted, p)
 	gs.haveForget(p)
-	gs.v05PeerGone(p)
 }
 
 func (gs *GossipSubRouter) EnoughPeers(topic string, suggested int) bool {
@@ -1016,12 +1014,6 @@ func (gs *GossipSubRouter) Preprocess(from peer.ID, msgs []*Message) {
 			}
 		}
 		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
-			continue
-		}
-		if from == gs.p.host.ID() && gs.have != nil && gs.have.idontwantOn {
-			// Our own message, as Topic.validate passes it here: with HAVE bitmaps our HAVE for its
-			// group goes once the publish is planned (haveOrigin) or follows our pops (an origin HAVE
-			// mode), not once per message as each joins a batch.
 			continue
 		}
 		topic := msg.GetTopic()
@@ -1209,8 +1201,8 @@ func (gs *GossipSubRouter) handleIHave(p peer.ID, ctl *pb.ControlMessage) []*pb.
 
 // considerAnnounced records one announced id from p and makes it a candidate to ask for.
 func (gs *GossipSubRouter) considerAnnounced(p peer.ID, topic, mid string, iwant map[string]string, candidates *[]string) {
-	if gs.haveSeen(mid) || gs.expiredID(mid) {
-		return // held, or of a group past its lifetime (v0.5's D′): no offer, no ask
+	if gs.haveSeen(mid) {
+		return
 	}
 	// An announce names the id a HAVE bitmap cannot; learn it so the bitmap's holders count
 	// for this message before it arrives.
@@ -1223,13 +1215,7 @@ func (gs *GossipSubRouter) considerAnnounced(p peer.ID, topic, mid string, iwant
 	gs.noteAnnouncedHolder(mid, p)
 	gs.noteRarityAnnouncer(mid, p)
 	gs.recordOffer(mid, topic, p)
-	if gs.v05LastResort() {
-		gs.noteOffered(p, topic, mid)
-	}
 	if gs.parkGroups != nil && gs.peerParkedFor(p, mid) {
-		// B′: a parked announcer is not asked now, but when every announcer is parked each is
-		// asked once more, later.
-		gs.lastResort(mid)
 		return
 	}
 	if _, dup := iwant[mid]; dup {
@@ -1371,45 +1357,25 @@ func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	}
 
 	ihave := make(map[string]*pb.Message)
-	if n := countIWantIDs(ctl); n > 0 {
-		var inMesh int64
-		for _, peers := range gs.mesh {
-			if _, ok := peers[p]; ok {
-				inMesh = n
-				break
-			}
-		}
-		gs.p.upload.noteAsksIn(n, inMesh)
-	}
 	for _, iwant := range ctl.GetIwant() {
 		for _, mid := range iwant.GetMessageIDs() {
 			// An ask by index resolves to the id we hold there, or to nothing.
 			askRoot, askIndex, byIndex := decodeWant(mid)
-			if gs.expiredID(mid) {
-				continue // an ask for a group past its lifetime is ignored, without penalty (v0.5's D′)
-			}
 			mid, skip := gs.haveResolveWant(mid)
 			if skip || gs.discloseRefuses(p, mid) || gs.originOfferRefuses(mid) {
 				continue
 			}
-			if byIndex && gs.havePeerHolds(p, askRoot, askIndex) {
-				// The peer's own HAVE names the index: the ask is stale, overtaken by that HAVE on
-				// the urgent lane, and the HAVE wins (the spec's §4.5, which also penalises; an
-				// honest asker drops such asks before writing them).
-				AsksForHeldDropped.Add(1)
-				continue
-			}
 			gs.offerAnswered(p, mid)
 			if byIndex {
-				// The ask supersedes a claim the peer sent for this index, never its HAVE (haveRevoke).
+				// The ask supersedes any bitmap the peer sent for this index (havebitmap.go).
 				if q := gs.haveQueue(p); q != nil {
 					q.haveRevoke(askRoot, askIndex)
 				}
 			}
 			// Check if that peer has sent IDONTWANT before, if so don't send them the message.
-			// An ask by index passes the peer's unwanted set: a claim it sent ahead of decode (plan
-			// §7c D7 idea 2) put the ids there, and a node that fell short must be able to pull the
-			// rest; a HAVE for the index was handled above.
+			// An ask by index is explicit and later than any bitmap the peer sent, so it is
+			// answered regardless: a receiver that suppressed a group ahead of decode and fell
+			// short must be able to pull the rest.
 			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok && !byIndex {
 				continue
 			}
@@ -1455,15 +1421,6 @@ func (gs *GossipSubRouter) handleIWant(p peer.ID, ctl *pb.ControlMessage) []*pb.
 	}
 
 	return msgs
-}
-
-// countIWantIDs is the ask ids an RPC's control carries.
-func countIWantIDs(ctl *pb.ControlMessage) int64 {
-	var n int64
-	for _, iwant := range ctl.GetIwant() {
-		n += int64(len(iwant.GetMessageIDs()))
-	}
-	return n
 }
 
 func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlPrune {
@@ -1862,7 +1819,6 @@ func shallowRPCCopy(rpc *RPC) *RPC {
 }
 
 func (gs *GossipSubRouter) Publish(msg *Message) {
-	gs.haveOrigin([]*Message{msg}, nil) // our HAVE ahead of the data, as PublishBatch sends it
 	for p, rpc := range gs.rpcs(msg) {
 		gs.haveOriginLead(p, rpc)
 		gs.sendRPC(p, rpc, rpc.urgent)
@@ -1871,11 +1827,6 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 
 func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
-		if gs.expiredID(gs.p.idGen.ID(msg)) {
-			// A late copy of a group past its lifetime: not served, forwarded or announced (v0.5's
-			// D′). The application has it delivered regardless; what it does with it is its own.
-			return
-		}
 		gs.mcache.Put(msg)
 		gs.pacedBorn(gs.p.idGen.ID(msg))
 		// A message we forward is validated and in mcache: servable. Our own messages never
@@ -2404,9 +2355,6 @@ func (gs *GossipSubRouter) doSendRPC(rpc *RPC, p peer.ID, q *rpcQueue, urgent bo
 		err = q.Push(rpc, false)
 	}
 	if err != nil {
-		if gs.v05OfferSkipped() && errIsQueueFull(err) {
-			gs.oweRefused(p, q, rpc) // before doDropRPC, which strips the gossip from the control
-		}
 		gs.doDropRPC(rpc, p, "queue full")
 		return false
 	}

@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -38,37 +37,6 @@ func TestUploadByClass(t *testing.T) {
 		sum := s.PushBytes + s.AnswerBytes + s.IHaveBytes + s.IWantBytes + s.IDontWantBytes + s.GraftPruneBytes + s.OtherBytes
 		if s.AllBytes != int64(written) || sum != s.AllBytes || s.OtherBytes < 6 {
 			t.Fatalf("all %d sum %d other %d, want %d, equal, and at least the prefixes and control tags", s.AllBytes, sum, s.OtherBytes, written)
-		}
-	})
-	t.Run("control ids are counted by kind, HAVE bitmaps and asks by index apart", func(t *testing.T) {
-		var u uploadCounter
-		var bits haveBits
-		bits.Set(0)
-		bits.Set(3)
-		have := encodeHave(root, &bits)
-		want := encodeWant(root, 5)
-		ctl := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
-			Ihave:     []*pb.ControlIHave{{MessageIDs: []string{have, "plain"}}},
-			Iwant:     []*pb.ControlIWant{{MessageIDs: []string{want, want, "plain"}}},
-			Idontwant: []*pb.ControlIDontWant{{MessageIDs: []string{have}}},
-		}}}
-		u.note(ctl, proto.Size(&ctl.RPC), "to")
-		s := u.s
-		if s.IHaveIDs != 2 || s.IHaveBitmaps != 1 || s.IWantIDs != 3 || s.IWantAsks != 2 || s.IDontWantIDs != 1 || s.IDontWantBitmaps != 1 {
-			t.Fatalf("ids %+v, want IHAVE 2 (1 bitmap), IWANT 3 (2 asks), IDONTWANT 1 (1 bitmap)", s)
-		}
-	})
-	t.Run("pushes are counted per frame when the writer has an id function, answers never", func(t *testing.T) {
-		var u uploadCounter
-		id := func(m *pb.Message) string { return string(m.Data) }
-		for _, to := range []string{"p1", "p2"} {
-			u.noteWithID(testDataRPC(root, 2), 10, peer.ID(to), id)
-		}
-		ans := &RPC{RPC: pb.RPC{Publish: []*pb.Message{{Data: []byte(testMid(root, 2))}}}, solicited: true}
-		u.noteWithID(ans, 10, "p3", id)
-		u.note(testDataRPC(root, 2), 10, "p4") // no id function: counted as a push, not per frame
-		if len(u.pushPerFrame) != 1 || u.pushPerFrame[testMid(root, 2)] != 2 || u.s.PushFrames != 3 || u.s.AnswerFrames != 1 {
-			t.Fatalf("per frame %v, push frames %d, answers %d; want the frame pushed twice, 3 push frames, 1 answer", u.pushPerFrame, u.s.PushFrames, u.s.AnswerFrames)
 		}
 	})
 	t.Run("a filtered copy stays an answer", func(t *testing.T) {

@@ -1,0 +1,27 @@
+load("@prysm//tools/go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "channel.go",
+        "engine.go",
+        "errors.go",
+        "events.go",
+        "observer.go",
+        "peer.go",
+        "peer_ctrl.go",
+        "peer_in.go",
+        "session.go",
+        "types.go",
+        "wire.go",
+    ],
+    importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/pb:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/legacy/transport:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/protocol:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/protocol/pb:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
+)

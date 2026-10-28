@@ -1,0 +1,36 @@
+load("@prysm//tools/go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["conn.go"],
+    importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentintegrationtest/ecbridge",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/pb:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/legacy/transport:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/protocol/pb:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/network:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/protocol:go_default_library",
+        "@com_github_multiformats_go_multistream//:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["conn_test.go"],
+    embed = [":go_default_library"],
+    deps = [
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/rs:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/legacy/transport:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/protocol:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/protocol/pb:go_default_library",
+        "@com_github_libp2p_go_libp2p//:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
+)

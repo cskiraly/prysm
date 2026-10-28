@@ -1,0 +1,19 @@
+load("@prysm//tools/go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "bitmap.go",
+        "emit.go",
+        "strategy.go",
+        "types.go",
+    ],
+    importpath = "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/rs",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast:go_default_library",
+        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/rs/pb:go_default_library",
+        "@com_github_klauspost_reedsolomon//:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
+)

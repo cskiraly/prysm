@@ -48,8 +48,7 @@ type diffusionStats struct {
 	compTimes          []time.Duration
 	drops, dups        int
 	rxBytes, txBytes   int
-	linkRx             int // bytes the downlinks took in less their drops, all protocols, publish to completion
-	socketRx           int // what the downlinks handed the sockets over the same interval (link rx counts at the queue's intake)
+	linkRx             int // bytes delivered by all downlinks, all protocols, by completion
 	idwSent, idwRecv   int
 	ctrlRx             int
 	publisherTx        int
@@ -142,6 +141,40 @@ type prePublisher interface {
 	prePublish(t *testing.T, ctx context.Context, wg *sync.WaitGroup)
 }
 
+// edgeShaper is an optional variant hook: a variant whose nodes keep links a random regular graph
+// does not give them (the fulldas arm's per-line graphs, fulldas_test.go) supplies the cell's graph
+// before the network is built.
+type edgeShaper interface {
+	shapeEdges(edges []edge) []edge
+}
+
+// horizonless is an optional variant hook: true leaves the horizon's lines out of the report.
+type horizonless interface {
+	horizonless() bool
+}
+
+// extraRxer is an optional variant hook: application data its nodes received outside gossipsub
+// this message (the fulldas arm's sampled cells), all nodes, added to the tracers' data bytes.
+type extraRxer interface {
+	extraRx() int
+}
+
+// addExtraRx adds a variant's application data outside gossipsub to the aggregated data bytes.
+func addExtraRx(v variant, s *diffusionStats) {
+	if x, ok := v.(extraRxer); ok {
+		s.rxBytes += x.extraRx()
+	}
+}
+
+// shapedGraph is meshGraph, or the variant's graph in its place.
+func shapedGraph(t *testing.T, n int, v variant) []edge {
+	edges := meshGraph(t, n)
+	if es, ok := v.(edgeShaper); ok {
+		edges = es.shapeEdges(edges)
+	}
+	return edges
+}
+
 // announceRetryCeiling is one tick past the longest sleep pubsub's announceRetry can take
 // (`1+rand.Intn(1000)` ms, upstream pubsub.go). See the drain in runDiffusion.
 const announceRetryCeiling = 1001 * time.Millisecond
@@ -220,11 +253,9 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		if driven {
 			gd.setGates(gates)
 		}
-		// Built once: the network and the cross-check's dump read the same links and graph.
-		links, edges := meshLinks(t, p.n, p.rate), meshGraph(t, p.n)
 		nw, stop := newSimNetwork(t, networkConfig{
-			links:   links,
-			edges:   edges,
+			links:   meshLinks(t, p.n, p.rate),
+			edges:   shapedGraph(t, p.n, v),
 			latency: simnet.StaticLatency(p.latency),
 			perNodeOpts: func(i int) []pubsub.Option {
 				opts := []pubsub.Option{pubsub.WithRawTracer(tracers[i]), pubsub.WithRequestObservation()}
@@ -248,9 +279,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		defer r.cancel()
 		stats.meshSummary = r.settle(t, tracers)
 		tMeshed := time.Now()
-		xc := xcDumpOpen(t)
-		defer xc.close(t)
-		xc.net(t, p, links, edges, pushDegreeOf(v))
 
 		ctx, cancel := context.WithTimeout(context.Background(), networkOpTimeout)
 		defer cancel()
@@ -321,14 +349,13 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			stats.pub, stats.msg, stats.msgs = plan.pubs[m-1], m, len(plan.pubs)
 			breaks0, parks0, retries0 := parkBreaks.Load(), parks.Load(), offerRetries.Load()
 			held0 := promisesHeld(nw)
-			v050 := v05Now()
 
 			// The announce-rate histogram describes the measured diffusion, not the settle heartbeats.
 			announceStats.Reset()
 			done := make(chan completionEvent, p.n)
 			uploadNewWindow(nw) // the settle heartbeats and the previous gap are not this message's
 			promiseNewWindow(nw)
-			linkBase, socketBase := downlinkBytes(nw), socketBytes(nw)
+			linkBase := downlinkBytes(nw)
 			start := time.Now()
 			prevStart = start
 			// The horizon is taken on this goroutine at the deadline, while every subscription is
@@ -338,7 +365,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			stats.compAt = make([]time.Duration, p.n)
 			stats.rxAtComp = make([]int, p.n)
 			stats.horizon = newHorizonSnapshot(t, p.n, p.deadline, stats.pub, base)
-			stats.horizon.degree, stats.horizon.askWindow = pushDegreeOf(v), xcAskWindow()
 			horizonTimer := time.NewTimer(p.deadline)
 			defer horizonTimer.Stop()
 			takeHorizon := func() {
@@ -354,10 +380,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			}
 			signal := func(node int, at time.Duration) { done <- completionEvent{node: node, at: at} }
 			r.watch(ctx, &wg, start, signal)
-			xc.mesh(t, m, stats.pub, nw, tracers)
-			pubsub.HaveRevoked.Store(0)
-			pubsub.AsksForHeldDropped.Store(0)
-			pubsub.StaleAsksDropped.Store(0)
 			if err := r.publish(ctx, t); err != nil {
 				t.Fatal(err)
 			}
@@ -384,8 +406,8 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 					// moved"; these are the counters at the harness timeout, the horizon's the ones at
 					// the deadline.
 					aggregateTracers(tracers, &stats)
+					addExtraRx(v, &stats)
 					stats.linkRx = linkRxSince(nw, linkBase)
-					stats.socketRx = socketRxSince(nw, socketBase)
 					stats.tracers = tracers
 					stats.startAt = start
 					takeHorizon()
@@ -399,8 +421,8 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 				stats.virt = time.Since(start)
 				synctest.Wait()
 				aggregateTracers(tracers, &stats)
+				addExtraRx(v, &stats)
 				stats.linkRx = linkRxSince(nw, linkBase)
-				stats.socketRx = socketRxSince(nw, socketBase)
 				stats.tracers = tracers
 				stats.startAt = start
 				if gates != nil {
@@ -423,9 +445,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 				t.Logf("=== message %d/%d, publisher node %d%s", m, len(plan.pubs), stats.pub, cold)
 				reportCell(t, v, stats)
 				t.Logf("        commitment enforcement this message: %d broken promises, %d peers parked; offer-table retries %d; promises due with the index held %d", parkBreaks.Load()-breaks0, parks.Load()-parks0, offerRetries.Load()-retries0, promisesHeld(nw)-held0)
-				if os.Getenv("SEGMENT_V05") != "" {
-					t.Logf("        %s", v050.line(v05Now()))
-				}
 				sums = append(sums, summarise(stats))
 			}
 			if timedOut {
@@ -454,8 +473,7 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 func reportCell(t *testing.T, v variant, stats diffusionStats) {
 	v.report(t, stats)
 	if stats.linkRx > 0 && stats.n > 0 {
-		t.Logf("        link rx/node %dB (each downlink's intake less its drops, publish to completion: UDP payloads, every protocol)", stats.linkRx/stats.n)
-		t.Logf("        socket rx/node %dB (what the downlinks handed the sockets from the publish to completion; link rx counts bytes as a downlink queue takes them in, less its drops)", stats.socketRx/stats.n)
+		t.Logf("        link rx/node %dB (what each downlink enqueued less dropped by completion, packets still queued included: UDP payloads, every protocol)", stats.linkRx/stats.n)
 	}
 	if w, ok := v.(wireFormer); ok {
 		t.Logf("        %s", w.wireForm())
@@ -463,8 +481,10 @@ func reportCell(t *testing.T, v variant, stats diffusionStats) {
 	if stats.gateSummary != "" {
 		t.Logf("        %s", stats.gateSummary)
 	}
-	for _, line := range stats.horizon.lines(stats.compAt, stats.rxAtComp) {
-		t.Logf("        %s", line)
+	if hl, ok := v.(horizonless); !ok || !hl.horizonless() {
+		for _, line := range stats.horizon.lines(stats.compAt, stats.rxAtComp) {
+			t.Logf("        %s", line)
+		}
 	}
 }
 
