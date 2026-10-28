@@ -1,7 +1,8 @@
 # The arm table shared by runcell.sh (Shadow) and harnesscell.sh (in-process): the fleet runner's
 # definitions for the arms the cross-check reproduces, so a cell's SEGMENT_* environment is the
 # published cell's on both substrates.
-# Inputs: arm seed N pay, NET (home|dc20|dcb20|upN); outputs: P KA FC COMMON EXTRA EDGES VARIANT ALIAS
+# Inputs: arm seed N pay, NET (home|dc20|dcb20|upN), COND (cold, warm320k, cwndN: the transport condition,
+# see below); outputs: P KA FC COMMON EXTRA EDGES VARIANT ALIAS
 # (VARIANT: a = variant A on TestQ6RealisticMesh, b = TestVariantBDiffusion, c = TestVariantCDiffusion;
 # ALIAS: the name the published fleet used for the arm, for pairing with its records).
 #
@@ -25,7 +26,19 @@ case $NET in
   up[0-9]*) UP=${NET#up}; DOWN=$((UP*2)) ;;
   *) echo "bad NET $NET (home|dc20|dcb20|upN)"; exit 2 ;;
 esac
-COMMON="SEGMENT_STRICT=1 SEGMENT_SLOW_TESTS=1 SEGMENT_MESH_SIZES=$N SEGMENT_DEGREE=${DEGREE:-70} SEGMENT_LATENCY_MODEL=${LATENCY_MODEL:-geo} SEGMENT_DET_RAND=1 SEGMENT_SEED=$seed SEGMENT_PAYLOAD_BYTES=$P SEGMENT_DEADLINE_MS=3000 SEGMENT_UP_MBPS=$UP SEGMENT_DOWN_MBPS=$DOWN $SCEN"
+# The transport condition (the report's section 7): cold = every connection from slow start, the
+# post's figures; warm320k = the harness's link-level warm-up, 320 KiB pushed on every connection
+# over a dummy stream before the publish (the bandwidth-delay product of 50 Mbps x 50 ms); cwndN =
+# quic-go's initial congestion window set to N packets through the fork's knob. Both are QUIC-side
+# and refused by the Shadow node until it supports them.
+COND=${COND:-cold}
+case $COND in
+  cold) CONDENV="" ;;
+  warm320k) CONDENV="SEGMENT_WARMUP_BYTES=327680" ;;
+  cwnd[0-9]*) CONDENV="SEGMENT_INITIAL_CWND_PACKETS=${COND#cwnd}" ;;
+  *) echo "bad COND $COND (cold|warm320k|cwndN)"; exit 2 ;;
+esac
+COMMON="$CONDENV SEGMENT_STRICT=1 SEGMENT_SLOW_TESTS=1 SEGMENT_MESH_SIZES=$N SEGMENT_DEGREE=${DEGREE:-70} SEGMENT_LATENCY_MODEL=${LATENCY_MODEL:-geo} SEGMENT_DET_RAND=1 SEGMENT_SEED=$seed SEGMENT_PAYLOAD_BYTES=$P SEGMENT_DEADLINE_MS=3000 SEGMENT_UP_MBPS=$UP SEGMENT_DOWN_MBPS=$DOWN $SCEN"
 # BUILDER_UP gives node 0 a symmetric datacenter link (SEGMENT_BUILDER_UP_MBPS) on any scenario.
 [ -z "${BUILDER_UP:-}" ] || COMMON="$COMMON SEGMENT_BUILDER_UP_MBPS=$BUILDER_UP"
 FINAL="SEGMENT_IWANT_DISCIPLINE_MS=200 SEGMENT_OFFER_TABLE=1 SEGMENT_IHAVE_PARK=1 SEGMENT_IHAVE_PARK_K=1 SEGMENT_IHAVE_PARK_PROMISE_MS=400 SEGMENT_IHAVE_PARK_TTL_MS=30000"
@@ -51,8 +64,8 @@ case $arm in
   lad_batch_16k) ALIAS=lad_batch16; EXTRA="SEGMENT_ARMS=segmented SEGMENT_STRUCTURED_IDS=1 SEGMENT_SIZE_BYTES=16384" ;;
   acodedcf_32k) ALIAS=acodedcf; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$KA SEGMENT_PARITY=$KA SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $FINAL" ;;
   aadaptcfd_16k) ALIAS=aadaptcfd; EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=$AR SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$((P/16384)) SEGMENT_PARITY=$((P/16384)) SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $FINAL" ;;
-  # The series' production path (the Shadow branch only, SEGMENT_PRODUCTION is the series'):
-  # tier 2 plain, tier 3 coded, on the series' 16 KiB, with and without the 101-byte shim ids.
+  # The series' production path (runequiv3.sh; the Shadow branch only, SEGMENT_PRODUCTION is the
+  # series'): tier 2 plain, tier 3 coded, on the series' 16 KiB, with and without the 101-byte shim ids.
   prod2_16k)    ALIAS=prod2; EXTRA="SEGMENT_ARMS=phase SEGMENT_PRODUCTION=tier2 SEGMENT_SIZE_BYTES=16384" ;;
   prod2s_16k)   ALIAS=prod2s; EXTRA="SEGMENT_ARMS=phase SEGMENT_PRODUCTION=tier2 SEGMENT_SIZE_BYTES=16384 SEGMENT_STRUCTURED_IDS=1" ;;
   prod3_16k)    ALIAS=prod3; EXTRA="SEGMENT_ARMS=phase SEGMENT_PRODUCTION=tier3 SEGMENT_SIZE_BYTES=16384" ;;

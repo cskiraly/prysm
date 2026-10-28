@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"google.golang.org/protobuf/proto"
@@ -38,11 +39,12 @@ type RecvEvent struct {
 	What Digest
 }
 
-// CompletionStats summarises per-node completion under right-censoring (phase 0). times holds the
-// durations of the nodes that completed; population is every non-publisher node, so censored nodes
-// rank above every finite time. A quantile is reported only when it is actually reached — never
-// computed over completers alone — and the rate is against the experiment deadline, not the
-// harness timeout. max is deliberately absent: it is undefined under censoring.
+// CompletionStats summarises per-node completion under right-censoring. times holds the
+// durations of the nodes that completed; population
+// is every non-publisher node, so censored nodes rank above every finite time. A quantile
+// is reported only when it is actually reached — never computed over completers alone —
+// and the rate is against the experiment deadline, not the harness timeout. max is
+// deliberately absent: it is undefined under censoring.
 func CompletionStats(times []time.Duration, population int, deadline time.Duration) string {
 	sorted := append([]time.Duration(nil), times...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
@@ -76,7 +78,8 @@ type ControlCounts struct {
 	IdontwantSent, IdontwantRecv int
 	GraftSent, PruneSent         int
 	// Encoded bytes of the whole control section (IHAVE/IWANT/IDONTWANT/GRAFT/PRUNE).
-	// Payload equivalents exclude these; this counter is what lets a report say by how much.
+	// Payload equivalents exclude these; this counter
+	// is what lets a report say by how much.
 	BytesSent, BytesRecv int
 }
 
@@ -89,21 +92,41 @@ type RecordingTracer struct {
 	// Mu, Sends and Recvs are exported because the raw event log is the measurement: an
 	// experiment that needs a shape this file does not compute reads the events directly,
 	// under Mu.
-	Mu         sync.Mutex
-	Sends      []SendEvent
-	Recvs      []RecvEvent
+	Mu    sync.Mutex
+	Sends []SendEvent
+	Recvs []RecvEvent
+	// Dups is every later sighting of a message already delivered, with the sender and the
+	// instant, so that a duplicate can be read against the first copy: how far behind it
+	// landed, and how much of the payload the receiver still lacked when it did. The
+	// duplicates counter and this log move together and reset together.
+	Dups       []RecvEvent
 	duplicates int
 	rejects    int
 	recvBytes  int
+	recvFrames int
 	sentBytes  int
 	// Partial-message bytes are counted separately from rpc.Publish bytes. Variant B's
 	// payload never appears in rpc.Publish at all -- it travels in rpc.Partial -- so a tracer
 	// that only sums Publish reports zero wire bytes for the whole variant, which reads as
 	// "nothing moved" rather than "the tracer cannot see it".
-	partialRecvBytes int
-	partialSentBytes int
-	partialRPCsRecv  int
-	partialRPCsSent  int
+	//
+	// Payload and signalling are counted apart. rpc.Partial carries both a PartialMessage
+	// (the data) and a PartsMetadata (the have/want bitmaps), and summing them into one
+	// figure put the two families on different bases: a variant whose signalling rides in
+	// PartsMetadata reported zero control bytes and hid its signalling inside its copies,
+	// while a variant signalling through IHAVE/IWANT had that cost reported separately and
+	// excluded from its copies. Any claim that signalling collapsed is unreadable until the
+	// two are split, so they are.
+	partialRecvBytes     int
+	partialSentBytes     int
+	partialMetaRecvBytes int
+	partialMetaSentBytes int
+	partialRPCsRecv      int
+	partialRPCsSent      int
+	// Partial RPCs carrying a PartsMetadata, either direction. A metadata byte count alone
+	// cannot say whether signalling piggybacked on data frames or paid for its own.
+	partialMetaRPCsRecv int
+	partialMetaRPCsSent int
 	// Partial-message bytes split by topic. An experiment running both DAS axes at once cannot
 	// read the totals above at all: they sum across every topic the node speaks, so the row
 	// share had to be inferred by differencing arms. rpc.Partial carries a TopicID, so the
@@ -118,12 +141,38 @@ type RecordingTracer struct {
 	// degree the moment a peer is grafted in any one topic, and a per-topic precondition
 	// ("this topic's mesh has formed") becomes unassertable.
 	graftedInTopic map[string]map[peer.ID]int
+	// firstAnnounce is the first time each message id was named by an inbound control message:
+	// an IHAVE, an IWANT or an IDONTWANT. Hearing that a message exists is a different event
+	// from receiving it, and on a topic whose ids carry the segment index in the clear it is
+	// the earlier one -- which is what a diffusion curve of "knows about" rather than "holds"
+	// is made of. Only the first mention is kept, so the map is bounded by the number of
+	// distinct messages, not by the control traffic.
+	//
+	// nil unless TrackAnnounce is called: a cell that does not ask for the curve must not pay
+	// a map write per announced id, so that its scheduling stays exactly what it was.
+	firstAnnounce map[string]time.Time
+	// partialObserve decodes one inbound rpc.Partial into the segments it names. nil unless
+	// TrackPartialSegments is called.
+	partialObserve PartialObserveFn
+	// firstPartialGot is first delivery for segments that arrive inside rpc.Partial. They
+	// never reach DeliverMessage, so FirstDelivery cannot see them at all.
+	firstPartialGot map[string]time.Time
 }
 
-// partialTopicCounts is one topic's share of the partial-message traffic.
+// PartialObserveFn decodes one inbound partial-message extension into the segments it names:
+// got is what the frame carried, heard is what its bitmap says the sender holds. Either may be
+// empty. The tracer is generic -- the encoding of a partial message and of PartsMetadata, and
+// the mapping from a bit index to a segment's identity, belong to the experiment -- so this is
+// supplied rather than decoded here. Called under the tracer's lock, so it must not call back
+// into the tracer.
+type PartialObserveFn func(topicID string, groupID, partialMessage, partsMetadata []byte) (got, heard []string)
+
+// partialTopicCounts is one topic's share of the partial-message traffic. Payload bytes and
+// metadata (bitmap) bytes are held apart for the reason given on partialMetaRecvBytes.
 type partialTopicCounts struct {
-	RecvBytes, SentBytes int
-	RecvRPCs, SentRPCs   int
+	RecvBytes, SentBytes         int
+	RecvMetaBytes, SentMetaBytes int
+	RecvRPCs, SentRPCs           int
 }
 
 func NewRecordingTracer() *RecordingTracer {
@@ -144,18 +193,105 @@ func (r *RecordingTracer) ResetCounters() {
 	defer r.Mu.Unlock()
 	r.Sends = nil
 	r.Recvs = nil
+	r.Dups = nil
 	r.duplicates = 0
 	r.rejects = 0
 	r.recvBytes = 0
+	r.recvFrames = 0
 	r.sentBytes = 0
 	r.partialRecvBytes = 0
 	r.partialSentBytes = 0
+	r.partialMetaRecvBytes = 0
+	r.partialMetaSentBytes = 0
 	r.partialRPCsRecv = 0
 	r.partialRPCsSent = 0
+	r.partialMetaRPCsRecv = 0
+	r.partialMetaRPCsSent = 0
 	r.partialByTopic = make(map[string]partialTopicCounts)
 	r.droppedRPCs = 0
 	r.undeliverable = 0
 	r.control = ControlCounts{}
+	if r.firstAnnounce != nil {
+		r.firstAnnounce = make(map[string]time.Time)
+	}
+	if r.firstPartialGot != nil {
+		r.firstPartialGot = make(map[string]time.Time)
+	}
+}
+
+// TrackAnnounce starts recording the first inbound control mention of each message id. Call it
+// before the run; it costs one map write per id first seen and nothing per id after that.
+func (r *RecordingTracer) TrackAnnounce() {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	if r.firstAnnounce == nil {
+		r.firstAnnounce = make(map[string]time.Time)
+	}
+}
+
+// TrackPartialSegments extends the diffusion instrument to the partial-message path, which is
+// invisible to everything TrackAnnounce and FirstDelivery read. Implies TrackAnnounce.
+//
+// Two separate blind spots, not one. A segment carried in rpc.Partial never reaches
+// DeliverMessage, so *first got* is missing; and a variant signalling with bitmaps sends no
+// IHAVE, so *first heard* is missing too. A curve built without this reports that nobody ever
+// heard of anything and nobody ever received anything, which reads as a triumph and is an
+// artefact.
+//
+// On the heard side, only the *have* bitmap should count, and it is the supplied fn's job to
+// honour that. A want bitmap is not evidence that a segment exists: a standing want defaults to
+// everything on first contact, so counting want bits would mark every segment heard the moment
+// a peer connects -- the same artefact with the sign reversed, which is why the rule differs
+// from the control path's, where an inbound IWANT does count.
+func (r *RecordingTracer) TrackPartialSegments(fn PartialObserveFn) {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	if r.firstAnnounce == nil {
+		r.firstAnnounce = make(map[string]time.Time)
+	}
+	if r.firstPartialGot == nil {
+		r.firstPartialGot = make(map[string]time.Time)
+	}
+	r.partialObserve = fn
+}
+
+// FirstPartialGot returns, per segment identity, when a frame carrying it first arrived. Empty
+// unless TrackPartialSegments was called.
+func (r *RecordingTracer) FirstPartialGot() map[string]time.Time {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	out := make(map[string]time.Time, len(r.firstPartialGot))
+	for id, at := range r.firstPartialGot {
+		out[id] = at
+	}
+	return out
+}
+
+// FirstAnnounce returns a copy of the first inbound control mention of each message id. It is
+// empty unless TrackAnnounce was called.
+func (r *RecordingTracer) FirstAnnounce() map[string]time.Time {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	out := make(map[string]time.Time, len(r.firstAnnounce))
+	for id, at := range r.firstAnnounce {
+		out[id] = at
+	}
+	return out
+}
+
+// FirstDelivery returns, per message digest, when this node was first delivered it. Duplicates
+// do not appear: pubsub delivers a message to the application once, and later sightings arrive
+// through DuplicateMessage, which records them in Dups.
+func (r *RecordingTracer) FirstDelivery() map[Digest]time.Time {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	out := make(map[Digest]time.Time, len(r.Recvs))
+	for _, e := range r.Recvs {
+		if _, seen := out[e.What]; !seen {
+			out[e.What] = e.At
+		}
+	}
+	return out
 }
 
 // FirstForward is the time this node first passed any traced message on, which is the direct
@@ -220,10 +356,43 @@ func (r *RecordingTracer) PartialCounts() (recvBytes, sentBytes, recvRPCs, sentR
 	return r.partialRecvBytes, r.partialSentBytes, r.partialRPCsRecv, r.partialRPCsSent
 }
 
+// PartialMetaCounts returns the bitmap-signalling traffic carried in rpc.Partial: bytes and
+// the RPCs that carried any, each way. This is the partial path's analogue of
+// ControlCounts.Bytes*, and it is what makes a bitmap variant's signalling cost comparable with
+// an IHAVE/IWANT variant's. PartialCounts excludes every byte counted here.
+func (r *RecordingTracer) PartialMetaCounts() (recvBytes, sentBytes, recvRPCs, sentRPCs int) {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	return r.partialMetaRecvBytes, r.partialMetaSentBytes, r.partialMetaRPCsRecv, r.partialMetaRPCsSent
+}
+
+// PartialMetaCountsByTopicPrefix is PartialMetaCounts over every topic whose name contains
+// substr, matching PartialCountsByTopicPrefix.
+func (r *RecordingTracer) PartialMetaCountsByTopicPrefix(substr string) (recvBytes, sentBytes int) {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	for topic, counts := range r.partialByTopic {
+		if !strings.Contains(topic, substr) {
+			continue
+		}
+		recvBytes += counts.RecvMetaBytes
+		sentBytes += counts.SentMetaBytes
+	}
+
+	return recvBytes, sentBytes
+}
+
 func (r *RecordingTracer) Counts() (duplicates, rejects, recvBytes, sentBytes int) {
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 	return r.duplicates, r.rejects, r.recvBytes, r.sentBytes
+}
+
+// RecvFrames is the data frames received in rpc.Publish, first copies and duplicates alike, and their data bytes.
+func (r *RecordingTracer) RecvFrames() (frames, bytes int) {
+	r.Mu.Lock()
+	defer r.Mu.Unlock()
+	return r.recvFrames, r.recvBytes
 }
 
 func (r *RecordingTracer) MeshPeers() int {
@@ -324,13 +493,19 @@ func (r *RecordingTracer) SendRPC(rpc *pubsub.RPC, p peer.ID) {
 		r.sentBytes += len(m.Data)
 	}
 	if rpc.Partial != nil {
-		bytes := len(rpc.Partial.PartialMessage) + len(rpc.Partial.PartsMetadata)
+		payload := len(rpc.Partial.PartialMessage)
+		meta := len(rpc.Partial.PartsMetadata)
 		r.partialRPCsSent++
-		r.partialSentBytes += bytes
+		r.partialSentBytes += payload
+		r.partialMetaSentBytes += meta
 		counts := r.partialByTopic[rpc.Partial.GetTopicID()]
-		counts.SentBytes += bytes
+		counts.SentBytes += payload
+		counts.SentMetaBytes += meta
 		counts.SentRPCs++
 		r.partialByTopic[rpc.Partial.GetTopicID()] = counts
+		if meta > 0 {
+			r.partialMetaRPCsSent++
+		}
 	}
 }
 
@@ -343,15 +518,52 @@ func (r *RecordingTracer) RecvRPC(rpc *pubsub.RPC) {
 	r.countControl(rpc, false)
 	for _, m := range rpc.Publish {
 		r.recvBytes += len(m.Data)
+		r.recvFrames++
 	}
 	if rpc.Partial != nil {
-		bytes := len(rpc.Partial.PartialMessage) + len(rpc.Partial.PartsMetadata)
+		payload := len(rpc.Partial.PartialMessage)
+		meta := len(rpc.Partial.PartsMetadata)
 		r.partialRPCsRecv++
-		r.partialRecvBytes += bytes
+		r.partialRecvBytes += payload
+		r.partialMetaRecvBytes += meta
 		counts := r.partialByTopic[rpc.Partial.GetTopicID()]
-		counts.RecvBytes += bytes
+		counts.RecvBytes += payload
+		counts.RecvMetaBytes += meta
 		counts.RecvRPCs++
 		r.partialByTopic[rpc.Partial.GetTopicID()] = counts
+		if meta > 0 {
+			r.partialMetaRPCsRecv++
+		}
+		r.observePartial(rpc.Partial)
+	}
+}
+
+// observePartial records what an inbound partial frame carried and what its bitmap named.
+// Caller holds Mu.
+func (r *RecordingTracer) observePartial(ext *pubsub_pb.PartialMessagesExtension) {
+	if r.partialObserve == nil {
+		return
+	}
+	got, heard := r.partialObserve(ext.GetTopicID(), ext.GetGroupID(), ext.GetPartialMessage(), ext.GetPartsMetadata())
+	if len(got) == 0 && len(heard) == 0 {
+		return
+	}
+	now := time.Now()
+	// A frame that carries a segment is also the strongest possible announcement of it, so a
+	// got is a heard as well. Without this a segment that was pushed unasked -- which is the
+	// whole point of a standing want -- would have a delivery time and no hearing time.
+	for _, id := range got {
+		if _, seen := r.firstPartialGot[id]; !seen {
+			r.firstPartialGot[id] = now
+		}
+		if _, seen := r.firstAnnounce[id]; !seen {
+			r.firstAnnounce[id] = now
+		}
+	}
+	for _, id := range heard {
+		if _, seen := r.firstAnnounce[id]; !seen {
+			r.firstAnnounce[id] = now
+		}
 	}
 }
 
@@ -419,16 +631,37 @@ func (r *RecordingTracer) countControl(rpc *pubsub.RPC, outbound bool) {
 	add(&r.control.IwantIdsSent, &r.control.IwantIdsRecv, iwantIds)
 	add(&r.control.IdontwantSent, &r.control.IdontwantRecv, len(c.Idontwant))
 	add(&r.control.BytesSent, &r.control.BytesRecv, proto.Size(c))
+	if !outbound && r.firstAnnounce != nil {
+		now := time.Now()
+		note := func(ids []string) {
+			for _, id := range ids {
+				if _, seen := r.firstAnnounce[id]; !seen {
+					r.firstAnnounce[id] = now
+				}
+			}
+		}
+		for _, h := range c.Ihave {
+			note(h.MessageIDs)
+		}
+		for _, w := range c.Iwant {
+			note(w.MessageIDs)
+		}
+		for _, d := range c.Idontwant {
+			note(d.MessageIDs)
+		}
+	}
 	if outbound {
 		r.control.GraftSent += len(c.Graft)
 		r.control.PruneSent += len(c.Prune)
 	}
 }
 
-func (r *RecordingTracer) DuplicateMessage(*pubsub.Message) {
+func (r *RecordingTracer) DuplicateMessage(msg *pubsub.Message) {
+	now := time.Now()
 	r.Mu.Lock()
 	defer r.Mu.Unlock()
 	r.duplicates++
+	r.Dups = append(r.Dups, RecvEvent{At: now, From: msg.ReceivedFrom, What: DigestOf(msg.Data)})
 }
 
 func (r *RecordingTracer) RejectMessage(*pubsub.Message, string) {

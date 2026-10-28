@@ -67,7 +67,42 @@ func mergedControl(dst, src *RPC) *RPC {
 		out.Control.Prune = append(out.Control.Prune, c.GetPrune()...)
 		out.Control.Idontwant = append(out.Control.Idontwant, c.GetIdontwant()...)
 	}
+	out.Control.Idontwant = dedupeHave(out.Control.Idontwant)
 	return out
+}
+
+// dedupeHave keeps only the newest HAVE bitmap per group root across merged IDONTWANT lists:
+// a bitmap is idempotent state, so the older one says nothing the newer does not, and this is
+// where a HAVE saves bytes over N ids. Ordinary ids are kept in order. Nothing is mutated; the
+// lists come back untouched when no root repeats.
+func dedupeHave(lists []*pb.ControlIDontWant) []*pb.ControlIDontWant {
+	last := make(map[string]int)
+	n, dup := 0, false
+	for _, l := range lists {
+		for _, mid := range l.GetMessageIDs() {
+			if root, _, ok := decodeHave(mid); ok {
+				if _, seen := last[root]; seen {
+					dup = true
+				}
+				last[root] = n
+			}
+			n++
+		}
+	}
+	if !dup {
+		return lists
+	}
+	kept := make([]string, 0, n)
+	i := 0
+	for _, l := range lists {
+		for _, mid := range l.GetMessageIDs() {
+			if root, _, ok := decodeHave(mid); !ok || last[root] == i {
+				kept = append(kept, mid)
+			}
+			i++
+		}
+	}
+	return []*pb.ControlIDontWant{{MessageIDs: kept}}
 }
 
 // coalesceInto folds rpc into the newest queued control-only RPC on the same lane, if one is there

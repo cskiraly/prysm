@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Bounded deferred admission -- stage 5 of the gated-pull design.
+// Bounded deferred admission.
 //
 // The receiver gate governs what a node *asks for*. It cannot govern what arrives: a peer may push
 // an unsolicited segment on a subscribed topic, and the bytes and the initial parse happen whatever

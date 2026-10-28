@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// The receiver authority gate -- stage 2 of the gated-pull design.
+// The receiver authority gate.
 //
 // Any binding of the segment commitment to the bid makes segment authentication depend on holding
 // the block, so a receiver that does not yet have the block cannot verify what it is being offered.

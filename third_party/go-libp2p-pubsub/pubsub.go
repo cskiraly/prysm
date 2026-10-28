@@ -94,6 +94,15 @@ type PubSub struct {
 
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
+	// dispatchCredits, when set, bounds the peers a node feeds at once (WithDispatchCredits).
+	dispatchCredits *dispatchCredits
+	// hose, when set, is the node-wide window over frames in flight (WithHoseWindow).
+	hose *hoseWindow
+	// upload counts the bytes this node has written to its streams, by class (upload.go).
+	upload uploadCounter
+	// writersBlocked counts the writer goroutines inside a stream write: the hose estimate's
+	// sign that the transport, not the node, is the bottleneck.
+	writersBlocked atomic.Int64
 
 	// incoming messages from other peers
 	incoming chan incomingUnion
@@ -332,6 +341,12 @@ type RPC struct {
 	from peer.ID
 	// wire size, set by the router before the RPC enters an outbound queue (queue accounting)
 	size int
+	// urgent is the lane the router chose for an RPC it yields to a publish loop; the announce
+	// bitmap under WithHaveAnnounceUrgent (havebitmap.go). Not sent over the wire.
+	urgent bool
+	// solicited marks an IWANT answer: the peer asked for these frames after any bitmap it
+	// sent, so the dispatch-time cancel and projection leave them alone (havebitmap.go).
+	solicited bool
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -1139,6 +1154,8 @@ func (p *PubSub) handlePendingPeers() {
 		}
 
 		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+		rpcQueue.credits = p.dispatchCredits
+		rpcQueue.hose, rpcQueue.peer = p.hose, pid
 		p.peers[pid] = rpcQueue
 		go p.handleNewPeer(p.ctx, pid, rpcQueue)
 	}
@@ -1201,6 +1218,8 @@ func (p *PubSub) handleDeadPeers() {
 			// we respawn the writer as we need to ensure there is a stream active
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
 			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+			rpcQueue.credits = p.dispatchCredits
+			rpcQueue.hose, rpcQueue.peer = p.hose, pid
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
 		}
@@ -1777,7 +1796,10 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
 		if gs, ok := p.rt.(*GossipSubRouter); ok {
+			gs.underReportNote(src, id)
+			gs.discloseTraded(src, id)
 			gs.noteDuplicate(id, src)
+			gs.hoseAckDuplicate(id, src)
 		}
 		return false
 	}

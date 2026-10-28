@@ -63,9 +63,9 @@ type Config struct {
 	// 400 ms) was that this is a correctness knob, and under heterogeneous latency no single
 	// constant is correct for both an 8 ms neighbour and a 110 ms one.
 	AdaptiveRequestTimeout bool
-	// WithholdServes is the F1 failure injection: the node keeps announcing, receiving and
-	// pushing, but never answers a peer's wants. Test harness only; a production
-	// configuration must never set it.
+	// WithholdServes is the F1 failure injection: the
+	// node keeps announcing, receiving and pushing, but never answers a peer's wants. Test
+	// harness only; a production configuration must never set it.
 	WithholdServes bool
 	// CompressSegments snappy-compresses each segment inside the partial message, as the
 	// topic encoder does for an ordinary gossip message. The partial path never passes through
@@ -96,6 +96,15 @@ type Config struct {
 	// transmission time, on the same reasoning as RequestTimeout. Past it, everything missing is
 	// requested regardless, so a lost push cannot strand a segment.
 	PushGrace time.Duration
+	// PushWindow is how long after this node first holds a group it volunteers the group's
+	// segments unasked, under every policy. Past it the group is served on request only.
+	//
+	// The extension forgets a group's peer state after three idle heartbeats, and a pass that
+	// runs after that reads every peer as holding nothing: a late contact about an old group
+	// then pushes the whole group again, and so does each receiver whose state has also
+	// expired. A window no longer than that state lifetime means no push is decided blind.
+	// Defaults to defaultPushWindow.
+	PushWindow time.Duration
 	// RequestDefer is how long after first hearing of a *coded* group a node holds off
 	// issuing new requests, so pushes already in flight can count toward its K before it
 	// commits to asking. Zero -- the default -- requests immediately.
@@ -250,6 +259,9 @@ type Broadcaster struct {
 	// announceFlush marks groups with a held-back announce whose window flush is already
 	// armed, so a burst of deferrals arms one timer rather than one per suppressed send.
 	announceFlush map[groupKey]bool
+	// firstHeld is when this node first held each group, for PushWindow. Keyed by group alone,
+	// since a group is obtained once whatever topic carried it; pruned at GroupTTL.
+	firstHeld map[string]time.Time
 
 	// self is our own peer id, set by SetSelf once the host exists.
 	self peer.ID
@@ -298,7 +310,15 @@ type Counters struct {
 	GroupsCompleted    int
 	AuthThrottled      int
 	VerifyQueueDropped int
+	// PushesPastWindow counts push decisions withheld because the group was past PushWindow;
+	// each pass counts its own, so a segment withheld from one peer twice counts twice.
+	PushesPastWindow int
 }
+
+// defaultPushWindow is three 700 ms gossipsub heartbeats (beacon-chain/p2p's interval): the
+// least time the partial-messages extension keeps a group's peer state after a publish pass,
+// its minimum group TTL, which is what AppendPubSubOpts leaves it at.
+const defaultPushWindow = 3 * 700 * time.Millisecond
 
 // New builds a Broadcaster. It does not run until Start. A nil logger uses the package one.
 func New(ctx context.Context, logger *logrus.Logger, cfg Config) *Broadcaster {
@@ -307,6 +327,9 @@ func New(ctx context.Context, logger *logrus.Logger, cfg Config) *Broadcaster {
 	}
 	if cfg.PushGrace <= 0 {
 		cfg.PushGrace = 500 * time.Millisecond
+	}
+	if cfg.PushWindow <= 0 {
+		cfg.PushWindow = defaultPushWindow
 	}
 	if cfg.RequestTimeout <= 0 {
 		cfg.RequestTimeout = 300 * time.Millisecond
@@ -342,6 +365,7 @@ func New(ctx context.Context, logger *logrus.Logger, cfg Config) *Broadcaster {
 		announced:     make(map[groupKey]announcedShape),
 		rtt:           make(map[peer.ID]*rttEstimate),
 		announceFlush: make(map[groupKey]bool),
+		firstHeld:     make(map[string]time.Time),
 		wake:          make(chan struct{}, 1),
 	}
 }
@@ -415,8 +439,8 @@ func (b *Broadcaster) Counters() Counters {
 // ServeTopic marks a topic as one we exchange segments on.
 //
 // An RPC naming any other topic is refused outright. Without this the group-state surface is
-// keyed by a peer-controlled topic id, which is the known pre-admission problem; restricting it
-// to topics we actually joined is the cheap half of the fix.
+// keyed by a peer-controlled topic id, the pre-admission problem; restricting it to topics we
+// actually joined is the cheap half of the fix.
 func (b *Broadcaster) ServeTopic(topic string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

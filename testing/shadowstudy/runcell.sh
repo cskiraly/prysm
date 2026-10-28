@@ -29,20 +29,44 @@ export SHADOW=${SHADOW:-$HOME/.local/bin/shadow}
 
 arm=${1:?arm}; seed=${2:?seed}; tr=${3:-quic}; N=${4:-500}; pay=${5:-p1m}
 NET=${NET:-home}
+COND=${COND:-cold}
 source "$STUDY/arms.sh"
 
+# The transport condition (arms.sh's COND): a warm cell publishes at 150 s and warms its links from
+# 90 s before that (the harness's warm-up took ~30 s of simulated time at 50 nodes; 500 nodes x 70
+# peers x 320 KiB is 22 MB per node); a cwndN cell over TCP runs the Shadow build whose Reno starts
+# at SHADOW_TCP_INITCWND segments (the local patch; over QUIC the node applies the fork's knob).
+case $COND in
+  warm*) PUBLISH_DELAY=${PUBLISH_DELAY:-150}; GENFLAGS="${GENFLAGS:-} --warm-lead ${WARM_LEAD:-90}" ;;
+  cwnd*) export SHADOW_TCP_INITCWND=${COND#cwnd}; export SHADOW=${SHADOW_CWND:-$HOME/.local/bin/shadow-cwnd} ;;
+esac
 QDISC=${QDISC:-fifo}
 cell="${arm}_${seed}_${tr}_${pay}_n${N}"
 [ "$NET" = home ] || cell="${cell}_${NET}"
+[ "$COND" = cold ] || cell="${cell}_${COND}"
 [ -z "$EDGES" ] || cell="${cell}_${EDGES}"
 [ "$QDISC" = fifo ] || cell="${cell}_${QDISC}"
 mkdir -p "$OUT/$cell" "$RES" "$TOPO"
 topo="$TOPO/topo_${N}_${seed}_${LATENCY_MODEL:-geo}_d${DEGREE:-70}_${NET}${EDGES:+_$EDGES}.json"
 if [ ! -f "$topo" ]; then
-  env $COMMON SHADOW_EXPORT="$topo" ${EDGES:+SHADOW_EDGES=$EDGES} "$BIN" -test.run '^TestShadowExport$' -test.count=1 -test.v > "$OUT/$cell/export.log" 2>&1 || { echo "export failed, see $OUT/$cell/export.log"; exit 3; }
+  # Written beside and moved into place, so a cell that shares the topology and starts in the same
+  # second never reads a half-written file; the export is deterministic, so a double write is the same file.
+  env $COMMON SHADOW_EXPORT="$topo.$$" ${EDGES:+SHADOW_EDGES=$EDGES} "$BIN" -test.run '^TestShadowExport$' -test.count=1 -test.v > "$OUT/$cell/export.log" 2>&1 || { echo "export failed, see $OUT/$cell/export.log"; exit 3; }
+  mv -f "$topo.$$" "$topo"
 fi
 [ "$(python3 -c "import json; print(json.load(open('$topo'))['n'])")" = "$N" ] || { echo "topology $topo is not for $N nodes"; exit 3; }
-printf '%s\n' $COMMON $EXTRA SHADOW_VARIANT=$VARIANT > "$OUT/$cell/cell.env"
+# SEGMENT_DIFFUSION is not an arm knob, so arms.sh does not carry it: it asks each node for its
+# per-segment curves, which is a question about any arm rather than a different arm. It reaches
+# the nodes only if it is in the env file, since a Shadow process inherits nothing from here.
+# Knobs that are questions about a cell rather than a different arm, so arms.sh does not carry
+# them. A Shadow process inherits nothing from here, so they only reach the nodes through the env
+# file. SHADOW_UDP_SNDBUF/RCVBUF override what quic-go asks for and are the only way to vary the
+# socket buffer sizes, since quic-go's own request overwrites Shadow's configured defaults.
+passthrough=""
+for k in SEGMENT_DIFFUSION SHADOW_UDP_SNDBUF SHADOW_UDP_RCVBUF; do
+  [ -z "$(eval echo "\$$k")" ] || passthrough="$passthrough $k=$(eval echo "\$$k")"
+done
+printf '%s\n' $COMMON $EXTRA SHADOW_VARIANT=$VARIANT $passthrough > "$OUT/$cell/cell.env"
 gen() {
   python3 "$TOOLS/gen_shadow.py" --topology "$topo" --out "$OUT/$cell" --binary "$BIN" --transport "$tr" \
     --env-file "$OUT/$cell/cell.env" --seed "$seed" --publish-delay "${PUBLISH_DELAY:-60}" --hold "${HOLD:-8}" \
@@ -57,5 +81,5 @@ if [ $rc -eq 124 ]; then
 fi
 python3 "$TOOLS/extract.py" --data "$OUT/$cell/data" --n "$N" --arm "$arm" --seed "$seed" --transport "$tr" --pay "$pay" \
   --payload-bytes "$P" --deadline 3 --out "$RES/$cell.json" --shadow-rc "$rc" --stderr "$OUT/$cell/shadow.stderr" \
-  --label "$cell" --binary "$BIN" --shadow "$SHADOW" --extra "net=$NET" --extra "alias=$ALIAS" \
+  --label "$cell" --binary "$BIN" --shadow "$SHADOW" --extra "net=$NET" --extra "cond=$COND" --extra "alias=$ALIAS" \
   --commit "$(head -n 1 "$BIN.commit" 2>/dev/null || echo unknown)" | tee "$OUT/$cell/summary.txt"

@@ -186,6 +186,19 @@ type OutboundStat struct {
 	WriteBlocked    time.Duration
 	Writes          int64
 	MaxWrite        time.Duration
+	// Cancelled counts messages dropped at dispatch because the peer had announced them;
+	// Attached the RPCs that carried a pending HAVE bitmap (WithHaveDispatch).
+	Cancelled int64
+	Attached  int64
+	// Reordered counts pops that chose a rarer frame over the head (WithHaveRarestDispatch).
+	Reordered int64
+	// Projected counts frames dropped at dispatch because the peer was projected to complete
+	// its group without them (WithHaveDispatchProjection).
+	Projected int64
+	// CreditWait is the time the writer spent waiting for a dispatch slot, CreditAcquires the
+	// slots it took (WithDispatchCredits).
+	CreditWait     time.Duration
+	CreditAcquires int64
 }
 
 // OutboundStats snapshots every peer's outbound queue, on the router goroutine (the peer table

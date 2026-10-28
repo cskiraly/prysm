@@ -47,14 +47,23 @@ type pendingRPC struct {
 	rpc  *RPC
 }
 
-// RoundRobinMessageIDScheduler schedules outgoing RPCs in round-robin order of message IDs.
+// RoundRobinMessageIDScheduler schedules outgoing RPCs in round-robin order of message IDs:
+// each pass visits the messages in the order they were first added and yields one pending RPC
+// of each. The pass order used to be Go's map order, which re-randomises per pass, so the order
+// each peer received a batch in differed between two runs of one seed; with the per-message
+// peer order also pinned (rpcs, under a seeded source), the publisher's whole send order is now
+// a function of the seed (Q116, the repeat spread).
 type RoundRobinMessageIDScheduler struct {
-	rpcs map[string][]pendingRPC
+	rpcs  map[string][]pendingRPC
+	order []string
 }
 
 func (s *RoundRobinMessageIDScheduler) AddRPC(peer peer.ID, msgID string, rpc *RPC) {
 	if s.rpcs == nil {
 		s.rpcs = make(map[string][]pendingRPC)
+	}
+	if _, seen := s.rpcs[msgID]; !seen {
+		s.order = append(s.order, msgID)
 	}
 	s.rpcs[msgID] = append(s.rpcs[msgID], pendingRPC{peer: peer, rpc: rpc})
 }
@@ -62,7 +71,11 @@ func (s *RoundRobinMessageIDScheduler) AddRPC(peer peer.ID, msgID string, rpc *R
 func (s *RoundRobinMessageIDScheduler) All() iter.Seq2[peer.ID, *RPC] {
 	return func(yield func(peer.ID, *RPC) bool) {
 		for len(s.rpcs) > 0 {
-			for msgID, rpcs := range s.rpcs {
+			for _, msgID := range s.order {
+				rpcs, ok := s.rpcs[msgID]
+				if !ok {
+					continue
+				}
 				if len(rpcs) == 0 {
 					delete(s.rpcs, msgID)
 					continue

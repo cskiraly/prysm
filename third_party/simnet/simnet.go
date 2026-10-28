@@ -79,6 +79,17 @@ func (n *Simnet) init() {
 	}
 }
 
+// LinkStats returns every endpoint's queue counters in NewEndpoint order, which is node index
+// order for a network built by simlibp2p. Call it once the topology is up; it does not lock
+// against a concurrent NewEndpoint.
+func (n *Simnet) LinkStats() []LinkStats {
+	stats := make([]LinkStats, len(n.links))
+	for i, link := range n.links {
+		stats[i] = link.Stats()
+	}
+	return stats
+}
+
 func (n *Simnet) NewEndpoint(addr *net.UDPAddr, linkSettings NodeBiDiLinkSettings) *SimConn {
 	n.init()
 	c := NewBlockingSimConn(addr)

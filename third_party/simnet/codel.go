@@ -2,6 +2,7 @@ package simnet
 
 import (
 	"math"
+	"sync/atomic"
 	"time"
 )
 
@@ -12,6 +13,10 @@ type coDelQueue struct {
 
 	byteCount uint64
 	MTU       uint16
+
+	// stats belongs to the owning fqCoDel, which throws a flow's queue away once it drains
+	// and would take a per-queue counter with it.
+	stats *queueStats
 
 	// CoDel state
 	target   time.Duration // target queue delay (e.g., 5ms)
@@ -29,17 +34,47 @@ type packetWithTimestamp struct {
 	ts time.Time
 }
 
-func newCoDelQueue(target, interval time.Duration) coDelQueue {
+// QueueStats is a snapshot of what a queue admitted and what CoDel dropped. The enqueued
+// counts are the denominator; a drop count on its own is not a drop rate.
+type QueueStats struct {
+	PacketsEnqueued uint64
+	BytesEnqueued   uint64
+	PacketsDropped  uint64
+	BytesDropped    uint64
+}
+
+// queueStats is the live counter behind QueueStats. Only the link driver's goroutine writes it,
+// but a test reads it from its own, so the fields are atomic.
+type queueStats struct {
+	packetsEnqueued atomic.Uint64
+	bytesEnqueued   atomic.Uint64
+	packetsDropped  atomic.Uint64
+	bytesDropped    atomic.Uint64
+}
+
+func (s *queueStats) snapshot() QueueStats {
+	return QueueStats{
+		PacketsEnqueued: s.packetsEnqueued.Load(),
+		BytesEnqueued:   s.bytesEnqueued.Load(),
+		PacketsDropped:  s.packetsDropped.Load(),
+		BytesDropped:    s.bytesDropped.Load(),
+	}
+}
+
+func newCoDelQueue(target, interval time.Duration, stats *queueStats) coDelQueue {
 	return coDelQueue{
 		target:   target,
 		interval: interval,
 		q:        newRingBuffer[packetWithTimestamp](4),
+		stats:    stats,
 	}
 }
 
 // Enqueue adds a packet to the queue
 func (q *coDelQueue) Enqueue(p *Packet) {
 	q.byteCount += uint64(len(p.buf))
+	q.stats.packetsEnqueued.Add(1)
+	q.stats.bytesEnqueued.Add(uint64(len(p.buf)))
 	q.q.PushBack(packetWithTimestamp{p, time.Now()})
 }
 
@@ -99,8 +134,11 @@ func (q *coDelQueue) Dequeue() (*Packet, bool) {
 	return p.Packet, p.Packet != nil
 }
 
+// drop discards a packet CoDel decided against. Nothing else records it, so without this count
+// the only sign of a congested link is the traffic that never arrives.
 func (q *coDelQueue) drop(p packetWithTimestamp) {
-	// TODO add stats
+	q.stats.packetsDropped.Add(1)
+	q.stats.bytesDropped.Add(uint64(len(p.buf)))
 }
 
 func (q *coDelQueue) doDequeue(now time.Time) (p packetWithTimestamp, okToDrop bool) {

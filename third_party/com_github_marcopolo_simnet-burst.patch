@@ -1,6 +1,164 @@
+diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel.go fork_simnet/codel.go
+--- base_simnet/codel.go	2026-09-20 14:42:40.801569414 +0200
++++ fork_simnet/codel.go	2026-09-20 14:42:40.804169978 +0200
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"math"
++	"sync/atomic"
+ 	"time"
+ )
+ 
+@@ -13,6 +14,10 @@
+ 	byteCount uint64
+ 	MTU       uint16
+ 
++	// stats belongs to the owning fqCoDel, which throws a flow's queue away once it drains
++	// and would take a per-queue counter with it.
++	stats *queueStats
++
+ 	// CoDel state
+ 	target   time.Duration // target queue delay (e.g., 5ms)
+ 	interval time.Duration // interval for sustained bad queue (e.g., 100ms)
+@@ -29,17 +34,47 @@
+ 	ts time.Time
+ }
+ 
+-func newCoDelQueue(target, interval time.Duration) coDelQueue {
++// QueueStats is a snapshot of what a queue admitted and what CoDel dropped. The enqueued
++// counts are the denominator; a drop count on its own is not a drop rate.
++type QueueStats struct {
++	PacketsEnqueued uint64
++	BytesEnqueued   uint64
++	PacketsDropped  uint64
++	BytesDropped    uint64
++}
++
++// queueStats is the live counter behind QueueStats. Only the link driver's goroutine writes it,
++// but a test reads it from its own, so the fields are atomic.
++type queueStats struct {
++	packetsEnqueued atomic.Uint64
++	bytesEnqueued   atomic.Uint64
++	packetsDropped  atomic.Uint64
++	bytesDropped    atomic.Uint64
++}
++
++func (s *queueStats) snapshot() QueueStats {
++	return QueueStats{
++		PacketsEnqueued: s.packetsEnqueued.Load(),
++		BytesEnqueued:   s.bytesEnqueued.Load(),
++		PacketsDropped:  s.packetsDropped.Load(),
++		BytesDropped:    s.bytesDropped.Load(),
++	}
++}
++
++func newCoDelQueue(target, interval time.Duration, stats *queueStats) coDelQueue {
+ 	return coDelQueue{
+ 		target:   target,
+ 		interval: interval,
+ 		q:        newRingBuffer[packetWithTimestamp](4),
++		stats:    stats,
+ 	}
+ }
+ 
+ // Enqueue adds a packet to the queue
+ func (q *coDelQueue) Enqueue(p *Packet) {
+ 	q.byteCount += uint64(len(p.buf))
++	q.stats.packetsEnqueued.Add(1)
++	q.stats.bytesEnqueued.Add(uint64(len(p.buf)))
+ 	q.q.PushBack(packetWithTimestamp{p, time.Now()})
+ }
+ 
+@@ -99,8 +134,11 @@
+ 	return p.Packet, p.Packet != nil
+ }
+ 
++// drop discards a packet CoDel decided against. Nothing else records it, so without this count
++// the only sign of a congested link is the traffic that never arrives.
+ func (q *coDelQueue) drop(p packetWithTimestamp) {
+-	// TODO add stats
++	q.stats.packetsDropped.Add(1)
++	q.stats.bytesDropped.Add(uint64(len(p.buf)))
+ }
+ 
+ func (q *coDelQueue) doDequeue(now time.Time) (p packetWithTimestamp, okToDrop bool) {
+diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel_test.go fork_simnet/codel_test.go
+--- base_simnet/codel_test.go	2026-09-20 14:42:40.801569414 +0200
++++ fork_simnet/codel_test.go	2026-09-20 14:42:40.804169978 +0200
+@@ -14,7 +14,7 @@
+ 			target   = 5 * time.Millisecond
+ 			interval = 100 * time.Millisecond
+ 		)
+-		q := newCoDelQueue(target, interval)
++		q := newCoDelQueue(target, interval, &queueStats{})
+ 		q.MTU = 1
+ 
+ 		// Build a queue that stays full for more than one interval.
+@@ -58,7 +58,7 @@
+ 			target   = 5 * time.Millisecond
+ 			interval = 100 * time.Millisecond
+ 		)
+-		q := newCoDelQueue(target, interval)
++		q := newCoDelQueue(target, interval, &queueStats{})
+ 		q.MTU = 1
+ 
+ 		for i := range 2 {
+@@ -101,7 +101,7 @@
+ 		packets[i] = &Packet{buf: data}
+ 	}
+ 
+-	q := newCoDelQueue(5*time.Millisecond, 100*time.Millisecond)
++	q := newCoDelQueue(5*time.Millisecond, 100*time.Millisecond, &queueStats{})
+ 	for _, p := range packets {
+ 		q.Enqueue(p)
+ 	}
+diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/fq_codel.go fork_simnet/fq_codel.go
+--- base_simnet/fq_codel.go	2026-09-20 14:42:40.801569414 +0200
++++ fork_simnet/fq_codel.go	2026-09-20 14:42:40.804169978 +0200
+@@ -25,6 +25,10 @@
+ 
+ 	hash maphash.Hash
+ 
++	// stats is kept here, not per flow, because a flow's queue is discarded the moment it
++	// drains. It counts CoDel's sojourn-time drops; there is no tail drop to count.
++	stats *queueStats
++
+ 	// Note: No packet limit is implemented in this fqCoDel implementation. This
+ 	// is not for production use.
+ }
+@@ -37,19 +41,28 @@
+ 		quantum:  quantum,
+ 		target:   target,
+ 		interval: interval,
++		stats:    &queueStats{},
+ 	}
+ }
+ 
++// Stats reports what this queue admitted and what CoDel dropped.
++func (q *fqCoDel) Stats() QueueStats {
++	return q.stats.snapshot()
++}
++
+ func (q *fqCoDel) Enqueue(p *Packet) {
+ 	bucket := int(p.Hash(&q.hash) % uint64(len(q.flows)))
+ 
+ 	fq := q.flows[bucket]
+ 	if fq == nil {
+ 		fq = &coDelQueueWithCredits{
+-			coDelQueue: newCoDelQueue(q.target, q.interval),
++			coDelQueue: newCoDelQueue(q.target, q.interval, q.stats),
+ 			credits:    q.quantum,
+ 			bucket:     bucket,
+ 		}
++		// RFC 8289's second AQM, the backlog term of dodequeue, needs the interface MTU; the
++		// quantum is that MTU. Left at zero the term compares against nothing and never fires.
++		fq.MTU = uint16(q.quantum) // lint:ignore uintcast -- an MTU, 1500 by default.
+ 		q.flows[bucket] = fq
+ 		q.newFlows.append(&listNode[*coDelQueueWithCredits]{v: fq})
+ 	}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_simnet/ratelink.go
---- base_simnet/ratelink.go	2026-08-30 20:53:15.249404082 +0200
-+++ fork_simnet/ratelink.go	2026-08-30 20:53:15.252826658 +0200
+--- base_simnet/ratelink.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/ratelink.go	2026-09-20 14:42:40.804169978 +0200
 @@ -14,16 +14,30 @@
  
  // Creates a new RateLimiter with the following parameters:
@@ -37,8 +195,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_sim
  	}
  }
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go fork_simnet/ratelink_test.go
---- base_simnet/ratelink_test.go	2026-08-30 20:53:15.249404082 +0200
-+++ fork_simnet/ratelink_test.go	2026-08-30 20:53:15.252826658 +0200
+--- base_simnet/ratelink_test.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/ratelink_test.go	2026-09-20 14:42:40.804169978 +0200
 @@ -26,7 +26,7 @@
  		)
  
@@ -49,8 +207,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go for
  		chunk := make([]byte, mtu)
  
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork_simnet/simconn_test.go
---- base_simnet/simconn_test.go	2026-08-30 20:53:15.249404082 +0200
-+++ fork_simnet/simconn_test.go	2026-08-30 20:53:15.252826658 +0200
+--- base_simnet/simconn_test.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/simconn_test.go	2026-09-20 14:42:40.804169978 +0200
 @@ -214,6 +214,7 @@
  		DefaultFlowBucketCount,
  		1500,
@@ -60,9 +218,18 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork
  		closeSignal,
  	)
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simnet/simlink.go
---- base_simnet/simlink.go	2026-08-30 20:53:15.249404082 +0200
-+++ fork_simnet/simlink.go	2026-08-30 20:53:15.252826658 +0200
-@@ -17,6 +17,13 @@
+--- base_simnet/simlink.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/simlink.go	2026-09-20 14:42:40.804169978 +0200
+@@ -1,6 +1,8 @@
+ package simnet
+ 
+ import (
++	"os"
++	"strconv"
+ 	"sync"
+ 	"time"
+ )
+@@ -17,6 +19,13 @@
  	// MTU (Maximum Transmission Unit) specifies the maximum packet size in bytes
  	MTU int
  
@@ -76,7 +243,29 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  	// FlowBucketCount sets the number of flow buckets for FQ-CoDel. If zero
  	// defaults to DefaultFlowBucketCount
  	FlowBucketCount int
-@@ -61,6 +68,7 @@
+@@ -35,11 +44,16 @@
+ 	upPacketReceiver PacketReceiver,
+ 	downPacketReceiver PacketReceiver,
+ ) *Simlink {
+-	const (
+-		target     = 5 * time.Millisecond
+-		interval   = 100 * time.Millisecond
+-		defaultMTU = 1500
+-	)
++	const defaultMTU = 1500
++	// CoDel's target and interval, Linux's defaults, overridable through SIMNET_CODEL_TARGET_MS
++	// and SIMNET_CODEL_INTERVAL_MS (local change; upstream has them as constants).
++	//
++	// They are a knob because active queue management is one of the few things that genuinely
++	// differs between this simulator and Shadow, which has none: setting the target far above
++	// any sojourn a run reaches leaves CoDel installed but never dropping, which is Shadow's
++	// behaviour, and makes the difference measurable rather than argued. Unset, nothing changes.
++	target := envDuration("SIMNET_CODEL_TARGET_MS", 5*time.Millisecond)
++	interval := envDuration("SIMNET_CODEL_INTERVAL_MS", 100*time.Millisecond)
+ 
+ 	if linkSettings.Uplink.MTU == 0 {
+ 		linkSettings.Uplink.MTU = defaultMTU
+@@ -61,6 +75,7 @@
  			linkSettings.Uplink.MTU,
  			linkSettings.Uplink.FlowBucketCount,
  			linkSettings.Uplink.MTU, linkSettings.Uplink.BitsPerSecond,
@@ -84,7 +273,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  			upPacketReceiver,
  			closeSignal,
  		),
-@@ -69,6 +77,7 @@
+@@ -69,6 +84,7 @@
  			linkSettings.Downlink.MTU,
  			linkSettings.Downlink.FlowBucketCount,
  			linkSettings.Downlink.MTU, linkSettings.Downlink.BitsPerSecond,
@@ -92,7 +281,25 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  			downPacketReceiver,
  			closeSignal,
  		),
-@@ -93,13 +102,14 @@
+@@ -80,6 +96,17 @@
+ 	l.down.Start(wg)
+ }
+ 
++// LinkStats reports each direction's queue separately, since an asymmetric link congests in
++// one of them long before the other.
++type LinkStats struct {
++	Uplink   QueueStats
++	Downlink QueueStats
++}
++
++func (l *Simlink) Stats() LinkStats {
++	return LinkStats{Uplink: l.up.q.Stats(), Downlink: l.down.q.Stats()}
++}
++
+ type linkDriver struct {
+ 	newPacket     chan *Packet
+ 	q             fqCoDel
+@@ -93,13 +120,14 @@
  	quantum int,
  	flowCount int,
  	mtu int, bandwidth int,
@@ -108,9 +315,22 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  	}
  }
  
+@@ -156,3 +184,12 @@
+ 		}
+ 	})
+ }
++
++// envDuration reads a millisecond count from the environment, falling back when unset or unusable.
++func envDuration(name string, fallback time.Duration) time.Duration {
++	v, err := strconv.ParseFloat(os.Getenv(name), 64)
++	if err != nil || v <= 0 {
++		return fallback
++	}
++	return time.Duration(v * float64(time.Millisecond))
++}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork_simnet/simlink_test.go
---- base_simnet/simlink_test.go	2026-08-30 20:53:15.249404082 +0200
-+++ fork_simnet/simlink_test.go	2026-08-30 20:53:15.252826658 +0200
+--- base_simnet/simlink_test.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/simlink_test.go	2026-09-20 14:42:40.804169978 +0200
 @@ -46,6 +46,7 @@
  			128,
  			mtu,
@@ -119,3 +339,24 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork
  			&tr,
  			closeSignal,
  		)
+diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simnet.go fork_simnet/simnet.go
+--- base_simnet/simnet.go	2026-09-20 14:42:40.801940821 +0200
++++ fork_simnet/simnet.go	2026-09-20 14:42:40.804169978 +0200
+@@ -79,6 +79,17 @@
+ 	}
+ }
+ 
++// LinkStats returns every endpoint's queue counters in NewEndpoint order, which is node index
++// order for a network built by simlibp2p. Call it once the topology is up; it does not lock
++// against a concurrent NewEndpoint.
++func (n *Simnet) LinkStats() []LinkStats {
++	stats := make([]LinkStats, len(n.links))
++	for i, link := range n.links {
++		stats[i] = link.Stats()
++	}
++	return stats
++}
++
+ func (n *Simnet) NewEndpoint(addr *net.UDPAddr, linkSettings NodeBiDiLinkSettings) *SimConn {
+ 	n.init()
+ 	c := NewBlockingSimConn(addr)

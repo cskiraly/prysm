@@ -25,6 +25,10 @@ type fqCoDel struct {
 
 	hash maphash.Hash
 
+	// stats is kept here, not per flow, because a flow's queue is discarded the moment it
+	// drains. It counts CoDel's sojourn-time drops; there is no tail drop to count.
+	stats *queueStats
+
 	// Note: No packet limit is implemented in this fqCoDel implementation. This
 	// is not for production use.
 }
@@ -37,7 +41,13 @@ func newFqCoDel(target, interval time.Duration, quantum, flowCount int) fqCoDel 
 		quantum:  quantum,
 		target:   target,
 		interval: interval,
+		stats:    &queueStats{},
 	}
+}
+
+// Stats reports what this queue admitted and what CoDel dropped.
+func (q *fqCoDel) Stats() QueueStats {
+	return q.stats.snapshot()
 }
 
 func (q *fqCoDel) Enqueue(p *Packet) {
@@ -46,10 +56,13 @@ func (q *fqCoDel) Enqueue(p *Packet) {
 	fq := q.flows[bucket]
 	if fq == nil {
 		fq = &coDelQueueWithCredits{
-			coDelQueue: newCoDelQueue(q.target, q.interval),
+			coDelQueue: newCoDelQueue(q.target, q.interval, q.stats),
 			credits:    q.quantum,
 			bucket:     bucket,
 		}
+		// RFC 8289's second AQM, the backlog term of dodequeue, needs the interface MTU; the
+		// quantum is that MTU. Left at zero the term compares against nothing and never fires.
+		fq.MTU = uint16(q.quantum) // lint:ignore uintcast -- an MTU, 1500 by default.
 		q.flows[bucket] = fq
 		q.newFlows.append(&listNode[*coDelQueueWithCredits]{v: fq})
 	}

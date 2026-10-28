@@ -1,6 +1,6 @@
 package segmentintegrationtest
 
-// Structured segment message ids -- stage 1 of the gated-pull design.
+// Structured segment message ids.
 //
 // Today's ids are content hashes, so an announcement does not say which block would authorize
 // the message it advertises. That is what stops a receiver from declining to request what it
@@ -23,8 +23,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
@@ -259,7 +261,103 @@ func structuredIDOpts() []pubsub.Option {
 		return nil
 	}
 	var genesisValidatorsRoot [32]byte
-	return []pubsub.Option{pubsub.WithMessageIdFn(msgIDFn(genesisValidatorsRoot[:]))}
+	opts := []pubsub.Option{pubsub.WithMessageIdFn(msgIDFn(genesisValidatorsRoot[:]))}
+	// SEGMENT_HAVE_BITMAP=1: one HAVE bitmap per group in place of one IDONTWANT per segment
+	// (scheduled-diffusion-plan.md §7c, D1). The group root keys the bitmap, the index is its bit.
+	// SEGMENT_HAVE_BITMAP=1|idontwant (D1: the IDONTWANT bitmap), ihave (D1b: the IHAVE bitmap,
+	// IDONTWANT kept per id) or both. Each bitmap inherits its message's semantics and lane.
+	if mode := os.Getenv("SEGMENT_HAVE_BITMAP"); mode != "" {
+		opts = append(opts, pubsub.WithHaveBitmaps(haveIndexOf))
+		switch mode {
+		case "1", "idontwant":
+		case "ihave":
+			opts = append(opts, pubsub.WithHaveAnnounceBitmaps(), pubsub.WithHaveIDontWantPerID())
+		case "both":
+			opts = append(opts, pubsub.WithHaveAnnounceBitmaps())
+		default:
+			panic("bad SEGMENT_HAVE_BITMAP " + mode + " (want 1, idontwant, ihave or both)")
+		}
+		// SEGMENT_ORIGIN_HAVE=1: the publisher sends its HAVE for each group it batch-publishes, as a receiver's goes.
+		if os.Getenv("SEGMENT_ORIGIN_HAVE") != "" {
+			opts = append(opts, pubsub.WithOriginHave())
+		}
+		// SEGMENT_SRC_HAVE: what the publisher's HAVE says of its own group instead of every frame at publish (privacy card P4):
+		// paced grows it as its writers pop the frames; none sends none; sent tells each peer the frames sent it;
+		// dilute:<ms> is paced, cut per peer to a relay's curve by the Q6 cell (SEGMENT_SRC_HAVE there).
+		switch v := os.Getenv("SEGMENT_SRC_HAVE"); {
+		case v == "":
+		case v == "paced" || strings.HasPrefix(v, "dilute:"):
+			opts = append(opts, pubsub.WithOriginHavePaced())
+		case v == "none":
+			opts = append(opts, pubsub.WithOriginHaveMode(pubsub.OriginHaveNone))
+		case v == "sent":
+			opts = append(opts, pubsub.WithOriginHaveMode(pubsub.OriginHaveSent))
+		default:
+			panic("bad SEGMENT_SRC_HAVE " + v + " (want paced, none, sent or dilute:<ms>)")
+		}
+		// SEGMENT_DECODE_CLEARS_PROMISES=1: the decode claim fulfils the group's gossip-tracer promises (implies SEGMENT_PROMISE_COUNT).
+		if os.Getenv("SEGMENT_DECODE_CLEARS_PROMISES") != "" {
+			opts = append(opts, pubsub.WithDecodeClearsPromises())
+		}
+		// D1c: SEGMENT_HAVE_FAST_IHAVE=1 puts the announce bitmap in the urgent lane carrying the
+		// announcer's queued bytes to the peer; SEGMENT_HAVE_ASK_DELAY_MBPS makes the asker hold
+		// a loaded announce for the time that load takes at this rate (cap
+		// SEGMENT_HAVE_ASK_DELAY_CAP_MS, default 500). Unset: IHAVE in the normal lane.
+		if mode == "ihave" || mode == "both" {
+			if os.Getenv("SEGMENT_HAVE_FAST_IHAVE") != "" {
+				opts = append(opts, pubsub.WithHaveAnnounceUrgent(true))
+			}
+			if v := os.Getenv("SEGMENT_HAVE_ASK_DELAY_MBPS"); v != "" {
+				mbps, err := strconv.Atoi(v)
+				if err != nil || mbps <= 0 {
+					panic("bad SEGMENT_HAVE_ASK_DELAY_MBPS " + v)
+				}
+				capMs := 500
+				if c := os.Getenv("SEGMENT_HAVE_ASK_DELAY_CAP_MS"); c != "" {
+					if capMs, err = strconv.Atoi(c); err != nil || capMs <= 0 {
+						panic("bad SEGMENT_HAVE_ASK_DELAY_CAP_MS " + c)
+					}
+				}
+				opts = append(opts, pubsub.WithHaveAskDelay(int64(mbps)*1_000_000, time.Duration(capMs)*time.Millisecond))
+			}
+		}
+		// SEGMENT_DISPATCH_CREDITS=<A>[,sticky]: a node feeds at most A peers at a time; a slot is
+		// kept while the peer's queue has data (sticky) or rotates to the longest waiter (§7c D5).
+		if v := os.Getenv("SEGMENT_DISPATCH_CREDITS"); v != "" {
+			a, sticky := strings.CutSuffix(v, ",sticky")
+			n, err := strconv.Atoi(a)
+			if err != nil || n < 1 {
+				panic("bad SEGMENT_DISPATCH_CREDITS " + v + " (want <A>[,sticky], A >= 1)")
+			}
+			opts = append(opts, pubsub.WithDispatchCredits(n, sticky))
+		}
+		// SEGMENT_HAVE_DISPATCH=cancel|attach|both: the writer drops a queued frame the peer has
+		// since announced, and/or carries a pending HAVE on the next RPC out (§7c, D2).
+		if v := os.Getenv("SEGMENT_HAVE_DISPATCH"); v != "" {
+			cancel, attach := v == "cancel" || v == "both", v == "attach" || v == "both"
+			if !cancel && !attach {
+				panic("bad SEGMENT_HAVE_DISPATCH " + v + " (want cancel, attach or both)")
+			}
+			opts = append(opts, pubsub.WithHaveDispatch(cancel, attach))
+			// The dispatch ledger (pop and HAVE times per peer and frame) rides along: the horizon
+			// classes each duplicate by whether its sender could have cancelled it (§7c, after Q116).
+			opts = append(opts, pubsub.WithHaveLedger())
+			// SEGMENT_HAVE_RAREST=1: the writer pops the rarest queued frame first (§7c D3).
+			if os.Getenv("SEGMENT_HAVE_RAREST") != "" {
+				opts = append(opts, pubsub.WithHaveRarestDispatch())
+			}
+		}
+	}
+	return opts
+}
+
+// haveIndexOf is the HAVE bitmap's view of a structured id: the group root and the index.
+func haveIndexOf(mid string) (string, uint32, bool) {
+	k, ok := segIDKey(mid)
+	if !ok {
+		return "", 0, false
+	}
+	return string(k.group[:]), k.index, true
 }
 
 func TestSegmentIDPrefixRoundTrip(t *testing.T) {

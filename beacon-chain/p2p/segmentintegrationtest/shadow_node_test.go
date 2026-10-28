@@ -17,6 +17,7 @@ package segmentintegrationtest
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	"github.com/cskiraly/eth-networking-lab/shadowsim"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -69,13 +71,14 @@ func shadowEdges(t *testing.T, n int) []edge {
 }
 
 // shadowRefuse fails on the driver features a one-process node cannot honour, rather than
-// running a cell that silently differs from its in-process twin: the transport warm-ups (simnet's
-// congestion window is not quic-go's over a real socket), the warm-up arm and the background load
-// (both need the driver's drain between nodes), the last-piece screen's placed holders (other
-// nodes publish) and the authority gates (armed by the driver at the publish instant).
+// running a cell that silently differs from its in-process twin: the warm-up arm and the
+// background load (both need the driver's drain between nodes), the last-piece screen's placed
+// holders (other nodes publish) and the authority gates (armed by the driver at the publish
+// instant). The link-level warm-up (SEGMENT_WARMUP_BYTES, at the schedule's warm instant) and
+// the initial-window knob (SEGMENT_INITIAL_CWND_PACKETS, the quic-go fork) are honoured.
 func shadowRefuse(t *testing.T, n int, seed uint64) {
 	t.Helper()
-	for _, k := range []string{"SEGMENT_INITIAL_CWND_PACKETS", "SEGMENT_WARMUP_BYTES", "SEGMENT_WARMUP", "SEGMENT_BG_INTERVAL_MS"} {
+	for _, k := range []string{"SEGMENT_WARMUP", "SEGMENT_BG_INTERVAL_MS"} {
 		if os.Getenv(k) != "" {
 			t.Fatalf("%s is not supported under Shadow", k)
 		}
@@ -191,7 +194,7 @@ func shadowCellFromEnv(t *testing.T, n, idx int) shadowCell {
 		v := cell.variant(t, n, cell.policies[0], cell.replications[0], cell.parities[0])
 		// This node's broadcaster only, in the slot pubsubOpts reads; the other slots stay empty.
 		v.nodes = make([]*variantBNode, n)
-		v.nodes[idx] = newVariantBNode(bLogger(), v.policy, v.replication, v.pushDivisor, failWithholdSet(t, n)[idx], v.groups)
+		v.nodes[idx] = newVariantBNode(bLogger(), v.policy, v.replication, v.pushDivisor, failWithholdSet(t, n)[idx])
 		// The wire form for the record: the first group's segments as gossip would carry them
 		// is not what B puts on the wire (partial messages), so only the counts are meaningful.
 		arm := wireArm{name: fmt.Sprintf("variantB/%s/K=%d/%d", v.policy.String(), v.msgs[0].Descriptor.Required(), len(v.msgs)),
@@ -212,7 +215,7 @@ func shadowCellFromEnv(t *testing.T, n, idx int) shadowCell {
 						}
 						go func() {
 							select {
-							case <-node.done:
+							case <-node.completed():
 								onDone()
 							case <-ctx.Done():
 							}
@@ -275,10 +278,27 @@ func TestShadowNode(t *testing.T) {
 
 	priv, err := shadowsim.Identity(seed, e.Index)
 	require.NoError(t, err)
+	// quic-go's default initial window is process-global and read when connections are made, so
+	// the knob (the fork's; loud without it) is applied before the host exists, as the driver does.
+	applyInitialCWND(t)
 	h, err := shadowsim.NewHost(priv, e.Transport, e.IP(e.Index), e.Port)
 	require.NoError(t, err)
 	defer h.Close()
+	warmBytes := warmupBytes(t)
+	if warmBytes > 0 {
+		// Every node reads and discards what its peers push at the warm instant.
+		h.SetStreamHandler(warmupProtocol, func(s network.Stream) {
+			_, _ = io.Copy(io.Discard, s)
+			_ = s.Close()
+		})
+	}
 	tracer := newRecordingTracer()
+	if diffusionCurves() {
+		tracer.TrackAnnounce()
+		if pd, ok := sc.v.(partialDiffusion); ok {
+			tracer.TrackPartialSegments(pd.partialObserve())
+		}
+	}
 
 	// The option order is the harness's (gossipsim.New, then the driver): signing off, the
 	// production configuration, the study's substrate options, then this node's own -- the
@@ -331,6 +351,47 @@ func TestShadowNode(t *testing.T) {
 		completed.Store(true)
 	})
 
+	// The link-level warm-up, the harness's (transportwarmup_test.go): at the warm instant every
+	// node pushes the bytes down each of its connections, one peer at a time in a per-node
+	// rotation, then idles until the publish so the links drain. Neither stack shrinks its
+	// window over the idle gap (quic-go by design; Shadow's Reno only on a timeout). The
+	// self-check goes into the record's extras: links warmed, elapsed, the second-half rate, and
+	// whether the warm-up ran into the drain before the publish.
+	var warmExtra map[string]int64
+	if warmBytes > 0 {
+		if e.WarmAt.IsZero() {
+			t.Fatal("SEGMENT_WARMUP_BYTES needs SHADOW_WARM_AT (the generator's --warm-lead)")
+		}
+		shadowsim.SleepUntil(e.WarmAt)
+		buf := make([]byte, warmupChunk)
+		for i := range buf {
+			buf[i] = byte(i * 31)
+		}
+		ws := warmupStats{bytes: warmBytes}
+		w0 := time.Now()
+		peers := h.Network().Peers()
+		for k := range peers {
+			p := peers[(k+e.Index)%len(peers)]
+			first, second, ok := warmOnePeer(ctx, h, p, buf, warmBytes)
+			if !ok {
+				continue
+			}
+			ws.links++
+			ws.firstHalf += first
+			ws.secondHalf += second
+		}
+		ws.elapsed = time.Since(w0)
+		overrun := time.Now().Add(warmupDrain).After(e.PublishAt)
+		note := ""
+		if overrun {
+			note = " (OVERRUN: not drained before the publish)"
+		}
+		t.Logf("node %d: transport warm-up %d links x %dKiB, first half %.1f Mbps, second half %.1f Mbps, %v%s",
+			e.Index, ws.links, warmBytes>>10, ws.firstHalfRate()/1e6, ws.secondHalfRate()/1e6, ws.elapsed, note)
+		warmExtra = map[string]int64{"warm_links": int64(ws.links), "warm_ms": ws.elapsed.Milliseconds(),
+			"warm_bps2": int64(ws.secondHalfRate()), "warm_overrun": map[bool]int64{true: 1}[overrun]}
+	}
+
 	shadowsim.SleepUntil(e.PublishAt)
 	meshAtPublish := tracer.MeshPeers()
 	peersAtPublish := len(h.Network().Peers())
@@ -356,7 +417,13 @@ func TestShadowNode(t *testing.T) {
 	// not see; the byte totals include them so rx/node and the publisher's bytes mean the same
 	// on every variant, and the split is kept in the extras.
 	prx, ptx, _, _ := tracer.PartialCounts()
-	rx, tx = rx+prx, tx+ptx
+	// Payload and bitmap signalling both go into the wire total -- every byte crossed the
+	// link -- but they are carried out separately in the extras, because the copies figure is
+	// payload and the signalling is this variant's control cost. Summed into one counter they
+	// put variant B on a different basis from variant A, whose control bytes have always been
+	// reported apart from its copies.
+	mrx, mtx, _, _ := tracer.PartialMetaCounts()
+	rx, tx = rx+prx+mrx, tx+ptx+mtx
 	c := tracer.ControlSeen()
 	dropped, undeliverable := tracer.Losses()
 	var wire wireForm
@@ -378,14 +445,32 @@ func TestShadowNode(t *testing.T) {
 		Snapshots: snaps,
 	}
 	st.Declined = sc.declined(e.Index)
+	if diffusionCurves() {
+		// The key list, not the arm's message ids, is what makes this basis-agnostic: a
+		// partial-path variant has no gossip message ids, and a curve keyed on them is empty.
+		keys := segmentIDs(sc.arm)
+		if pd, ok := sc.v.(partialDiffusion); ok {
+			keys = pd.segKeys()
+		}
+		st.FirstGotS, st.FirstHeardS = segmentDiffusion(tracer, sc.arm, keys, e.PublishAt)
+	}
 	if run.extra != nil {
 		st.Extra = run.extra()
 	}
-	if prx+ptx > 0 {
+	if prx+ptx+mrx+mtx > 0 {
 		if st.Extra == nil {
 			st.Extra = map[string]int64{}
 		}
 		st.Extra["partial_rx"], st.Extra["partial_tx"] = int64(prx), int64(ptx)
+		st.Extra["partial_meta_rx"], st.Extra["partial_meta_tx"] = int64(mrx), int64(mtx)
+	}
+	if warmExtra != nil {
+		if st.Extra == nil {
+			st.Extra = map[string]int64{}
+		}
+		for k, v := range warmExtra {
+			st.Extra[k] = v
+		}
 	}
 	require.NoError(t, st.Write(os.Stdout))
 }

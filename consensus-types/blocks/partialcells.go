@@ -49,8 +49,7 @@ type partialParts interface {
 	// defersAnnouncements says whether news that is not on the recipient's critical path -- a
 	// request *removal*, and availability growth -- may wait for a packet going there anyway
 	// rather than buying its own. True on the row axis; false on the column axis, which keeps the
-	// shipped announce-everything-now behaviour until it gets the mechanism in a commit of its
-	// own.
+	// shipped announce-everything-now behaviour until it gets the mechanism in a commit of its own.
 	defersAnnouncements() bool
 	// availabilityIsUrgent says the current availability must not be held: it is news other
 	// nodes act on at once. A complete row is the case -- its announcement is the cancellation
@@ -83,8 +82,8 @@ func availabilityMaxDelay() time.Duration { return RequestAvailabilityMaxDelay }
 // RequestN: at N=1 the peer being told is the one already sending, so the cancellation is worth
 // little and can wait; at N>1 the other claim-holders are worth telling, because their
 // transmission may not have been dispatched. The packet arithmetic: 42 B of metadata against a
-// 2 KB cell means a piggybacked cancellation costs nothing and a dedicated one pays only if the
-// peer probably has not dispatched.
+// 2 KB cell means a piggybacked cancellation costs nothing and a
+// dedicated one pays only if the peer probably has not dispatched.
 //
 // A var so R3 can sweep it; 500 ms is a starting point, not a measurement.
 var RequestCancellationMaxDelay = 500 * time.Millisecond

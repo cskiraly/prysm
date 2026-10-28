@@ -65,10 +65,9 @@ and logs go to `testing/results/` (`RES`), Shadow's working directories to `test
 ./runcell.sh line 1 quic 2
 # a published cell, on each substrate
 ./cell.sh shadow wholend 7 quic 500 p1m
-./cell.sh shadow aadaptcf_16k 7 tcp 500 p1m
-./cell.sh harness atuned_32k 7 quic 500 p1m
+./cell.sh shadow aadaptcf 7 tcp 500 p1m
+./cell.sh harness atuned 7 quic 500 p1m
 ```
 
-Determinism: identical inputs and seeds do not guarantee identical results, even within a
-session (the lab's tools README has the measurements). Treat each run as one sample and compare
-medians over paired seeds.
+Determinism: the same cell twice in one session gives byte-identical records; across sessions
+the run re-samples (the lab's tools README says why). Compare medians over paired seeds.

@@ -20,6 +20,9 @@ import (
 // calibrated so the pair mean lands near the ~62 ms RIPE-Atlas mean the PPPT study used.
 var geoRegionWeights = []int{35, 20, 10, 25, 10} // eu, na-east, na-west, asia, rest
 
+// GeoRegionNames names the regions GeoRegions returns, in geoRegionWeights order.
+var GeoRegionNames = []string{"eu", "na-east", "na-west", "asia", "rest"}
+
 var geoBaseOneWayMs = [5][5]int{
 	{8, 40, 70, 90, 110},
 	{40, 8, 30, 80, 60},
@@ -46,13 +49,8 @@ func GeoLatency(t *testing.T, seed uint64, n int) (simlibp2p.LatencyFunc, string
 	return fn, summary
 }
 
-// GeoLatencyPair is GeoLatency plus the raw per-pair function.
-//
-// The two-publisher driver needs the modelled one-way latency between two specific nodes -- to
-// place the proposer at a chosen distance from the builder, and to model a direct proposer-builder
-// channel as exactly one hop rather than as a guess.
-func GeoLatencyPair(t *testing.T, seed uint64, n int) (simlibp2p.LatencyFunc, string, func(i, j int) time.Duration) {
-	t.Helper()
+// GeoRegions is each node's region under GeoLatency's draw for seed, an index into GeoRegionNames.
+func GeoRegions(seed uint64, n int) []int {
 	total := 0
 	for _, w := range geoRegionWeights {
 		total += w
@@ -68,6 +66,17 @@ func GeoLatencyPair(t *testing.T, seed uint64, n int) (simlibp2p.LatencyFunc, st
 			r -= w
 		}
 	}
+	return region
+}
+
+// GeoLatencyPair is GeoLatency plus the raw per-pair function.
+//
+// The two-publisher driver needs the modelled one-way latency between two specific nodes -- to
+// place the proposer at a chosen distance from the builder, and to model a direct proposer-builder
+// channel as exactly one hop rather than as a guess.
+func GeoLatencyPair(t *testing.T, seed uint64, n int) (simlibp2p.LatencyFunc, string, func(i, j int) time.Duration) {
+	t.Helper()
+	region := GeoRegions(seed, n)
 	pair := func(i, j int) time.Duration {
 		if i == j {
 			return time.Millisecond

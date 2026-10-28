@@ -271,13 +271,19 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			return err
 		}
 
+		if p.hose != nil {
+			p.hose.written.Add(int64(len(out))) // the forward source's byte clock (hosefwd.go)
+		}
 		wt := time.Now()
+		p.writersBlocked.Add(1)
 		_, err = s.Write(out)
+		p.writersBlocked.Add(-1)
 		outgoing.noteWrite(time.Since(wt))
 		if err != nil {
 			p.rpcLogger.Debug("failed to send message", "peer", s.Conn().RemotePeer(), "rpc", rpc, "err", err)
 			return err
 		}
+		p.upload.note(rpc, len(out), s.Conn().RemotePeer())
 		p.rpcLogger.Debug("sent", "peer", s.Conn().RemotePeer(), "rpc", rpc)
 		return nil
 	}
@@ -306,6 +312,7 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 		}
 
 		err = writeRpc(rpc)
+		outgoing.afterWrite()
 		if err != nil {
 			s.Reset()
 			p.logger.Debug("error writing message to peer", "peer", s.Conn().RemotePeer(), "err", err)

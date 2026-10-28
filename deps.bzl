@@ -2015,7 +2015,7 @@ def prysm_deps():
         patch_args = ["-p1"],
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
-            # Phase forwarding on variant A. Same diff as the
+            # Phase forwarding (variant A). Same diff as the
             # go.mod replace to ./third_party/go-libp2p-pubsub; regenerate with
             # diff -u <modcache>/gossipsub.go third_party/go-libp2p-pubsub/gossipsub.go etc.
             "//third_party:com_github_libp2p_go_libp2p_pubsub-phaseforward.patch",
@@ -2037,6 +2037,12 @@ def prysm_deps():
             # diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base third_party/go-libp2p-pubsub.
             # sign.go is excluded because the cloneof patch above is Bazel-only. Verify by
             # applying the result to a fresh base copy and diffing against the fork: empty.
+            # Since 2026-09-20 it also carries every fork file added since Sep 4 (they were in
+            # no patch, which is what broke //beacon-chain/p2p/segmentintegrationtest under
+            # Bazel), and it opens with a BUILD.bazel hunk listing them: go_repository runs
+            # gazelle before it applies patches, so a source file a patch creates is not in
+            # srcs unless the patch adds it. third_party/regen-pubsub-admission-patch.sh does
+            # the regeneration, carries that hunk verbatim, and verifies the round trip.
             "//third_party:com_github_libp2p_go_libp2p_pubsub-admission.patch",
         ],
         sum = "h1:SNdvB6V0eYMXLRR95n+4vpxJKbFsbHhgjPdDiTpGoo0=",
@@ -2147,7 +2153,9 @@ def prysm_deps():
             # Zero keeps upstream's one-MTU burst, which is exact under a virtual clock; on the
             # real clock every timer wake-up overshoots, so one-MTU pacing lost capacity (a
             # 50 Mbps link delivered ~21) and wall-clock links set a few milliseconds
-            # (gossipsim.RealClockBurstWindow). Same diff as the go.mod replace to
+            # (gossipsim.RealClockBurstWindow). It also carries CoDel drop accounting: upstream's
+            # drop() was a no-op, so a congested link lost packets silently; Simnet.LinkStats()
+            # reads the counters. Same diff as the go.mod replace to
             # ./third_party/simnet; regenerate with
             # diff -ruN -x '*.orig' -x BUILD.bazel -x .github <modcache>/simnet@v0.0.7 third_party/simnet.
             "//third_party:com_github_marcopolo_simnet-burst.patch",

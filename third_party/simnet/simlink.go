@@ -1,6 +1,8 @@
 package simnet
 
 import (
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -42,11 +44,16 @@ func NewSimlink(
 	upPacketReceiver PacketReceiver,
 	downPacketReceiver PacketReceiver,
 ) *Simlink {
-	const (
-		target     = 5 * time.Millisecond
-		interval   = 100 * time.Millisecond
-		defaultMTU = 1500
-	)
+	const defaultMTU = 1500
+	// CoDel's target and interval, Linux's defaults, overridable through SIMNET_CODEL_TARGET_MS
+	// and SIMNET_CODEL_INTERVAL_MS (local change; upstream has them as constants).
+	//
+	// They are a knob because active queue management is one of the few things that genuinely
+	// differs between this simulator and Shadow, which has none: setting the target far above
+	// any sojourn a run reaches leaves CoDel installed but never dropping, which is Shadow's
+	// behaviour, and makes the difference measurable rather than argued. Unset, nothing changes.
+	target := envDuration("SIMNET_CODEL_TARGET_MS", 5*time.Millisecond)
+	interval := envDuration("SIMNET_CODEL_INTERVAL_MS", 100*time.Millisecond)
 
 	if linkSettings.Uplink.MTU == 0 {
 		linkSettings.Uplink.MTU = defaultMTU
@@ -87,6 +94,17 @@ func NewSimlink(
 func (l *Simlink) Start(wg *sync.WaitGroup) {
 	l.up.Start(wg)
 	l.down.Start(wg)
+}
+
+// LinkStats reports each direction's queue separately, since an asymmetric link congests in
+// one of them long before the other.
+type LinkStats struct {
+	Uplink   QueueStats
+	Downlink QueueStats
+}
+
+func (l *Simlink) Stats() LinkStats {
+	return LinkStats{Uplink: l.up.q.Stats(), Downlink: l.down.q.Stats()}
 }
 
 type linkDriver struct {
@@ -165,4 +183,13 @@ func (d *linkDriver) Start(wg *sync.WaitGroup) {
 			}
 		}
 	})
+}
+
+// envDuration reads a millisecond count from the environment, falling back when unset or unusable.
+func envDuration(name string, fallback time.Duration) time.Duration {
+	v, err := strconv.ParseFloat(os.Getenv(name), 64)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return time.Duration(v * float64(time.Millisecond))
 }

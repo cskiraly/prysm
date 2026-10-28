@@ -2,18 +2,41 @@ package gossipsim
 
 import (
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 	"github.com/marcopolo/simnet"
 )
 
+// FlowBuckets is the number of FQ-CoDel queues simnet gives each link, from
+// SEGMENT_FLOW_BUCKETS; zero (unset) leaves simnet's own default of 128.
+//
+// It exists to make the unit of fair queueing an experimental variable, because that is one of
+// the two places the two substrates of the payload-segmentation cross-check genuinely differ.
+// simnet, like a real Linux node's fq_codel, queues per flow: a node talking to seventy peers
+// has seventy queues and each gets a turn, so a small announcement to an idle peer does not wait
+// behind a bulk segment going to a busy one. Shadow schedules per socket, and go-libp2p puts
+// every QUIC connection on one socket, so it has one queue for the whole host. Setting this to 1
+// collapses simnet to that: a single CoDel queue, fair between nothing.
+//
+// Setting it to 1 therefore isolates the fairness unit while leaving CoDel in place, which the
+// simulator's own qdisc setting cannot do.
+func FlowBuckets() int {
+	v, err := strconv.Atoi(os.Getenv("SEGMENT_FLOW_BUCKETS"))
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
+}
+
 // UniformLinks gives every node the same symmetric access link.
 func UniformLinks(n, bitsPerSecond int) []simlibp2p.NodeLinkSettingsAndCount {
 	return []simlibp2p.NodeLinkSettingsAndCount{{
 		LinkSettings: simnet.NodeBiDiLinkSettings{
-			Downlink: simnet.LinkSettings{BitsPerSecond: bitsPerSecond},
-			Uplink:   simnet.LinkSettings{BitsPerSecond: bitsPerSecond},
+			Downlink: simnet.LinkSettings{BitsPerSecond: bitsPerSecond, FlowBucketCount: FlowBuckets()},
+			Uplink:   simnet.LinkSettings{BitsPerSecond: bitsPerSecond, FlowBucketCount: FlowBuckets()},
 		},
 		Count: n,
 	}}
@@ -25,8 +48,8 @@ func UniformLinks(n, bitsPerSecond int) []simlibp2p.NodeLinkSettingsAndCount {
 func AsymmetricLinks(n, upBitsPerSecond, downBitsPerSecond int) []simlibp2p.NodeLinkSettingsAndCount {
 	return []simlibp2p.NodeLinkSettingsAndCount{{
 		LinkSettings: simnet.NodeBiDiLinkSettings{
-			Downlink: simnet.LinkSettings{BitsPerSecond: downBitsPerSecond},
-			Uplink:   simnet.LinkSettings{BitsPerSecond: upBitsPerSecond},
+			Downlink: simnet.LinkSettings{BitsPerSecond: downBitsPerSecond, FlowBucketCount: FlowBuckets()},
+			Uplink:   simnet.LinkSettings{BitsPerSecond: upBitsPerSecond, FlowBucketCount: FlowBuckets()},
 		},
 		Count: n,
 	}}
@@ -43,7 +66,8 @@ func AsymmetricLinks(n, upBitsPerSecond, downBitsPerSecond int) []simlibp2p.Node
 // instants, so one-MTU pacing already delivers the full rate -- and a window's worth of tokens
 // would be released in zero virtual time, a burst no physical link produces. Measured on the
 // segment study's variant B, the 5 ms window under synctest inflated reissued requests by 46%
-// and last-node completion by 25% (Q52) -- instrument artifact, not protocol behaviour.
+// and last-node completion by 25% (experiment Q52) -- instrument artifact, not
+// protocol behaviour.
 const RealClockBurstWindow = 5 * time.Millisecond
 
 // stampBurstWindow applies the clock-appropriate burst window to every link that has not chosen
@@ -96,4 +120,22 @@ func addrIP(a net.Addr) string {
 		return a.String()
 	}
 	return host
+}
+
+// WithFlowBuckets stamps the cell's fair-queueing unit onto every class of a link population.
+//
+// Stamping the whole list in one place, rather than at each construction site, is deliberate:
+// SEGMENT_FLOW_BUCKETS was honoured on UniformLinks and AsymmetricLinks and silently ignored by
+// the mesh cells' own link builder, so the knob read as set and was not. A custom population --
+// a heterogeneity sweep, say -- must go through here for the same reason.
+func WithFlowBuckets(links []simlibp2p.NodeLinkSettingsAndCount) []simlibp2p.NodeLinkSettingsAndCount {
+	b := FlowBuckets()
+	if b <= 0 {
+		return links
+	}
+	for i := range links {
+		links[i].LinkSettings.Uplink.FlowBucketCount = b
+		links[i].LinkSettings.Downlink.FlowBucketCount = b
+	}
+	return links
 }

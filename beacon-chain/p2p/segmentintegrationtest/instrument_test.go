@@ -7,7 +7,7 @@ package segmentintegrationtest
 // the same substrate. The aliases below keep this package's names.
 //
 // The two tests are unchanged. They are what justifies trusting every byte figure the study
-// reports, so they stay next to it.
+// quotes, so they stay next to it.
 
 import (
 	"bytes"
@@ -31,7 +31,11 @@ import (
 type (
 	digest          = gossipsim.Digest
 	recordingTracer = gossipsim.RecordingTracer
+	recvEvent       = gossipsim.RecvEvent
 	controlCounts   = gossipsim.ControlCounts
+	// partialObserveFn decodes an inbound rpc.Partial for the diffusion instrument; see
+	// partialSegmentObserver.
+	partialObserveFn = gossipsim.PartialObserveFn
 )
 
 func digestOf(b []byte) digest { return gossipsim.DigestOf(b) }

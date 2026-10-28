@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -104,6 +105,38 @@ func TestNoBrokenPromises(t *testing.T) {
 		// verify that the peerPromises map has been vacated
 		if len(gt.peerPromises) != 0 {
 			t.Fatal("expected empty peerPromises map")
+		}
+	})
+}
+
+// TestPromiseTracking is WithPromiseTracking's known answer: without scoring, a broken promise is charged and counted per peer.
+func TestPromiseTracking(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		hosts := getDefaultHosts(t, 2)
+		plain := getGossipsub(ctx, hosts[0])
+		if c, o := plain.BrokenPromises(); c != nil || o != nil {
+			t.Fatal("no gossip tracer, so nothing is counted")
+		}
+		ps := getGossipsub(ctx, hosts[1], WithPromiseTracking())
+		gt := ps.rt.(*GossipSubRouter).gossipTracer
+		if gt == nil {
+			t.Fatal("promise tracking must install the gossip tracer")
+		}
+		gt.AddPromise("A", []string{"m1"})
+		gt.AddPromise("A", []string{"m2"})
+		gt.AddPromise("B", []string{"m3"})
+		if c, o := ps.BrokenPromises(); len(c) != 0 || o["A"] != 2 || o["B"] != 1 {
+			t.Fatalf("before the follow-up time: charged %v outstanding %v", c, o)
+		}
+		time.Sleep(GossipSubIWantFollowupTime + 2*GossipSubHeartbeatInterval)
+		if c, o := ps.BrokenPromises(); c["A"] != 2 || c["B"] != 1 || len(o) != 0 {
+			t.Fatalf("after it: charged %v outstanding %v, want A 2, B 1, none outstanding", c, o)
+		}
+		ps.ResetBrokenPromises()
+		if c, _ := ps.BrokenPromises(); len(c) != 0 {
+			t.Fatalf("a reset clears the charged count, got %v", c)
 		}
 	})
 }

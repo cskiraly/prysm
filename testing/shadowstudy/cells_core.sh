@@ -3,18 +3,21 @@
 # with their same-tree twins. cells_core.sh SUBSTRATE SIZE SEED...
 #   SUBSTRATE  shadow (each cell in QUIC and TCP) or harness (the twins; QUIC only)
 #   SIZE       small: every point up to 500 nodes, figure by figure (1, then 9, then 8's 250-node
-#              points); big: Figure 8's 1 000- and 2 000-node points, a lane of their own (memory;
-#              4 000 nodes does not fit the machine running Shadow)
+#              points); big: Figure 8's 1 000- and 2 000-node points, a lane of their own (memory);
+#              fig1: Figure 1 alone, for the seeds that follow the first
 # Lines are cell.sh's arguments; a cell two figures share (whole message at 1 MiB) is printed once.
 # Figure 9's tier 3 is aadaptcfd_16k below 512 KiB and aadaptcf_16k from there up, as published.
 set -u
-sub=${1:?shadow|harness}; size=${2:?small|big}; shift 2
-[ $# -gt 0 ] || { echo "usage: cells_core.sh shadow|harness small|big SEED..." >&2; exit 2; }
+sub=${1:?shadow|harness}; size=${2:?small|big|fig1}; shift 2
+[ $# -gt 0 ] || { echo "usage: cells_core.sh shadow|harness small|big|fig1 SEED..." >&2; exit 2; }
 case $sub in shadow) trs="quic tcp";; harness) trs=quic;; *) echo "bad substrate $sub" >&2; exit 2;; esac
 PAYS="p128k p256k p384k p512k p640k p768k p896k p1m p1536k p2m"
 emit() { for tr in $trs; do echo "$sub $1 $2 $tr $3 $4 $5"; done; }  # arm seed n pay net
 for seed in "$@"; do
   case $size in
+  fig1)
+    echo "# Figure 1 (fu_datacenter): seven arms, three scenarios, 500 nodes, 1 MiB; seed $seed"
+    for net in home dc20 dcb20; do for arm in wholend atuned_32k acoded_32k bfixed_32k bcodedfc1_32k c_32k crs_32k; do emit $arm $seed 500 p1m $net; done; done ;;
   small)
     echo "# Figure 1 (fu_datacenter): seven arms, three scenarios, 500 nodes, 1 MiB; seed $seed"
     for net in home dc20 dcb20; do for arm in wholend atuned_32k acoded_32k bfixed_32k bcodedfc1_32k c_32k crs_32k; do emit $arm $seed 500 p1m $net; done; done

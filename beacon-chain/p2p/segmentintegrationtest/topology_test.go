@@ -18,6 +18,8 @@ package segmentintegrationtest
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/rand"
 	"net"
 	"os"
 	"runtime"
@@ -184,7 +186,7 @@ func procCost() time.Duration {
 
 // procWorkers is SEGMENT_PROC_WORKERS, the validators a node runs concurrently under procCost;
 // default 4. Set explicitly because gossipsub's own default is the host's CPU count, which
-// would make the result depend on the host running the test.
+// would make the result depend on the machine.
 func procWorkers() int {
 	if n, err := strconv.Atoi(os.Getenv("SEGMENT_PROC_WORKERS")); err == nil && n > 0 {
 		return n
@@ -243,6 +245,9 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 	}
 
 	opts, perNode := substrateOpts(t, n, cfg.links, cfg.pubsubOpts, cfg.perNodeOpts)
+	if cfg.libraryDefaults && os.Getenv("SEGMENT_NO_SIGN") != "" {
+		t.Fatal("SEGMENT_NO_SIGN needs Prysm's message id: the library's default is From and Seqno, which an authorless message lacks")
+	}
 
 	return gossipsim.New(t, gossipsim.NetworkConfig{
 		Links:           cfg.links,
@@ -265,6 +270,23 @@ func newSimNetwork(t *testing.T, cfg networkConfig) (*simNetwork, func()) {
 func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCount, base []pubsub.Option, perNodeBase func(int) []pubsub.Option) ([]pubsub.Option, func(int) []pubsub.Option) {
 	t.Helper()
 	opts := append([]pubsub.Option{}, base...)
+	// SEGMENT_NO_SIGN=1: Prysm's message policy (beacon-chain/p2p/pubsub.go), unsigned and authorless, so no relay can skip the source.
+	if os.Getenv("SEGMENT_NO_SIGN") != "" {
+		opts = append(opts, pubsub.WithMessageSignaturePolicy(pubsub.StrictNoSign), pubsub.WithNoAuthor())
+	}
+	if os.Getenv("SEGMENT_ORIGIN_HAVE") != "" && (!structuredIDsEnabled() || os.Getenv("SEGMENT_HAVE_BITMAP") == "" || os.Getenv("SEGMENT_HAVE_BITMAP") == "ihave") {
+		t.Fatal("SEGMENT_ORIGIN_HAVE needs structured ids and the IDONTWANT-side HAVE bitmap (SEGMENT_HAVE_BITMAP=1, idontwant or both)")
+	}
+	if os.Getenv("SEGMENT_SRC_HAVE") != "" && (!structuredIDsEnabled() || os.Getenv("SEGMENT_HAVE_BITMAP") == "" || os.Getenv("SEGMENT_HAVE_BITMAP") == "ihave" || os.Getenv("SEGMENT_ORIGIN_HAVE") != "") {
+		t.Fatal("SEGMENT_SRC_HAVE needs structured ids and the IDONTWANT-side HAVE bitmap (SEGMENT_HAVE_BITMAP=1, idontwant or both), and excludes SEGMENT_ORIGIN_HAVE")
+	}
+	// SEGMENT_PROMISE_COUNT=1: the stock gossip tracer without scoring, so broken IWANT promises are counted per message.
+	if promiseCountOn() {
+		opts = append(opts, pubsub.WithPromiseTracking())
+	}
+	if os.Getenv("SEGMENT_DECODE_CLEARS_PROMISES") != "" && (!structuredIDsEnabled() || os.Getenv("SEGMENT_HAVE_BITMAP") == "" || os.Getenv("SEGMENT_HAVE_COMPLETE") == "") {
+		t.Fatal("SEGMENT_DECODE_CLEARS_PROMISES hangs on the decode claim: it needs structured ids, SEGMENT_HAVE_BITMAP and SEGMENT_HAVE_COMPLETE")
+	}
 
 	t.Cleanup(func() { t.Logf("        %s", announceStats.Line()) })
 	// SEGMENT_CONTROL_COALESCE=1 folds a control-only RPC into the control-only RPC already
@@ -289,7 +311,8 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 
 	// The IWANT discipline/budget knobs apply to every arm -- whole-message and plain
 	// segmented included -- because they are substrate fixes, not phase-arm features.
-	var parkBreaks, parks atomic.Int64
+	parkBreaks.Store(0)
+	parks.Store(0)
 	if os.Getenv("SEGMENT_IHAVE_PARK") != "" {
 		t.Cleanup(func() {
 			t.Logf("commitment enforcement: %d broken promises, %d peers parked (node-events)",
@@ -302,7 +325,7 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			t.Logf("pull memory: %d re-driven asks", pullRedrives.Load())
 		})
 	}
-	var offerRetries atomic.Int64
+	offerRetries.Store(0)
 	if os.Getenv("SEGMENT_OFFER_TABLE") != "" {
 		t.Cleanup(func() {
 			t.Logf("offer table: %d timer-driven retries", offerRetries.Load())
@@ -319,7 +342,7 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			t.Fatalf("bad SEGMENT_IWANT_DISCIPLINE_MS %q", v)
 		}
 		reqOpts = append(reqOpts, pubsub.WithIWantDiscipline(time.Duration(ms)*time.Millisecond))
-		// IHAVE-commitment enforcement (adversarial tier-B #8): a request
+		// IHAVE-commitment enforcement (adversarial-cell-design tier-B #8): a request
 		// expiring undelivered is a broken promise by its announcer; k breaks park the
 		// peer's announcements for the TTL. Requires the discipline, hence nested here.
 		if os.Getenv("SEGMENT_IHAVE_PARK") != "" {
@@ -335,6 +358,30 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			promise := envDuration("SEGMENT_IHAVE_PARK_PROMISE_MS", window*3/4)
 			ttl := envDuration("SEGMENT_IHAVE_PARK_TTL_MS", 30*time.Second)
 			reqOpts = append(reqOpts, pubsub.WithIHaveCommitmentPark(k, promise, ttl, &parkBreaks, &parks))
+			// SEGMENT_IHAVE_PARK_RECHECK=1: a promise whose index we hold by its deadline (received,
+			// or decoded) is absolved rather than charged to the peer that obeyed our decode HAVE.
+			if os.Getenv("SEGMENT_IHAVE_PARK_RECHECK") != "" {
+				reqOpts = append(reqOpts, pubsub.WithPromiseRecheck())
+			}
+			// SEGMENT_IHAVE_PARK_SCOPE=group: breaks and parks count per (peer, group), so a relay
+			// slow on one message is not parked for the next (Q131).
+			switch sc := os.Getenv("SEGMENT_IHAVE_PARK_SCOPE"); sc {
+			case "", "peer":
+			case "group":
+				// The group is the structured id's; without structured ids or HAVE bitmaps the router
+				// cannot tell one message's frames from another's, and the park would stay per peer.
+				if !structuredIDsEnabled() && os.Getenv("SEGMENT_HAVE_BITMAP") == "" {
+					t.Fatal("SEGMENT_IHAVE_PARK_SCOPE=group needs structured ids or HAVE bitmaps (use SEGMENT_IHAVE_PARK_TTL_MS otherwise)")
+				}
+				reqOpts = append(reqOpts, pubsub.WithIHaveParkPerGroup(func(mid string) (string, bool) {
+					if k, ok := segIDKey(mid); ok {
+						return string(k.group[:]), true
+					}
+					return "", false
+				}))
+			default:
+				t.Fatalf("bad SEGMENT_IHAVE_PARK_SCOPE %q (want peer or group)", sc)
+			}
 		}
 	}
 	if os.Getenv("SEGMENT_PULL_MEMORY") != "" {
@@ -392,8 +439,8 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		// got -- the difference between "brake didn't help" and "brake never fired".
 		opts = append(opts, pubsub.WithAdaptiveHedge(dInit, dMin, dMax, target, qHigh, &adaptMinE, &adaptMaxOcc))
 	}
-	// F2b real queue pressure: a hash-selected fraction of nodes run a slowed outbound
-	// writer, so their rpcQueue overflows naturally. The
+	// F2b real queue pressure: a hash-selected fraction of
+	// nodes run a slowed outbound writer, so their rpcQueue overflows naturally. The
 	// overflow drops surface through the tracer's droppedRPCs, already summed as `drops`.
 	sendDelaySet := failSendDelaySet(t, n)
 	sendDelay := envDuration("SEGMENT_FAIL_SEND_DELAY_MS", 0)
@@ -408,8 +455,8 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 	detRand := os.Getenv("SEGMENT_DET_RAND") != ""
 	detSeed := int64(meshGraphSeed(t))
 
-	// F1 withholding: a fixed-size node set, selected by ranking hash(fail seed, index)
-	// so the schedule is identical across arms, answers
+	// F1 withholding: a fixed-size node set, selected by
+	// ranking hash(fail seed, index) so the schedule is identical across arms, answers
 	// IWANTs never (silent) or whole after a delay (slow). Publisher excluded -- that is
 	// F5's job. Exposure is counted in the fork and logged, not assumed.
 	var withheld atomic.Int64
@@ -418,8 +465,8 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 	if os.Getenv("SEGMENT_FAIL_WITHHOLD_MODE") == "slow" {
 		withholdDelay = envDuration("SEGMENT_FAIL_WITHHOLD_SLOW_MS", 800*time.Millisecond)
 	}
-	// E7 extensions of the withholder: a structural-index floor that restricts the injection
-	// to the ids at or above it (the last-piece screen), a count-ordered
+	// E7 extensions of the withholder (hedge-and-adaptivity plan): a structural-index floor that
+	// restricts the injection to the ids at or above it (the last-piece screen), a count-ordered
 	// prefix (fast then slow, or slow then fast: the median-poisoning screen's timed strategies),
 	// and hearsay announcing (the capture screen). All ride the withholder set.
 	withholdFrom := -1
@@ -479,6 +526,13 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			t.Logf("failure exposure: %d withholding nodes, %d IWANT ids withheld/delayed",
 				len(withholdSet), withheld.Load())
 		})
+		// The set itself, by node index, so per-node records can be read for honest nodes only.
+		ids := make([]int, 0, len(withholdSet))
+		for i := range withholdSet {
+			ids = append(ids, i)
+		}
+		sort.Ints(ids)
+		t.Logf("failure exposure: withholding node indices %v", ids)
 	}
 
 	// Relay silence rides the SAME withholder set (identical CRN pairing with the F1 cells):
@@ -495,6 +549,44 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 				relaySkipped.Load())
 		})
 	}
+	// SEGMENT_FAIL_NO_REPAIR=1 rides the same withholder set: selected nodes push none of the
+	// frames they rebuild under SEGMENT_REBUILT=push, the withholder that will not repair.
+	noRepair := os.Getenv("SEGMENT_FAIL_NO_REPAIR") != ""
+	var noRepaired atomic.Int64
+	if noRepair {
+		if len(withholdSet) == 0 {
+			t.Fatal("SEGMENT_FAIL_NO_REPAIR requires SEGMENT_FAIL_WITHHOLD_PCT")
+		}
+		t.Cleanup(func() {
+			t.Logf("failure exposure: no repair on the withholder set, %d rebuilt frames not pushed",
+				noRepaired.Load())
+		})
+	}
+	// SEGMENT_FAIL_MUTE=1 rides the same withholder set: selected nodes send no IDONTWANT — no
+	// HAVE bitmap, no hose ack — to anyone, the mute peer sel=fewest ranks first; still receive.
+	mute := os.Getenv("SEGMENT_FAIL_MUTE") != ""
+	var muted atomic.Int64
+	if mute {
+		if len(withholdSet) == 0 {
+			t.Fatal("SEGMENT_FAIL_MUTE requires SEGMENT_FAIL_WITHHOLD_PCT")
+		}
+		t.Cleanup(func() {
+			t.Logf("failure exposure: mute on the withholder set, %d IDONTWANT/HAVE ids suppressed", muted.Load())
+		})
+	}
+	// SEGMENT_FAIL_UNDERREPORT=1 rides the same withholder set: each peer's HAVE carries only the
+	// frames that peer sent the node, and no claim goes out — the tailored under-reporter the proof
+	// guard cannot catch.
+	underReport := os.Getenv("SEGMENT_FAIL_UNDERREPORT") != ""
+	var underWithheld, underClaims atomic.Int64
+	if underReport {
+		if len(withholdSet) == 0 || mute || !structuredIDsEnabled() || os.Getenv("SEGMENT_HAVE_BITMAP") == "" {
+			t.Fatal("SEGMENT_FAIL_UNDERREPORT requires SEGMENT_FAIL_WITHHOLD_PCT, SEGMENT_HAVE_BITMAP and structured ids, and excludes SEGMENT_FAIL_MUTE")
+		}
+		t.Cleanup(func() {
+			t.Logf("failure exposure: under-report on the withholder set, %d HAVE indices left out, %d claims dropped", underWithheld.Load(), underClaims.Load())
+		})
+	}
 
 	// IDONTWANT spoofing: its own hash-selected set claims to hold every id it hears
 	// announced, poisoning phase forwarding's holder-count budget decay.
@@ -507,8 +599,8 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		})
 	}
 
-	// F2a per-class admission loss: every node sheds the configured class at queue admission
-	// with the given probability, decisions stateless
+	// F2a per-class admission loss: every node sheds the
+	// configured class at queue admission with the given probability, decisions stateless
 	// per (node seed, class, message id, destination address). Systemic, unlike F1's node
 	// subset -- queue pressure hits everyone.
 	var classDropped atomic.Int64
@@ -557,6 +649,15 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			}
 			if relaySilence {
 				out = append(out, pubsub.WithRelaySilence(&relaySkipped))
+			}
+			if noRepair {
+				out = append(out, pubsub.WithRebuiltRefusal(&noRepaired))
+			}
+			if mute {
+				out = append(out, pubsub.WithControlMute(&muted))
+			}
+			if underReport {
+				out = append(out, pubsub.WithHaveUnderReport(&underWithheld, &underClaims))
 			}
 		}
 		if spoofSet[i] {
@@ -684,6 +785,25 @@ func meshLinks(t *testing.T, n, defaultRate int) []simlibp2p.NodeLinkSettingsAnd
 		node0 = sym(b)
 	}
 
+	// The heterogeneity sweep replaces the class blocks with a drawn population, one entry per
+	// node. The builder keeps its own link: mixing the first hop into the population's spread
+	// would confound it with the relay path, which Q33 already paid for once.
+	if up := sigmaUplinks(t, n, validator.Uplink.BitsPerSecond); up != nil {
+		ratio := float64(validator.Downlink.BitsPerSecond) / float64(validator.Uplink.BitsPerSecond)
+		out := []simlibp2p.NodeLinkSettingsAndCount{{LinkSettings: node0, Count: 1}}
+		for i := 1; i < n; i++ {
+			out = append(out, simlibp2p.NodeLinkSettingsAndCount{
+				LinkSettings: simnet.NodeBiDiLinkSettings{
+					Downlink: simnet.LinkSettings{BitsPerSecond: int(float64(up[i]) * ratio)},
+					Uplink:   simnet.LinkSettings{BitsPerSecond: up[i]},
+				},
+				Count: 1,
+			})
+		}
+		t.Logf("      %s", sigmaLinkLine(up))
+		return gossipsim.WithFlowBuckets(out)
+	}
+
 	rest := n - 1
 	dcCount, slowCount := meshLinkCounts(t, n)
 
@@ -705,10 +825,10 @@ func meshLinks(t *testing.T, n, defaultRate int) []simlibp2p.NodeLinkSettingsAnd
 		})
 	}
 	out = append(out, simlibp2p.NodeLinkSettingsAndCount{LinkSettings: validator, Count: rest - dcCount - slowCount})
-	return out
+	return gossipsim.WithFlowBuckets(out)
 }
 
-// regimeRule is the oracle regime rule (E4/E5): SEGMENT_A_REGIME_RULE=1
+// regimeRule is the oracle regime rule (hedge-and-adaptivity plan, E4/E5): SEGMENT_A_REGIME_RULE=1
 // makes each node choose its A parameters from R, the payload's wire time on its own configured
 // uplink over the propagation round trip (SEGMENT_A_REGIME_RTT_MS, default 50), instead of from
 // the payload size alone: push degree r = 4 for R ≤ 0.85, 3 for R ≤ 1.3, 2 above; the request
@@ -868,10 +988,10 @@ func phasePubsubOptsMatch(t *testing.T, r int, match func(string) bool) []pubsub
 	if os.Getenv("SEGMENT_PHASE_FIXED_BUDGET") != "" {
 		opts = append(opts, pubsub.WithPhaseFixedBudget())
 	}
-	// Selection policy for the pushed subset: default sel=rank; "rr" is sender-side
-	// round-robin.
+	// Selection policy for the pushed subset: default sel=rank; "rr" is
+	// sender-side round-robin; "fewest" is appended by the realistic mesh after the HAVE options.
 	switch os.Getenv("SEGMENT_PHASE_SEL") {
-	case "", "rank":
+	case "", "rank", "fewest":
 	case "rr":
 		opts = append(opts, pubsub.WithPhaseSelectRR())
 	default:
@@ -1220,8 +1340,8 @@ func narrowHolders(t *testing.T, n int) (w int, holders []int) {
 }
 
 // failPublishOmit selects w shard indices the publisher never sends (F5 source omission).
-// Hash-ranked from a domain-separated fail seed so the set is deterministic and stable across
-// arms at a given w. For a coded arm with margin R,
+// Hash-ranked from a domain-separated fail seed so the set
+// is deterministic and stable across arms at a given w. For a coded arm with margin R,
 // w <= R is tolerated by construction; for an uncoded arm any w >= 1 leaves the omitted
 // segments unreachable, so completion is right-censored — the positive control that the
 // harness detects permanent omission as non-completion, not as a slow tail.
@@ -1251,9 +1371,47 @@ func failPublishOmit(t *testing.T, total int) map[int]bool {
 	return out
 }
 
+// srcPerPeer is SEGMENT_SRC_PER_PEER=<v>: the publisher injects v frames per mesh peer of each
+// message, v times its mesh size at publish, the rest omitted (privacy: with one copy per frame
+// and no announces, SEGMENT_PHASE_SRC=wide with degree 1, each mesh peer gets exactly v). 0 unset.
+func srcPerPeer(t *testing.T) int {
+	t.Helper()
+	v := os.Getenv("SEGMENT_SRC_PER_PEER")
+	if v == "" {
+		return 0
+	}
+	c, err := strconv.Atoi(v)
+	if err != nil || c < 1 {
+		t.Fatalf("bad SEGMENT_SRC_PER_PEER %q (want frames per mesh peer >= 1)", v)
+	}
+	return c
+}
+
+// srcPerPeerOmit omits all but keep of total frames, a hash-ranked subset as failPublishOmit's.
+func srcPerPeerOmit(t *testing.T, total, keep int) map[int]bool {
+	t.Helper()
+	if keep >= total {
+		return nil
+	}
+	seed := mix64(meshGraphSeed(t) ^ 0x5E5E5E5E5E5E5E5E)
+	idxs := make([]int, total)
+	for i := range idxs {
+		idxs[i] = i
+	}
+	sort.Slice(idxs, func(a, b int) bool {
+		return mix64(seed^uint64(idxs[a])) > mix64(seed^uint64(idxs[b]))
+	})
+	out := make(map[int]bool, total-keep)
+	for _, i := range idxs[:total-keep] {
+		out[i] = true
+	}
+	t.Logf("source per-peer cap: %d of %d frames injected", keep, total)
+	return out
+}
+
 // failSelect returns the fixed-size non-publisher node set for a failure mode: pct percent
-// of n-1, ranked by hash(domain seed, index), stateless and identical across arms
-// (a determinism requirement). domain separates one mode's set from another's
+// of n-1, ranked by hash(domain seed, index), stateless and identical across arms.
+// domain separates one mode's set from another's
 // at the same seed. Returns nil when pctEnv is unset.
 func failSelect(t *testing.T, n int, pctEnv string, domain uint64) map[int]bool {
 	t.Helper()
@@ -1290,8 +1448,9 @@ func failSendDelaySet(t *testing.T, n int) map[int]bool {
 }
 
 // failureDeadline is the slot-relevant completion deadline that rate@ reports against,
-// 4 s unless SEGMENT_DEADLINE_MS overrides it (phase 0). It does not stop the run — completion
-// beyond it still lands in the CDF; censoring happens only at the harness timeout.
+// 4 s unless SEGMENT_DEADLINE_MS overrides it. It
+// does not stop the run — completion beyond it still lands in the CDF; censoring happens
+// only at the harness timeout.
 func failureDeadline(t *testing.T) time.Duration {
 	t.Helper()
 	v := os.Getenv("SEGMENT_DEADLINE_MS")
@@ -1311,9 +1470,13 @@ func failureDeadline(t *testing.T) time.Duration {
 // round-trip into any router, so it cannot perturb what it measures.
 var announceStats = &pubsub.IHaveRPCStats{}
 
+// parkBreaks and parks are the cell's commitment-enforcement counters, package-level so the
+// driver can read them per message; zeroed when a network is built.
+var parkBreaks, parks, offerRetries atomic.Int64
+
 // meshGraphSeed is the seed every mesh experiment uses, 7 unless SEGMENT_SEED overrides it.
-// One seed per run is a known limitation; the override is what a multi-seed sweep varies, so
-// cells with different seeds differ in topology but nothing else.
+// One seed per run is a known limitation; the override is what a
+// multi-seed sweep varies, so cells with different seeds differ in topology but nothing else.
 func meshGraphSeed(t *testing.T) uint64 {
 	t.Helper()
 	v := os.Getenv("SEGMENT_SEED")
@@ -1357,4 +1520,201 @@ func nodeAtDistance(t *testing.T, n, from int, farthest bool) int {
 		}
 	}
 	return best
+}
+
+// Heterogeneity as a dial: a log-normal uplink population at a fixed mean.
+//
+// Every bandwidth result in the study so far moves all nodes together -- the uplink sweep sets
+// one rate for the whole network -- which cannot distinguish "the network is slow" from "the
+// network is uneven", and only the second is something a local mechanism can act on. The three
+// class knobs above do not fill the gap either: they give one rate per class, not a
+// distribution, so the spread is two or three point masses placed by index.
+//
+// SEGMENT_UPLINK_SIGMA is the spread of a log-normal uplink about the validator rate, in
+// natural-log units. Unset or zero it returns nil and meshLinks behaves exactly as before, so
+// the sigma=0 control is the existing home scenario and not a re-implementation of it. The
+// downlink scales with the uplink, so a node's asymmetry ratio is what the class knobs gave it
+// and the sweep stays one-dimensional.
+//
+// WHICH MEAN IS HELD FIXED IS THE WHOLE EXPERIMENT, so it is a knob and both are reported.
+// SEGMENT_UPLINK_MEAN=arithmetic (the default) holds the sum of capacity fixed. But completion
+// time is closer to 1/rate than to rate, so as sigma grows at fixed arithmetic mean the
+// harmonic mean falls, and some of the degradation is less effective capacity rather than
+// unevenness -- the confound the sweep exists to avoid. SEGMENT_UPLINK_MEAN=harmonic holds the
+// harmonic mean fixed instead, which is the sharper control: a protocol that assigns duty by
+// capacity should be roughly flat in sigma, while one that assigns equal duty degrades. Read
+// the realised means in the cell's link line before comparing anything across sigma.
+//
+// Deterministic in SEGMENT_SEED, drawn from a stream of its own so it does not perturb the
+// graph: every arm at one seed sees the same population, without which a paired comparison
+// across arms measures the draw. Across seeds the population varies, which is the point.
+func sigmaUplinks(t *testing.T, n, base int) []int {
+	t.Helper()
+	v := os.Getenv("SEGMENT_UPLINK_SIGMA")
+	if v == "" {
+		return nil
+	}
+	sigma, err := strconv.ParseFloat(v, 64)
+	if err != nil || sigma < 0 {
+		t.Fatalf("bad SEGMENT_UPLINK_SIGMA %q (want a non-negative float)", v)
+	}
+	if sigma == 0 || n < 2 || base <= 0 {
+		return nil
+	}
+	harmonic := false
+	switch m := os.Getenv("SEGMENT_UPLINK_MEAN"); m {
+	case "", "arithmetic":
+	case "harmonic":
+		harmonic = true
+	default:
+		t.Fatalf("bad SEGMENT_UPLINK_MEAN %q (want arithmetic or harmonic)", m)
+	}
+	// The clamp keeps the tails inside what a home link can be: an unclamped log-normal at
+	// sigma 1.1 draws nodes that never finish, which censors the cell rather than slowing it,
+	// and nodes faster than the datacenter class, which is a different experiment.
+	spread := 20.0
+	if s := os.Getenv("SEGMENT_UPLINK_CLAMP"); s != "" {
+		spread, err = strconv.ParseFloat(s, 64)
+		if err != nil || spread < 1 {
+			t.Fatalf("bad SEGMENT_UPLINK_CLAMP %q (want a float >= 1)", s)
+		}
+	}
+	target := float64(base)
+	lo, hi := target/spread, target*spread
+
+	// mu places the requested mean before clamping; the renormalisation below fixes up what the
+	// clamp takes away. Clamping without it silently moves the mean, which is exactly the
+	// confound this population exists to remove.
+	mu := math.Log(target) - sigma*sigma/2
+	if harmonic {
+		mu = math.Log(target) + sigma*sigma/2
+	}
+	rng := rand.New(rand.NewSource(int64(meshGraphSeed(t)) ^ sigmaUplinkStream)) // #nosec G404 -- a reproducible population, not a secret.
+	rest := n - 1
+	up := make([]float64, rest)
+	for i := range up {
+		up[i] = math.Exp(mu + sigma*rng.NormFloat64())
+	}
+	mean := func() float64 {
+		if harmonic {
+			var s float64
+			for _, x := range up {
+				s += 1 / x
+			}
+			return float64(len(up)) / s
+		}
+		var s float64
+		for _, x := range up {
+			s += x
+		}
+		return s / float64(len(up))
+	}
+	clamp := func() {
+		for i, x := range up {
+			up[i] = math.Min(hi, math.Max(lo, x))
+		}
+	}
+	clamp()
+	// Alternating rescale and clamp converges quickly and is stopped either way; a population
+	// that cannot reach the target within the clamp is reported rather than silently accepted.
+	for pass := 0; pass < 16; pass++ {
+		m := mean()
+		if math.Abs(m-target)/target < 1e-3 {
+			break
+		}
+		for i := range up {
+			up[i] *= target / m
+		}
+		clamp()
+	}
+
+	out := make([]int, n)
+	out[0] = base // node 0's own class is meshLinks' business, not the population's.
+	for i, x := range up {
+		out[i+1] = int(x)
+	}
+	return out
+}
+
+// sigmaUplinkStream separates the population draw from the graph draw, so turning the sweep on
+// does not change the topology a seed produces.
+const sigmaUplinkStream = 0x5347_4d41
+
+// sigmaClasses splits a drawn population into the classes the horizon reports: slow below half
+// the mean, dc above twice it, other between. Index blocks do not exist here -- every node is
+// its own class -- so populations() and meshLinks must both read the classes off the same draw,
+// which is why this takes the draw rather than re-deriving it.
+func sigmaClasses(up []int) (slow, dc []int) {
+	if len(up) < 2 {
+		return nil, nil
+	}
+	var sum float64
+	for _, x := range up[1:] {
+		sum += float64(x)
+	}
+	mean := sum / float64(len(up)-1)
+	for i := 1; i < len(up); i++ {
+		switch {
+		case float64(up[i]) < mean/2:
+			slow = append(slow, i)
+		case float64(up[i]) > 2*mean:
+			dc = append(dc, i)
+		}
+	}
+	return slow, dc
+}
+
+// sigmaNodeClasses is the class split without needing to know the cell's base rate.
+//
+// The draw is scale-invariant: every uplink is the target mean times a factor of (z, sigma,
+// clamp) alone, and the classes are defined relative to the realised mean, so any positive base
+// gives the same answer. That is what lets the horizon report read the classes back without
+// being handed the link rate the driver passed to meshLinks -- the two would otherwise have to
+// be kept in step by hand, and a per-class table that does not describe the cell looks exactly
+// like a result.
+func sigmaNodeClasses(t *testing.T, n int) (slow, dc []int) {
+	t.Helper()
+	return sigmaClasses(sigmaUplinks(t, n, classBase))
+}
+
+// classBase is the arbitrary positive rate sigmaNodeClasses draws at; high enough that the
+// truncation to integer bits per second cannot move a node across a class boundary.
+const classBase = 1000 * simlibp2p.OneMbps
+
+// sigmaSweepOn reports whether this cell draws a heterogeneous uplink population. A small sigma
+// can leave every node inside the class boundaries, so an empty class split does not mean the
+// sweep is off -- which is why this asks the generator rather than the environment.
+func sigmaSweepOn(t *testing.T, n int) bool {
+	t.Helper()
+	return sigmaUplinks(t, n, classBase) != nil
+}
+
+// sigmaLinkLine describes the realised population, which is what a cell must be read against:
+// the requested sigma is a parameter, the drawn mean and spread are the facts.
+func sigmaLinkLine(up []int) string {
+	rest := append([]int(nil), up[1:]...)
+	sort.Ints(rest)
+	var sum, inv float64
+	for _, x := range rest {
+		sum += float64(x)
+		inv += 1 / float64(x)
+	}
+	mbps := func(bps int) float64 { return float64(bps) / float64(simlibp2p.OneMbps) }
+	am := sum / float64(len(rest))
+	hm := float64(len(rest)) / inv
+	slow, dc := sigmaClasses(up)
+	// Nodes sitting on the clamp are a point mass, not a log-normal tail. Past about sigma 1.1
+	// they are a tenth of the population and the distribution is no longer the one requested,
+	// so the fraction is reported rather than left to be inferred from min == p10.
+	pinned := 0
+	for _, x := range rest {
+		if x == rest[0] || x == rest[len(rest)-1] {
+			pinned++
+		}
+	}
+	return fmt.Sprintf("uplink population: %d nodes, arithmetic mean %.1f Mbps, harmonic mean %.1f Mbps; "+
+		"min %.1f p10 %.1f p50 %.1f p90 %.1f max %.1f; slow(<mean/2) %d, dc(>2xmean) %d, at the clamp %d",
+		len(rest), mbps(int(am)), mbps(int(hm)),
+		mbps(rest[0]), mbps(rest[len(rest)/10]), mbps(rest[len(rest)/2]),
+		mbps(rest[9*len(rest)/10]), mbps(rest[len(rest)-1]), len(slow), len(dc), pinned)
 }

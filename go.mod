@@ -182,6 +182,7 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
+	github.com/klauspost/reedsolomon v1.12.5 // indirect
 	github.com/koron/go-ssdp v0.0.6 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kurtosis-tech/kurtosis-portal/api/golang v0.0.0-20230818182330-1a86869414d2 // indirect
@@ -316,9 +317,8 @@ replace github.com/json-iterator/go => github.com/prestonvanloon/go v1.1.7-0.201
 
 replace github.com/tyler-smith/go-bip39 => ./third_party/go-bip39
 
-// Local fork carrying the phase-forwarding experiment on variant A. The same diff reaches
-// bazel's external repo as the phaseforward, partialinterest and admission patches in
-// third_party/com_github_libp2p_go_libp2p_pubsub-*.patch.
+// Local fork carrying the phase-forwarding experiment (variant A).
+// The same diff is applied to bazel's external repo as third_party/*-phase.patch.
 replace github.com/libp2p/go-libp2p-pubsub => ./third_party/go-libp2p-pubsub
 
 // simnet: the rate link's burst is sized in line time rather than one MTU, so a 50 Mbps link

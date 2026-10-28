@@ -16,6 +16,7 @@ package segmentintegrationtest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/marcopolo/simnet"
 )
 
@@ -46,6 +48,7 @@ type diffusionStats struct {
 	compTimes          []time.Duration
 	drops, dups        int
 	rxBytes, txBytes   int
+	linkRx             int // bytes delivered by all downlinks, all protocols, by completion
 	idwSent, idwRecv   int
 	ctrlRx             int
 	publisherTx        int
@@ -56,8 +59,14 @@ type diffusionStats struct {
 	deadline           time.Duration
 	// Variant B's partial-message traffic. Union fields, summed for every variant and harmlessly
 	// zero for A and C, which never move partial-message RPCs.
-	partialRx, partialTx       int // partial-message bytes received / sent, all nodes
+	partialRx, partialTx       int // partial-message PAYLOAD bytes received / sent, all nodes
 	partialRPCs, partialTxRPCs int // partial-message RPCs received / sent, all nodes
+	// Bitmap signalling, counted apart from the payload above. This is the partial path's
+	// analogue of ctrlRx: it is what makes a bitmap variant's signalling cost comparable with an
+	// IHAVE/IWANT variant's, where the control bytes have always been reported separately and
+	// excluded from the copies figure. Summed into the payload it put the two families on
+	// different bases and hid B's signalling inside B's copies.
+	partialMetaRx, partialMetaTx int
 	// The raw event log and the publish instant, for reports that need per-message shapes
 	// (e.g. per-segment diffusion spread) rather than the aggregates above. Read under each
 	// tracer's Mu.
@@ -71,6 +80,9 @@ type diffusionStats struct {
 	horizon  *horizonSnapshot
 	compAt   []time.Duration
 	rxAtComp []int
+	// pub is the message's publisher; msg and msgs place it in a multi-message cell (1 of 1
+	// otherwise).
+	pub, msg, msgs int
 }
 
 // completionEvent is one node reaching its completion predicate, at a virtual time relative to
@@ -113,6 +125,15 @@ type gateDriven interface {
 	setGates(*segmentGates)
 }
 
+// partialDiffusion is an optional variant hook for the diffusion instrument: a variant whose
+// segments travel in rpc.Partial rather than rpc.Publish supplies the decoder that makes them
+// visible, and the key list that reads the curves back. Without it both curves are empty for the
+// whole variant -- see RecordingTracer.TrackPartialSegments.
+type partialDiffusion interface {
+	partialObserve() partialObserveFn
+	segKeys() []string
+}
+
 // prePublisher is an optional run hook run after mesh settle and before publish, used for A's
 // co-resident background traffic. It may advance virtual time (mesh formation), which is why it
 // runs before the driver captures the completion start.
@@ -132,6 +153,33 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 	applyInitialCWND(t)
 	stats := diffusionStats{n: p.n, deadline: p.deadline}
 	warmOnly := false
+	plan := messagePlanFromEnv(t, p.n, p.deadline)
+	// IDONTWANT spoofers claim every id and so are never sent it: the wait is for everyone else.
+	spoofers := failSpoofSet(t, p.n)
+	need := func(pub int) int {
+		k := p.n - 1
+		for i := range spoofers {
+			if i != pub {
+				k--
+			}
+		}
+		return k
+	}
+	if len(spoofers) > 0 {
+		t.Logf("      completion waits for %d nodes: %d IDONTWANT spoofers are reported by class, not waited for", need(0), len(spoofers))
+	}
+	mm, multi := v.(multiMessage)
+	if len(plan.pubs) > 1 && !multi {
+		t.Fatalf("SEGMENT_MESSAGES: the %s variant has no multi-message support", v.name())
+	}
+	if plan.pubs[0] != 0 {
+		fp, ok := v.(firstPublisher)
+		if !ok {
+			t.Fatalf("the %s variant publishes the first message from node 0 only", v.name())
+		}
+		fp.setFirstPublisher(plan.pubs[0])
+	}
+	var sums []messageSummary
 	synctest.Test(t, func(t *testing.T) {
 		bubbleStart := time.Now()
 		// Let pubsub's untracked retry goroutines finish before the bubble closes.
@@ -151,8 +199,15 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			synctest.Wait()
 		}()
 		tracers := make([]*recordingTracer, p.n)
+		pd, onPartialPath := v.(partialDiffusion)
 		for i := range tracers {
 			tracers[i] = newRecordingTracer()
+			if diffusionCurves() {
+				tracers[i].TrackAnnounce()
+				if onPartialPath {
+					tracers[i].TrackPartialSegments(pd.partialObserve())
+				}
+			}
 		}
 		// The authority gate is installed by the driver rather than by each variant: it is a
 		// property of the cell, not of the transport strategy, and every variant that pulls is
@@ -171,6 +226,7 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			perNodeOpts: func(i int) []pubsub.Option {
 				opts := []pubsub.Option{pubsub.WithRawTracer(tracers[i]), pubsub.WithRequestObservation()}
 				opts = append(opts, structuredIDOpts()...)
+				opts = append(opts, gossipPaceOpts(t, i, p.seed)...)
 				if gates != nil {
 					opts = append(opts, pubsub.WithRequestGate(gates.nodes[i], gates.deferrals[i]))
 				}
@@ -235,76 +291,129 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		stats.tMesh = tMeshed.Sub(tPeered)
 		stats.tPre = tReady.Sub(tMeshed)
 
-		// The announce-rate histogram describes the measured diffusion, not the settle heartbeats.
-		announceStats.Reset()
-		done := make(chan completionEvent, p.n)
-		start := time.Now()
-		// The horizon is taken on this goroutine at the deadline, while every subscription is
-		// still up: as a timer case of the completion loop, or as a wait after the last
-		// completion. A timer goroutine would race the deferred unsubscribe and read pruned
-		// meshes and a network that has left the topic.
-		stats.compAt = make([]time.Duration, p.n)
-		stats.rxAtComp = make([]int, p.n)
-		stats.horizon = newHorizonSnapshot(t, p.n, p.deadline)
-		horizonTimer := time.NewTimer(p.deadline)
-		defer horizonTimer.Stop()
-		takeHorizon := func() {
-			if !stats.horizon.taken {
-				stats.horizon.take(nw, tracers)
-			}
-		}
-		// Authority is dated from publish on the synthetic schedule: before the payload exists
-		// there is nothing a block could authorize, so a gate with no authority is closed. A
-		// gate-driven variant opens its own gates from real block arrival instead.
-		if !driven {
-			gates.armAll()
-		}
-		signal := func(node int, at time.Duration) { done <- completionEvent{node: node, at: at} }
-		r.watch(ctx, &wg, start, signal)
-		if err := r.publish(ctx, t); err != nil {
-			t.Fatal(err)
-		}
-
-		for stats.completed < p.n-1 {
-			select {
-			case ev := <-done:
-				stats.completed++
-				stats.compTimes = append(stats.compTimes, ev.at)
-				stats.compAt[ev.node] = ev.at
-				_, _, stats.rxAtComp[ev.node], _ = tracers[ev.node].Counts()
-			case <-ctx.Done():
-				stats.virt = time.Since(start)
+		var prevStart time.Time
+		for m := 1; m <= len(plan.pubs); m++ {
+			var base *horizonBase
+			if m > 1 {
 				if gates != nil {
-					// A censored cell is exactly where the gate's own ledger matters, so record
-					// it on the timeout path too rather than only on the happy one.
-					stats.gateSummary = gates.stats.line() + "\n        " + gates.admitted.line()
+					t.Fatal("multi-message cells do not run the authority gate")
 				}
-				// Aggregate here too: a censored cell without byte counters reads as "nothing
-				// moved"; these are the counters at the harness timeout, the horizon's the ones at
-				// the deadline.
+				// A gap after the previous publish; the network idles on heartbeats meanwhile.
+				time.Sleep(time.Until(prevStart.Add(plan.gap)))
+				mm.nextMessage(t, m, plan.pubs[m-1])
+				for _, tr := range tracers {
+					tr.ResetCounters()
+				}
+				stats = diffusionStats{n: p.n, deadline: p.deadline}
+				// The mesh as it stands at this publish: it has had a gap of heartbeats to churn.
+				stats.meshSummary = summariseMesh(meshSizes(tracers))
+				base = takeHorizonBase(nw)
+				var cancelM context.CancelFunc
+				ctx, cancelM = context.WithTimeout(context.Background(), networkOpTimeout)
+				defer cancelM()
+			}
+			stats.pub, stats.msg, stats.msgs = plan.pubs[m-1], m, len(plan.pubs)
+			breaks0, parks0, retries0 := parkBreaks.Load(), parks.Load(), offerRetries.Load()
+			held0 := promisesHeld(nw)
+
+			// The announce-rate histogram describes the measured diffusion, not the settle heartbeats.
+			announceStats.Reset()
+			done := make(chan completionEvent, p.n)
+			uploadNewWindow(nw) // the settle heartbeats and the previous gap are not this message's
+			promiseNewWindow(nw)
+			linkBase := downlinkBytes(nw)
+			start := time.Now()
+			prevStart = start
+			// The horizon is taken on this goroutine at the deadline, while every subscription is
+			// still up: as a timer case of the completion loop, or as a wait after the last
+			// completion. A timer goroutine would race the deferred unsubscribe and read pruned
+			// meshes and a network that has left the topic.
+			stats.compAt = make([]time.Duration, p.n)
+			stats.rxAtComp = make([]int, p.n)
+			stats.horizon = newHorizonSnapshot(t, p.n, p.deadline, stats.pub, base)
+			horizonTimer := time.NewTimer(p.deadline)
+			defer horizonTimer.Stop()
+			takeHorizon := func() {
+				if !stats.horizon.taken {
+					stats.horizon.take(nw, tracers)
+				}
+			}
+			// Authority is dated from publish on the synthetic schedule: before the payload exists
+			// there is nothing a block could authorize, so a gate with no authority is closed. A
+			// gate-driven variant opens its own gates from real block arrival instead.
+			if !driven {
+				gates.armAll()
+			}
+			signal := func(node int, at time.Duration) { done <- completionEvent{node: node, at: at} }
+			r.watch(ctx, &wg, start, signal)
+			if err := r.publish(ctx, t); err != nil {
+				t.Fatal(err)
+			}
+
+			timedOut := false
+			for !timedOut && stats.completed < need(stats.pub) {
+				select {
+				case ev := <-done:
+					if spoofers[ev.node] {
+						continue // a spoofer's claim starves itself; it is reported by class, not waited for
+					}
+					stats.completed++
+					stats.compTimes = append(stats.compTimes, ev.at)
+					stats.compAt[ev.node] = ev.at
+					stats.rxAtComp[ev.node] = payloadRx(tracers[ev.node])
+				case <-ctx.Done():
+					stats.virt = time.Since(start)
+					if gates != nil {
+						// A censored cell is exactly where the gate's own ledger matters, so record
+						// it on the timeout path too rather than only on the happy one.
+						stats.gateSummary = gates.stats.line() + "\n        " + gates.admitted.line()
+					}
+					// Aggregate here too: a censored cell without byte counters reads as "nothing
+					// moved"; these are the counters at the harness timeout, the horizon's the ones at
+					// the deadline.
+					aggregateTracers(tracers, &stats)
+					stats.linkRx = linkRxSince(nw, linkBase)
+					stats.tracers = tracers
+					stats.startAt = start
+					takeHorizon()
+					v.onTimeout(t, stats.completed, p.n)
+					timedOut = true
+				case <-horizonTimer.C:
+					takeHorizon()
+				}
+			}
+			if !timedOut {
+				stats.virt = time.Since(start)
+				synctest.Wait()
 				aggregateTracers(tracers, &stats)
+				stats.linkRx = linkRxSince(nw, linkBase)
 				stats.tracers = tracers
 				stats.startAt = start
-				takeHorizon()
-				v.onTimeout(t, stats.completed, p.n)
-				return
-			case <-horizonTimer.C:
-				takeHorizon()
+				if gates != nil {
+					stats.gateSummary = gates.stats.line() + "\n        " + gates.admitted.line()
+				}
+				// Bytes to completion are aggregated above, as every figure reads them; the horizon, if
+				// still ahead, is waited for here, before the deferred unsubscribe.
+				if !stats.horizon.taken {
+					<-horizonTimer.C
+					takeHorizon()
+				}
 			}
-		}
-		stats.virt = time.Since(start)
-		synctest.Wait()
-		aggregateTracers(tracers, &stats)
-		stats.tracers = tracers
-		stats.startAt = start
-		if gates != nil {
-			stats.gateSummary = gates.stats.line() + "\n        " + gates.admitted.line()
-		}
-		// Bytes to completion are aggregated above, as every figure reads them; the horizon, if
-		// still ahead, is waited for here, before the deferred unsubscribe.
-		if !stats.horizon.taken {
-			<-horizonTimer.C
-			takeHorizon()
+			if len(plan.pubs) > 1 {
+				// Each message is reported inside the bubble, while the routers it reads are alive;
+				// a single-message cell reports after it, as it always has.
+				cold := ""
+				if m == 1 {
+					cold = ", cold"
+				}
+				t.Logf("=== message %d/%d, publisher node %d%s", m, len(plan.pubs), stats.pub, cold)
+				reportCell(t, v, stats)
+				t.Logf("        commitment enforcement this message: %d broken promises, %d peers parked; offer-table retries %d; promises due with the index held %d", parkBreaks.Load()-breaks0, parks.Load()-parks0, offerRetries.Load()-retries0, promisesHeld(nw)-held0)
+				sums = append(sums, summarise(stats))
+			}
+			if timedOut {
+				return
+			}
 		}
 	})
 	stats.wall = time.Since(wall)
@@ -312,7 +421,24 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		t.Logf("      warm-up only: stopped before publish (SEGMENT_WARMUP_ONLY)")
 		return
 	}
+	if len(plan.pubs) > 1 {
+		t.Logf("%s; wall %v", messagesLine(plan, sums), stats.wall.Round(time.Millisecond))
+	} else {
+		reportCell(t, v, stats)
+	}
+	// Fail after reporting, outside the bubble: a t.Errorf inside synctest.Test propagates as
+	// FailNow when the bubble exits, which would skip the censored report entirely.
+	if stats.completed < need(stats.pub) {
+		t.Errorf("TIMEOUT: message %d: only %d/%d completed", stats.msg, stats.completed, need(stats.pub))
+	}
+}
+
+// reportCell emits one message's report: the variant's lines, then the driver's own.
+func reportCell(t *testing.T, v variant, stats diffusionStats) {
 	v.report(t, stats)
+	if stats.linkRx > 0 && stats.n > 0 {
+		t.Logf("        link rx/node %dB (what each downlink delivered by completion: UDP payloads, every protocol)", stats.linkRx/stats.n)
+	}
 	if w, ok := v.(wireFormer); ok {
 		t.Logf("        %s", w.wireForm())
 	}
@@ -321,11 +447,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 	}
 	for _, line := range stats.horizon.lines(stats.compAt, stats.rxAtComp) {
 		t.Logf("        %s", line)
-	}
-	// Fail after reporting, outside the bubble: a t.Errorf inside synctest.Test propagates as
-	// FailNow when the bubble exits, which would skip the censored report entirely.
-	if stats.completed < p.n-1 {
-		t.Errorf("TIMEOUT: only %d/%d completed", stats.completed, p.n-1)
 	}
 }
 
@@ -350,8 +471,66 @@ func aggregateTracers(tracers []*recordingTracer, s *diffusionStats) {
 		s.partialTx += ptx
 		s.partialRPCs += prpcs
 		s.partialTxRPCs += ptxrpcs
+		mrx, mtx, _, _ := tr.PartialMetaCounts()
+		s.partialMetaRx += mrx
+		s.partialMetaTx += mtx
 	}
-	s.pubControl = tracers[0].ControlSeen()
-	_, _, _, s.publisherTx = tracers[0].Counts()
-	_, s.partialPublisherTx, _, _ = tracers[0].PartialCounts()
+	s.pubControl = tracers[s.pub].ControlSeen()
+	_, _, _, s.publisherTx = tracers[s.pub].Counts()
+	_, s.partialPublisherTx, _, _ = tracers[s.pub].PartialCounts()
+}
+
+// promisesHeld sums, over the network, the promises that fell due with their index already held.
+func promisesHeld(nw *simNetwork) int64 {
+	if nw == nil {
+		return 0
+	}
+	var n int64
+	for _, ps := range nw.Pubsubs {
+		n += ps.PromisesHeldAtDeadline()
+	}
+	return n
+}
+
+// promiseCountOn is SEGMENT_PROMISE_COUNT, implied by SEGMENT_DECODE_CLEARS_PROMISES: the gossip tracer runs, and its promises are reported.
+func promiseCountOn() bool {
+	return os.Getenv("SEGMENT_PROMISE_COUNT") != "" || os.Getenv("SEGMENT_DECODE_CLEARS_PROMISES") != ""
+}
+
+// promiseNewWindow starts every node's broken-promise count afresh for the next message.
+func promiseNewWindow(nw *simNetwork) {
+	if nw == nil || !promiseCountOn() {
+		return
+	}
+	for _, ps := range nw.Pubsubs {
+		ps.ResetBrokenPromises()
+	}
+}
+
+// promiseLine sums the gossip tracer's promises over every node: charged since publish (P7's input) and still outstanding at the report.
+func promiseLine(nw *simNetwork) string {
+	var charged, outstanding, pairs, maxPair, maxPeer int
+	perPeer := make(map[peer.ID]int)
+	for _, ps := range nw.Pubsubs {
+		c, o := ps.BrokenPromises()
+		both := make(map[peer.ID]int, len(c)+len(o))
+		for p, k := range c {
+			charged += k
+			both[p] += k
+		}
+		for p, k := range o {
+			outstanding += k
+			both[p] += k
+		}
+		for p, k := range both {
+			pairs++
+			maxPair = max(maxPair, k)
+			perPeer[p] += k
+		}
+	}
+	for _, k := range perPeer {
+		maxPeer = max(maxPeer, k)
+	}
+	return fmt.Sprintf("broken promises: %d charged since publish + %d outstanding at the report, over %d (node, peer) pairs; max per (node, peer) %d, max per peer over nodes %d",
+		charged, outstanding, pairs, maxPair, maxPeer)
 }

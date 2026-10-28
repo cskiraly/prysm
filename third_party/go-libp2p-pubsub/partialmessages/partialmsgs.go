@@ -42,6 +42,10 @@ type PublishAction struct {
 	// from executing or affect the PeerState map.
 	Err error
 
+	// Urgent sends in the urgent lane, ahead of queued data; for metadata-only updates whose
+	// value is timeliness -- the lane IDONTWANT already uses.
+	Urgent bool
+
 	// OnSent, if non-nil, is called after the send is attempted, with whether the RPC was
 	// admitted to the peer's send queue. It is called on the publishing goroutine, before the
 	// next peer's action is built, so it may safely mutate the peerStates map.
@@ -204,7 +208,7 @@ func (e *PartialMessagesExtension[PeerState]) publish(topic string, groupID []by
 				rpc.PartialMessage = action.EncodedPartialMessage
 			}
 			rpc.PartsMetadata = action.EncodedPartsMetadata
-			admitted := e.sendRPC(p, &rpc)
+			admitted := e.sendRPC(p, &rpc, action.Urgent)
 			if action.OnSent != nil {
 				action.OnSent(admitted)
 			}
@@ -247,6 +251,15 @@ func (e *PartialMessagesExtension[PeerState]) PublishPartial(topic string, group
 			return e.router.PeerRequestsPartial(p, topic)
 		},
 	))
+}
+
+// MeshPeers is the router's current mesh for topic, or its fanout peers when the mesh is
+// empty, filtered to peers that can take partial messages. For a PublishActionsFn that wants
+// to bound its forwarding set: the peerStates map it is handed grows with every peer that ever
+// sent an RPC for the group, which is the whole connectivity, not the mesh. Router state, so
+// it may only be called on the router goroutine -- inside a PublishActionsFn is fine.
+func (e *PartialMessagesExtension[PeerState]) MeshPeers(topic string) iter.Seq[peer.ID] {
+	return e.router.MeshPeers(topic)
 }
 
 // initPeerState initializes the peer state of MeshPeers that aren't already in
@@ -321,8 +334,8 @@ func (e *PartialMessagesExtension[PeerState]) EmitGossip(topic string, peers []p
 	}
 }
 
-func (e *PartialMessagesExtension[PeerState]) sendRPC(to peer.ID, rpc *pb.PartialMessagesExtension) bool {
-	return e.router.SendRPC(to, rpc, false)
+func (e *PartialMessagesExtension[PeerState]) sendRPC(to peer.ID, rpc *pb.PartialMessagesExtension, urgent bool) bool {
+	return e.router.SendRPC(to, rpc, urgent)
 }
 
 func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.PartialMessagesExtension) error {

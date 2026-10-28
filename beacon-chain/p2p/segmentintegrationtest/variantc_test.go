@@ -54,6 +54,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // segmentTopicIndexed names the topic for one segment index.
@@ -232,6 +233,8 @@ type cCell struct {
 	parity     int
 	phaseR     int
 	extras     []int // SEGMENT_SUB_EXTRA: custody margins R, S = K + R per node
+	// build makes message m's group (m = 1 is arm), for multi-message cells.
+	build func(t *testing.T, m int) wireArm
 }
 
 // cCellFromEnv reads the cell's knobs and builds the group. params.SetupTestConfigCleanup must
@@ -269,18 +272,28 @@ func cCellFromEnv(t *testing.T) cCell {
 	}
 	sk, err := bls.RandKey()
 	require.NoError(t, err)
-	payload := mainnetLikePayload(payloadLen, 11)
 	c.unit = segmentSizeBytes(t)
-	c.arm = segmentedArm(t, payload, c.unit, sk, primitives.Slot(2048))
 	if v := os.Getenv("SEGMENT_PARITY"); v != "" {
 		// Coded topics: K+parity indices on the wire, one topic each, any K completing a node.
 		par, err := strconv.Atoi(v)
 		if err != nil || par <= 0 {
 			t.Fatalf("bad SEGMENT_PARITY %q", v)
 		}
-		c.arm = codedArm(t, payload, c.unit, par, sk, primitives.Slot(2048))
 		c.parity = par
 	}
+	// Message m's payload and slot follow variant A's multi-message cells (q6cell_test.go).
+	c.build = func(t *testing.T, m int) wireArm {
+		seed, slot := uint64(11), primitives.Slot(2048)
+		if m > 1 {
+			seed, slot = uint64(1000+m), primitives.Slot(4096+m) // lint:ignore uintcast -- m is a small positive message number.
+		}
+		payload := mainnetLikePayload(payloadLen, seed)
+		if c.parity > 0 {
+			return codedArm(t, payload, c.unit, c.parity, sk, slot)
+		}
+		return segmentedArm(t, payload, c.unit, sk, slot)
+	}
+	c.arm = c.build(t, 1)
 	c.topicCount = len(c.arm.msgs)
 	if len(c.extras) > 0 && c.parity == 0 {
 		t.Fatalf("SEGMENT_SUB_EXTRA needs a coded group (SEGMENT_PARITY > 0): at K = N the only custody set that completes is every topic, which is plain variant C")
@@ -307,7 +320,7 @@ func (c cCell) custodies() []*int {
 
 // variant is the cell's variant C at one custody margin (nil: every node joins every topic).
 func (c cCell) variant(extra *int) *variantC {
-	v := &variantC{arm: c.arm, unit: c.unit, topicCount: c.topicCount, phaseR: c.phaseR}
+	v := &variantC{arm: c.arm, unit: c.unit, topicCount: c.topicCount, phaseR: c.phaseR, build: c.build}
 	if extra != nil {
 		v.custody, v.extra = true, *extra
 	}
@@ -339,6 +352,19 @@ type variantC struct {
 	// custody restricts every node but the publisher to S = K + extra topics.
 	custody bool
 	extra   int
+	// pubID is the publisher's peer id, recorded at setup for the first-hop line.
+	pubID peer.ID
+	// build makes message m's group, for multi-message cells.
+	build func(t *testing.T, m int) wireArm
+}
+
+// nextMessage switches the variant to message m of a multi-message cell. The publisher holds
+// every topic's handle, so it stays node 0.
+func (v *variantC) nextMessage(t *testing.T, m, pub int) {
+	if pub != 0 {
+		t.Fatalf("variant C publishes from node 0 only; SEGMENT_PUBLISHER=rotate asked for node %d", pub)
+	}
+	v.arm = v.build(t, m)
 }
 
 func (v *variantC) name() string { return "variantC" }
@@ -364,6 +390,7 @@ func (v *variantC) pubsubOpts(t *testing.T, _ int) []pubsub.Option {
 
 func (v *variantC) setup(t *testing.T, nw *simNetwork, p diffusionParams) diffusionRun {
 	n := nw.Len()
+	v.pubID = nw.Hosts[0].ID()
 	subs := make([][]*pubsub.Subscription, n)
 	var pubTopics []*pubsub.Topic
 	for i, ps := range nw.Pubsubs {
@@ -491,6 +518,7 @@ func (v *variantC) report(t *testing.T, s diffusionStats) {
 		s.dups, s.idwSent, float64(s.dups)/math.Max(1, float64(s.idwSent)),
 		s.publisherTx, s.rxBytes/s.n, s.ctrlRx/s.n, s.wall.Round(time.Millisecond),
 		connectivityDegree(t, s.n), mesh)
+	t.Logf("        %s", firstHopLine(v.arm, s, v.pubID, "publisher"))
 	if s.drops > 0 {
 		t.Logf("*** %d DROPS", s.drops)
 	}
@@ -503,6 +531,31 @@ type cRun struct {
 	subs      [][]*pubsub.Subscription // per node, in topic order; ragged under custody
 	pubTopics []*pubsub.Topic          // the publisher's handle per topic index
 	n         int
+	// watches is each node's completion counter, re-armed per message; the readers feeding it are
+	// started once, so a message's readers never compete with the next message's for frames.
+	watches []*cWatch
+}
+
+// cWatch is one node's count of the current message's distinct segments.
+type cWatch struct {
+	mu     sync.Mutex
+	arm    wireArm
+	seen   map[digest]bool
+	onDone func()
+}
+
+func (w *cWatch) got(d digest) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.arm.known[d]; !ok || w.seen[d] {
+		return
+	}
+	w.seen[d] = true
+	if len(w.seen) == w.arm.completeAt() && w.onDone != nil {
+		f := w.onDone
+		w.onDone = nil
+		f()
+	}
 }
 
 func (r *cRun) settle(t *testing.T, tracers []*recordingTracer) string {
@@ -521,11 +574,35 @@ func (r *cRun) cancel() {
 }
 
 func (r *cRun) watch(ctx context.Context, wg *sync.WaitGroup, start time.Time, signal func(int, time.Duration)) {
-	for i := 1; i < r.n; i++ {
-		node := i
-		r.v.watchNode(ctx, wg, r.subs[i], func() { signal(node, time.Since(start)) })
+	if r.watches == nil {
+		// The readers run until the subscriptions are cancelled, across every message of the cell.
+		r.watches = make([]*cWatch, r.n)
+		for i := 1; i < r.n; i++ {
+			w := &cWatch{}
+			r.watches[i] = w
+			for _, sub := range r.subs[i] {
+				wg.Add(1)
+				go func(sub *pubsub.Subscription) {
+					defer wg.Done()
+					for {
+						msg, err := sub.Next(context.Background())
+						if err != nil {
+							return
+						}
+						w.got(digestOf(msg.Data))
+					}
+				}(sub)
+			}
+		}
+		drainSubs(context.Background(), wg, r.subs[0])
 	}
-	drainSubs(ctx, wg, r.subs[0])
+	for i := 1; i < r.n; i++ {
+		node, w := i, r.watches[i]
+		w.mu.Lock()
+		w.arm, w.seen = r.v.arm, make(map[digest]bool, len(r.v.arm.msgs))
+		w.onDone = func() { signal(node, time.Since(start)) }
+		w.mu.Unlock()
+	}
 }
 
 func (r *cRun) publish(ctx context.Context, t *testing.T) error {

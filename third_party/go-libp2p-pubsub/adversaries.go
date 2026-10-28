@@ -123,6 +123,22 @@ func WithIHaveHearsay(width int, announced *atomic.Int64) Option {
 	}
 }
 
+// WithRebuiltRefusal makes this node push none of the frames it rebuilds after decoding
+// (RebuiltPush): the withholder that will not repair. Announcing them is untouched, and stacked on
+// WithIWantWithholding they are never served either. The counter, when non-nil, records the
+// rebuilt frames held back.
+func WithRebuiltRefusal(refused *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("rebuilt refusal requires a gossipsub router")
+		}
+		gs.rebuiltRefuse = true
+		gs.rebuiltRefused = refused
+		return nil
+	}
+}
+
 // hearsayAnnounce forwards the announced ids, first time each, to the peers hearsayTargets
 // picks. Router goroutine.
 func (gs *GossipSubRouter) hearsayAnnounce(from peer.ID, ctl *pb.ControlMessage) {
@@ -191,5 +207,205 @@ func WithReadDelay(d time.Duration) Option {
 		}
 		ps.readDelay = d
 		return nil
+	}
+}
+
+// WithControlMute makes this node send no IDONTWANT to any peer: no HAVE bitmap, no hose
+// acknowledgement, no claim. It still receives, announces, asks and pushes. Against sel=fewest
+// the mute peer looks furthest behind to every pusher; stack WithIWantWithholding and
+// WithRelaySilence for the mute and silent free-rider. The counter, when non-nil, records the
+// ids suppressed, so the exposure is verified.
+func WithControlMute(muted *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("control mute requires a gossipsub router")
+		}
+		gs.controlMute = true
+		gs.controlMuted = muted
+		return nil
+	}
+}
+
+// applyControlMute returns rpc without its IDONTWANT entries under the mute, nil when nothing
+// else remains; rpc itself is never mutated, since one RPC can be yielded to several peers.
+func (gs *GossipSubRouter) applyControlMute(rpc *RPC) *RPC {
+	if !gs.controlMute || rpc == nil {
+		return rpc
+	}
+	ctl := rpc.GetControl()
+	if ctl == nil || len(ctl.Idontwant) == 0 {
+		return rpc
+	}
+	n := 0
+	for _, e := range ctl.Idontwant {
+		n += len(e.MessageIDs)
+	}
+	if gs.controlMuted != nil {
+		gs.controlMuted.Add(int64(n))
+	}
+	out := shallowRPCCopy(rpc)
+	out.urgent = rpc.urgent
+	out.Control = nil
+	if len(ctl.Ihave) > 0 || len(ctl.Iwant) > 0 || len(ctl.Graft) > 0 || len(ctl.Prune) > 0 || ctl.Extensions != nil {
+		out.Control = &pb.ControlMessage{Ihave: ctl.Ihave, Iwant: ctl.Iwant, Graft: ctl.Graft, Prune: ctl.Prune, Extensions: ctl.Extensions}
+	}
+	if len(out.Publish) == 0 && out.Control == nil && rpcOtherwiseEmpty(out) {
+		return nil
+	}
+	return out
+}
+
+// WithHaveUnderReport makes this node tell each peer, in every HAVE bitmap it sends it, only the
+// frames of the group that peer sent it -- pushed or answered, first copy or duplicate -- and
+// nothing learned from anyone else; it sends no claim. The tailored under-reporter against
+// sel=fewest: each pusher's view of it is consistent with what that pusher gave it and maximally
+// behind, so it ranks first everywhere and passes any local proof, including the proof guard,
+// whose HAVE arrives exactly when an honest node's would. The HAVE timing, the hose stamps and
+// everything else are untouched. Requires WithHaveBitmaps. The counters, when non-nil, record the
+// indices left out and the claims dropped, so the exposure is verified.
+func WithHaveUnderReport(withheld, claims *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("HAVE under-reporting requires a gossipsub router")
+		}
+		if gs.have == nil {
+			return fmt.Errorf("HAVE under-reporting requires WithHaveBitmaps first")
+		}
+		gs.under = &underReport{from: make(map[peer.ID]map[string]*haveEntry), withheld: withheld, claims: claims}
+		return nil
+	}
+}
+
+// underReport is the tailored under-reporter's state: what each peer sent us, per root.
+type underReport struct {
+	from             map[peer.ID]map[string]*haveEntry
+	withheld, claims *atomic.Int64
+}
+
+// underReportNote records that from sent us mid. Router goroutine, from Preprocess and from the
+// duplicate check, before either sends a HAVE or a hose ack.
+func (gs *GossipSubRouter) underReportNote(from peer.ID, mid string) {
+	if gs.under == nil || (gs.p != nil && from == gs.p.host.ID()) {
+		return
+	}
+	root, index, ok := gs.have.index(mid)
+	if !ok || len(root) != haveRootLen {
+		return
+	}
+	roots := gs.under.from[from]
+	if roots == nil {
+		roots = make(map[string]*haveEntry)
+		gs.under.from[from] = roots
+	}
+	e := roots[root]
+	if e == nil {
+		e = &haveEntry{}
+		roots[root] = e
+	}
+	e.bits.Set(index)
+	e.ttl = gs.have.holdTTL
+}
+
+// underReportBits is bits cut down to what p sent us of root, and how many indices that left
+// out; bits itself is never mutated.
+func (gs *GossipSubRouter) underReportBits(p peer.ID, root string, bits *haveBits) (*haveBits, int) {
+	out := &haveBits{b: append([]byte(nil), bits.Bytes()...)}
+	var from *haveBits
+	if e := gs.under.from[p][root]; e != nil {
+		from = &e.bits
+	}
+	for i := range out.b {
+		if from != nil && i < len(from.b) {
+			out.b[i] &= from.b[i]
+		} else {
+			out.b[i] = 0
+		}
+	}
+	return out, bits.Count() - out.Count()
+}
+
+// underReportCount adds n left-out indices to the exposure counter; a no-op on an honest node.
+func (gs *GossipSubRouter) underReportCount(n int) {
+	if gs.under != nil && gs.under.withheld != nil && n > 0 {
+		gs.under.withheld.Add(int64(n))
+	}
+}
+
+// applyUnderReport returns rpc with every HAVE bitmap to p cut down to what p sent us, every
+// structured per-id IDONTWANT p did not send us dropped, and every claim dropped; nil when nothing
+// else remains. rpc itself is never mutated, since one RPC can be yielded to several peers.
+func (gs *GossipSubRouter) applyUnderReport(rpc *RPC, p peer.ID) *RPC {
+	if gs.under == nil || rpc == nil {
+		return rpc
+	}
+	ctl := rpc.GetControl()
+	if ctl == nil || len(ctl.Idontwant) == 0 {
+		return rpc
+	}
+	entries := make([]*pb.ControlIDontWant, 0, len(ctl.Idontwant))
+	for _, e := range ctl.Idontwant {
+		ids := make([]string, 0, len(e.MessageIDs))
+		for _, mid := range e.MessageIDs {
+			if _, _, _, ok := decodeHoseStamp(mid); ok {
+				ids = append(ids, mid) // it names only what p just sent us
+				continue
+			}
+			if root, enc, ok := decodeHave(mid); ok {
+				switch mid[len(haveMagic)] {
+				case haveVersionClaim:
+					if gs.under.claims != nil {
+						gs.under.claims.Add(1)
+					}
+				case haveVersion:
+					var b haveBits
+					b.Or(enc)
+					cut, n := gs.underReportBits(p, root, &b)
+					gs.underReportCount(n)
+					ids = append(ids, encodeHave(root, cut))
+				default:
+					ids = append(ids, mid)
+				}
+				continue
+			}
+			if root, index, ok := gs.have.index(mid); ok && len(root) == haveRootLen {
+				if e := gs.under.from[p][root]; e == nil || !e.bits.Has(index) {
+					gs.underReportCount(1)
+					continue
+				}
+			}
+			ids = append(ids, mid)
+		}
+		if len(ids) > 0 {
+			entries = append(entries, &pb.ControlIDontWant{MessageIDs: ids})
+		}
+	}
+	out := shallowRPCCopy(rpc)
+	out.urgent = rpc.urgent
+	out.Control = nil
+	if len(entries) > 0 || len(ctl.Ihave) > 0 || len(ctl.Iwant) > 0 || len(ctl.Graft) > 0 || len(ctl.Prune) > 0 || ctl.Extensions != nil {
+		out.Control = &pb.ControlMessage{Ihave: ctl.Ihave, Iwant: ctl.Iwant, Graft: ctl.Graft, Prune: ctl.Prune, Idontwant: entries, Extensions: ctl.Extensions}
+	}
+	if len(out.Publish) == 0 && out.Control == nil && rpcOtherwiseEmpty(out) {
+		return nil
+	}
+	return out
+}
+
+// underReportHeartbeat ages what each peer sent us with the bitmaps it stands behind.
+func (gs *GossipSubRouter) underReportHeartbeat() {
+	if gs.under == nil {
+		return
+	}
+	for p, roots := range gs.under.from {
+		for root, e := range roots {
+			if e.ttl--; e.ttl <= 0 {
+				delete(roots, root)
+			}
+		}
+		if len(roots) == 0 {
+			delete(gs.under.from, p)
+		}
 	}
 }

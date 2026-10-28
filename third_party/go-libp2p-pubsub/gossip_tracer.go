@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -114,14 +115,104 @@ func (gt *gossipTracer) GetBrokenPromises() map[peer.ID]int {
 	return res
 }
 
+// WithPromiseTracking installs the gossip tracer without peer scoring, so broken IWANT promises are counted though never penalised.
+func WithPromiseTracking() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("promise tracking requires a gossipsub router")
+		}
+		if gs.gossipTracer != nil {
+			return nil
+		}
+		gs.gossipTracer = newGossipTracer()
+		if ps.tracer != nil {
+			ps.tracer.raw = append(ps.tracer.raw, gs.gossipTracer)
+		} else {
+			ps.tracer = &pubsubTracer{raw: []RawTracer{gs.gossipTracer}, pid: ps.host.ID(), idGen: ps.idGen}
+		}
+		return nil
+	}
+}
+
+// brokenPromiseCount accumulates the broken promises charged per peer, under its own lock.
+type brokenPromiseCount struct {
+	mu      sync.Mutex
+	perPeer map[peer.ID]int
+}
+
+func (c *brokenPromiseCount) add(p peer.ID, n int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.perPeer == nil {
+		c.perPeer = make(map[peer.ID]int)
+	}
+	c.perPeer[p] += n
+}
+
+// BrokenPromises is, per peer, the IWANT promises charged since ResetBrokenPromises and those still outstanding; nil without a gossip tracer.
+func (p *PubSub) BrokenPromises() (charged, outstanding map[peer.ID]int) {
+	gs, ok := p.rt.(*GossipSubRouter)
+	if !ok || gs.gossipTracer == nil {
+		return nil, nil
+	}
+	gs.brokenPromises.mu.Lock()
+	charged = make(map[peer.ID]int, len(gs.brokenPromises.perPeer))
+	for pid, n := range gs.brokenPromises.perPeer {
+		charged[pid] = n
+	}
+	gs.brokenPromises.mu.Unlock()
+	gt := gs.gossipTracer
+	gt.Lock()
+	defer gt.Unlock()
+	outstanding = make(map[peer.ID]int, len(gt.peerPromises))
+	for pid, mids := range gt.peerPromises {
+		outstanding[pid] = len(mids)
+	}
+	return charged, outstanding
+}
+
+// ResetBrokenPromises starts the charged count afresh (per message of a multi-message cell).
+func (p *PubSub) ResetBrokenPromises() {
+	gs, ok := p.rt.(*GossipSubRouter)
+	if !ok {
+		return
+	}
+	gs.brokenPromises.mu.Lock()
+	defer gs.brokenPromises.mu.Unlock()
+	gs.brokenPromises.perPeer = nil
+}
+
 var _ RawTracer = (*gossipTracer)(nil)
 
 func (gt *gossipTracer) fulfillPromise(msg *Message) {
-	mid := gt.idGen.ID(msg)
+	gt.fulfillPromiseID(gt.idGen.ID(msg))
+}
 
+// fulfillPromiseID fulfils the promises made under mid, for an ask made by index whose message
+// arrives under its own id (havebitmap.go).
+func (gt *gossipTracer) fulfillPromiseID(mid string) {
 	gt.Lock()
 	defer gt.Unlock()
+	gt.fulfillLocked(mid)
+}
 
+// fulfillPromisesWhere fulfils every promise whose id match accepts, and returns how many ids it cleared; match runs under the lock.
+func (gt *gossipTracer) fulfillPromisesWhere(match func(mid string) bool) int {
+	gt.Lock()
+	defer gt.Unlock()
+	n := 0
+	for mid := range gt.promises {
+		if match(mid) {
+			gt.fulfillLocked(mid)
+			n++
+		}
+	}
+	return n
+}
+
+// fulfillLocked is fulfillPromiseID with the lock held.
+func (gt *gossipTracer) fulfillLocked(mid string) {
 	promises, ok := gt.promises[mid]
 	if !ok {
 		return

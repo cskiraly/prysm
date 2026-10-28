@@ -40,8 +40,8 @@ const (
 	PushNone
 	// PushPhase pushes eagerly early and falls back to announce late, using the number of
 	// peers known to hold a segment as the local estimate of how far it has diffused. This
-	// is PPPT's push-pull phase transition with the bitmap state standing in for a hop
-	// counter: a segment is volunteered to its top
+	// is PPPT's push-pull phase transition with the
+	// bitmap state standing in for a hop counter: a segment is volunteered to its top
 	// max(0, replication - knownHolders) rendezvous peers, so the push degree decays to
 	// zero exactly where duplicates concentrate -- late in the diffusion.
 	PushPhase
@@ -96,6 +96,8 @@ type publishInput struct {
 	// onWithheld reports how many want-driven sends F1 withholding skipped, so injected
 	// exposure is verified, not assumed. Paired with withholdServes below.
 	onWithheld func(int)
+	// onPastWindow reports how many pushes pastPushWindow withheld. Optional.
+	onPastWindow func(int)
 	// replication is how many peers each segment is volunteered to under PushSplit. Zero is
 	// read as one, so a zero-value publishInput still pushes.
 	replication int
@@ -128,6 +130,9 @@ type publishInput struct {
 	pushGrace bool
 	// withholdServes is the F1 injection: skip want-driven sends, keep pushes and announces.
 	withholdServes bool
+	// pastPushWindow is true once the group is past Config.PushWindow: requests are still
+	// served, nothing is volunteered. False, the zero value, pushes as the policy says.
+	pastPushWindow bool
 	// compress snappy-compresses each segment in the part. See Config.CompressSegments.
 	compress bool
 }
@@ -400,6 +405,7 @@ func chunkedActions(in publishInput, peerStates map[peer.ID]PeerState, peerReque
 // would strand it. The policy only governs what goes out on top of that.
 func segmentsForPeer(in publishInput, id peer.ID, state PeerState, partialPeers []peer.ID, holders map[uint32]int) []uint32 {
 	var out []uint32
+	late := 0
 	for _, idx := range in.held.Indices() {
 		if state.pushed(idx) {
 			continue
@@ -411,17 +417,16 @@ func segmentsForPeer(in publishInput, id peer.ID, state PeerState, partialPeers 
 		if state.holds(idx) {
 			continue
 		}
+		push := false
 		switch in.policy {
 		case PushAll:
-			out = append(out, idx)
+			push = true
 		case PushSplit:
 			if in.pushDivisor > 0 {
 				// Coordinated: a pairwise predicate, so the receiver can run it too.
-				if willPush(in.groupID, idx, in.self, id, in.pushDivisor) {
-					out = append(out, idx)
-				}
-			} else if assignedTo(in.groupID, idx, id, partialPeers, in.replication) {
-				out = append(out, idx)
+				push = willPush(in.groupID, idx, in.self, id, in.pushDivisor)
+			} else {
+				push = assignedTo(in.groupID, idx, id, partialPeers, in.replication)
 			}
 		case PushNone:
 			// Requests only.
@@ -435,10 +440,20 @@ func segmentsForPeer(in publishInput, id peer.ID, state PeerState, partialPeers 
 				r = 1
 			}
 			r -= holders[idx]
-			if r > 0 && assignedTo(in.groupID, idx, id, partialPeers, r) {
-				out = append(out, idx)
-			}
+			push = r > 0 && assignedTo(in.groupID, idx, id, partialPeers, r)
 		}
+		if !push {
+			continue
+		}
+		if in.pastPushWindow {
+			// Late, a blank peer state may be forgotten rather than empty: announce, let it ask.
+			late++
+			continue
+		}
+		out = append(out, idx)
+	}
+	if late > 0 && in.onPastWindow != nil {
+		in.onPastWindow(late)
 	}
 	return out
 }

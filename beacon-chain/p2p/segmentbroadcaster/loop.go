@@ -117,6 +117,12 @@ func (b *Broadcaster) retryIncomplete() {
 		keys = append(keys, k)
 		ages = append(ages, now.Sub(l.created))
 	}
+	// By GroupTTL the reassembler has let the group go too; a group obtained again is new.
+	for g, at := range b.firstHeld {
+		if now.Sub(at) > b.cfg.GroupTTL {
+			delete(b.firstHeld, g)
+		}
+	}
 	b.mu.Unlock()
 	if r == nil {
 		return
@@ -160,7 +166,9 @@ func (b *Broadcaster) publishGroup(k groupKey) error {
 	groupID := []byte(k.group)
 	held, ok := r.Held(groupID)
 	var required uint32
+	pastWindow := false
 	if ok {
+		pastWindow = b.pastPushWindow(groupID)
 		// The reassembler is now the authority on this group's shape.
 		b.forgetAnnounced(k)
 		if d, _, dok := r.Descriptor(groupID); dok {
@@ -231,10 +239,28 @@ func (b *Broadcaster) publishGroup(k groupKey) error {
 		onWithheld: func(k int) {
 			b.bump(func(c *Counters) { c.ServesWithheld += k })
 		},
+		pastPushWindow: pastWindow,
+		onPastWindow: func(k int) {
+			b.bump(func(c *Counters) { c.PushesPastWindow += k })
+		},
 		compress: b.cfg.CompressSegments,
 	}
 	b.bump(func(c *Counters) { c.PublishPasses++ })
 	return publish(k.topic, groupID, publishActions(in))
+}
+
+// pastPushWindow reports whether a held group is past PushWindow, starting its clock on the
+// first pass that finds it held: right after the first segment is buffered or published.
+func (b *Broadcaster) pastPushWindow(groupID []byte) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	first, ok := b.firstHeld[string(groupID)]
+	if !ok {
+		b.firstHeld[string(groupID)] = now
+		return false
+	}
+	return now.Sub(first) >= b.cfg.PushWindow
 }
 
 // recordSend counts what a publish pass actually put on the wire.

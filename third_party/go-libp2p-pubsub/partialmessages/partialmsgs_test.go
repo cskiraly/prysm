@@ -1429,3 +1429,100 @@ func FuzzPeerInitiatedCounter(f *testing.F) {
 		}
 	})
 }
+
+// TestPublishActionUrgentReachesRouter checks that PublishAction.Urgent is what the router is
+// told, per action. A metadata-only update's whole value is timeliness, so it rides the lane
+// IDONTWANT uses; a data frame must not, or it would overtake queued data.
+func TestPublishActionUrgentReachesRouter(t *testing.T) {
+	topic := "test-topic"
+	const p1, p2 = peer.ID("1"), peer.ID("2")
+
+	var gotUrgent map[peer.ID]bool
+	router := testRouter{
+		sendRPC: func(p peer.ID, _ *pubsub_pb.PartialMessagesExtension, urgent bool) {
+			gotUrgent[p] = urgent
+		},
+		meshPeers: func(string) iter.Seq[peer.ID] {
+			return func(yield func(peer.ID) bool) {
+				for _, p := range []peer.ID{p1, p2} {
+					if !yield(p) {
+						return
+					}
+				}
+			}
+		},
+	}
+	handler := PartialMessagesExtension[peerState]{
+		Logger:        slog.Default(),
+		OnEmitGossip:  func(string, []byte, []peer.ID, map[peer.ID]peerState) {},
+		OnIncomingRPC: func(peer.ID, map[peer.ID]peerState, *pubsub_pb.PartialMessagesExtension) error { return nil },
+	}
+	if err := handler.Init(&router); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		urgent map[peer.ID]bool
+	}{
+		{name: "none urgent", urgent: map[peer.ID]bool{p1: false, p2: false}},
+		{name: "metadata urgent", urgent: map[peer.ID]bool{p1: true, p2: false}},
+		{name: "all urgent", urgent: map[peer.ID]bool{p1: true, p2: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotUrgent = make(map[peer.ID]bool)
+			err := handler.PublishPartial(topic, []byte("g"), func(_ map[peer.ID]peerState, _ func(peer.ID) bool) iter.Seq2[peer.ID, PublishAction] {
+				return func(yield func(peer.ID, PublishAction) bool) {
+					for _, p := range []peer.ID{p1, p2} {
+						act := PublishAction{EncodedPartsMetadata: []byte("meta"), Urgent: tc.urgent[p]}
+						if !yield(p, act) {
+							return
+						}
+					}
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotUrgent, tc.urgent) {
+				t.Fatalf("router saw %v, want %v", gotUrgent, tc.urgent)
+			}
+		})
+	}
+}
+
+func TestMeshPeersReadsTheRouter(t *testing.T) {
+	const p1, p2 = peer.ID("1"), peer.ID("2")
+	router := testRouter{
+		meshPeers: func(topic string) iter.Seq[peer.ID] {
+			return func(yield func(peer.ID) bool) {
+				if topic != "t" {
+					return
+				}
+				for _, p := range []peer.ID{p1, p2} {
+					if !yield(p) {
+						return
+					}
+				}
+			}
+		},
+	}
+	handler := PartialMessagesExtension[peerState]{
+		Logger:        slog.Default(),
+		OnEmitGossip:  func(string, []byte, []peer.ID, map[peer.ID]peerState) {},
+		OnIncomingRPC: func(peer.ID, map[peer.ID]peerState, *pubsub_pb.PartialMessagesExtension) error { return nil },
+	}
+	if err := handler.Init(&router); err != nil {
+		t.Fatal(err)
+	}
+	var got []peer.ID
+	for p := range handler.MeshPeers("t") {
+		got = append(got, p)
+	}
+	if len(got) != 2 || got[0] != p1 || got[1] != p2 {
+		t.Fatalf("MeshPeers(t) = %v, want [%s %s]", got, p1, p2)
+	}
+	for range handler.MeshPeers("other") {
+		t.Fatal("MeshPeers(other) yielded a peer")
+	}
+}

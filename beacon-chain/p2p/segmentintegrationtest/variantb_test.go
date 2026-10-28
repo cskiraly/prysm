@@ -4,10 +4,11 @@ package segmentintegrationtest
 //
 // What this establishes, and what it deliberately does not. It establishes that the mechanism
 // works over a real simulated network -- negotiation, bitmap exchange, push, pull, reassembly,
-// authentication -- and it reports the quantity the design is judged on: bytes received per node.
-// It does not yet establish the Q13 result. Two known harness gaps stand in the way: connectivity
-// degree still equals D, so there are no non-mesh peers and the announce path to them is untested,
-// and the mesh arms have no warm-up so everything here includes QUIC slow start.
+// authentication -- and it reports the quantity the design is judged on: bytes received per
+// node. It does not yet establish the Q13 result. Two harness gaps stand in the way:
+// connectivity degree still equals D, so there are no non-mesh
+// peers and the announce path to them is untested, and the mesh arms have no warm-up so
+// everything here includes QUIC slow start.
 //
 // The three arms are the policy knob, not three designs. See segmentbroadcaster.Policy.
 
@@ -19,7 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -38,11 +38,41 @@ import (
 // variantBNode is one node's variant B machinery.
 type variantBNode struct {
 	broadcaster *segmentbroadcaster.Broadcaster
-	// done closes when this node has reassembled the envelope: every group, when the payload
-	// travels as several groups on several topics (SEGMENT_B_GROUPS).
-	done      chan struct{}
-	once      sync.Once
-	remaining atomic.Int32 // groups still to reassemble before done closes
+	mu          sync.Mutex
+	// done closes when this node has reassembled the current message: every group, when the
+	// payload travels as several groups on several topics (SEGMENT_B_GROUPS). Re-armed per message.
+	done chan struct{}
+	left [][]byte // the current message's groups not yet reassembled
+}
+
+// arm starts the node on a message whose groups are parts: a fresh done channel, every group out.
+func (node *variantBNode) arm(parts [][]byte) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	node.done = make(chan struct{})
+	node.left = append([][]byte(nil), parts...)
+}
+
+// reassembled counts an envelope toward the current message; an earlier message's counts for none.
+func (node *variantBNode) reassembled(envelope []byte) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	for i, p := range node.left {
+		if bytes.Equal(p, envelope) {
+			node.left = append(node.left[:i], node.left[i+1:]...)
+			if len(node.left) == 0 {
+				close(node.done)
+			}
+			return
+		}
+	}
+}
+
+// completed is the current message's done channel.
+func (node *variantBNode) completed() <-chan struct{} {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	return node.done
 }
 
 // splitPayload cuts the payload into g contiguous parts of near-equal length, each a group of
@@ -99,7 +129,7 @@ func segmentMessagesFor(t *testing.T, sk bls.SecretKey, slot primitives.Slot, pa
 // payload commits to, so a descriptor that would be refused on the network is refused here.
 // Nothing in this path is stubbed except the commitment lookup, which stands in for the bid
 // field the block will eventually carry.
-func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, pushDivisor int, groups int) []*variantBNode {
+func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, pushDivisor int) []*variantBNode {
 	t.Helper()
 	logger := bLogger()
 	withholdSet := failWithholdSet(t, n)
@@ -110,7 +140,7 @@ func newVariantBNodes(t *testing.T, n int, policy segmentbroadcaster.Policy, rep
 	}
 	out := make([]*variantBNode, n)
 	for i := range out {
-		out[i] = newVariantBNode(logger, policy, replication, pushDivisor, withholdSet[i], groups)
+		out[i] = newVariantBNode(logger, policy, replication, pushDivisor, withholdSet[i])
 	}
 	return out
 }
@@ -127,9 +157,9 @@ func bLogger() *logrus.Logger {
 }
 
 // newVariantBNode is one node's broadcaster on the cell's policy and knobs; withhold puts it on
-// the withholding set, groups is how many envelopes complete it. The in-process cell builds
-// every node; the Shadow node, one process per node, builds its own.
-func newVariantBNode(logger *logrus.Logger, policy segmentbroadcaster.Policy, replication, pushDivisor int, withhold bool, groups int) *variantBNode {
+// the withholding set. The in-process cell builds every node; the Shadow node, one process per
+// node, builds its own.
+func newVariantBNode(logger *logrus.Logger, policy segmentbroadcaster.Policy, replication, pushDivisor int, withhold bool) *variantBNode {
 	node := &variantBNode{
 		done: make(chan struct{}),
 		broadcaster: segmentbroadcaster.New(context.Background(), logger, segmentbroadcaster.Config{
@@ -144,6 +174,9 @@ func newVariantBNode(logger *logrus.Logger, policy segmentbroadcaster.Policy, re
 			// on the same reasoning as RequestTimeout -- and past it everything missing is
 			// requested regardless, so a lost push cannot strand a segment.
 			PushGrace: envDuration("SEGMENT_PUSH_GRACE_MS", 16*defaultLatency),
+			// How long after first holding a group a node still pushes it unasked; past it,
+			// requests only. Zero keeps the package default, three gossip heartbeats.
+			PushWindow: envDuration("SEGMENT_PUSH_WINDOW_MS", 0),
 			// The request timeout has to cover a round trip *plus* the time for the peer
 			// to transmit everything asked of it, not just a round trip. Here that is
 			// 50 ms RTT + 512 KB at 50 Mbps = ~132 ms at minimum, and more when several
@@ -182,7 +215,6 @@ func newVariantBNode(logger *logrus.Logger, policy segmentbroadcaster.Policy, re
 			CompressSegments: os.Getenv("SEGMENT_PARTIAL_COMPRESS") != "",
 		}),
 	}
-	node.remaining.Store(int32(max(groups, 1))) // lint:ignore uintcast -- a small env count
 	return node
 }
 
@@ -277,14 +309,15 @@ func TestVariantBDiffusion(t *testing.T) {
 // out of TestVariantBDiffusion so the Shadow node builds the same groups from the same knobs.
 type bCell struct {
 	segmentSize  int
-	payload      []byte
+	payloadLen   int
+	payload      []byte // message 1's
 	policies     []segmentbroadcaster.Policy
 	replications []int
 	parities     []int
 	pushDivisor  int
 	groups       int
 	pk           []byte
-	slot         primitives.Slot
+	slot         primitives.Slot // message 1's
 }
 
 // bCellFromEnv reads the cell's knobs. params.SetupTestConfigCleanup must have run.
@@ -336,6 +369,7 @@ func bCellFromEnv(t *testing.T) bCell {
 	sk, err := bls.RandKey()
 	require.NoError(t, err)
 	c.pk = sk.PublicKey().Marshal()
+	c.payloadLen = payloadLen
 	c.payload = mainnetLikePayload(payloadLen, 11)
 	c.policies = []segmentbroadcaster.Policy{
 		segmentbroadcaster.PushSplit,
@@ -361,38 +395,55 @@ func bCellFromEnv(t *testing.T) bCell {
 	return c
 }
 
-// variant is the cell's variant B at n nodes on one policy, replication and parity: the payload
-// cut into groups and each group's segment messages.
-func (c bCell) variant(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, parity int) *variantB {
+// bMessage is one message of a cell as variant B carries it: the payload cut into groups and
+// each group's segment messages.
+type bMessage struct {
+	payload     []byte
+	slot        primitives.Slot
+	parts       [][]byte
+	msgsByGroup [][]*segments.SegmentMessage
+	wireBytes   int
+}
+
+// message builds message m at one parity. Message 1 is the single-message cell's payload; each
+// later message of a multi-message cell has its own content and slot on variant A's scheme
+// (q6cell_test.go), so its group ids are new to the reassemblers and the partial-message state.
+func (c bCell) message(t *testing.T, m, parity int) bMessage {
 	t.Helper()
-	parts := splitPayload(c.payload, c.groups)
-	msgsByGroup := make([][]*segments.SegmentMessage, 0, c.groups)
-	wireBytes := 0
-	for _, part := range parts {
-		msgs := segmentMessagesFor(t, nil, c.slot, part, c.segmentSize, parity)
+	msg := bMessage{payload: c.payload, slot: c.slot}
+	if m > 1 {
+		msg.payload, msg.slot = mainnetLikePayload(c.payloadLen, uint64(1000+m)), primitives.Slot(4096+m) // lint:ignore uintcast -- m is a small positive message number.
+	}
+	msg.parts = splitPayload(msg.payload, c.groups)
+	msg.msgsByGroup = make([][]*segments.SegmentMessage, 0, c.groups)
+	for _, part := range msg.parts {
+		msgs := segmentMessagesFor(t, nil, msg.slot, part, c.segmentSize, parity)
 		require.Equal(t, true, len(msgs) > 1)
-		msgsByGroup = append(msgsByGroup, msgs)
-		for _, m := range msgs {
-			enc, err := m.Marshal()
+		msg.msgsByGroup = append(msg.msgsByGroup, msgs)
+		for _, sm := range msgs {
+			enc, err := sm.Marshal()
 			require.NoError(t, err)
-			wireBytes += len(enc)
+			msg.wireBytes += len(enc)
 		}
 	}
-	return &variantB{
+	return msg
+}
+
+// variant is the cell's variant B at n nodes on one policy, replication and parity, on message 1.
+func (c bCell) variant(t *testing.T, n int, policy segmentbroadcaster.Policy, replication, parity int) *variantB {
+	t.Helper()
+	v := &variantB{
 		n:           n,
 		unit:        c.segmentSize,
-		wireBytes:   wireBytes,
 		replication: replication,
 		pushDivisor: c.pushDivisor,
 		policy:      policy,
 		pk:          c.pk,
-		slot:        c.slot,
-		payload:     c.payload,
 		groups:      c.groups,
-		parts:       parts,
-		msgs:        msgsByGroup[0],
-		msgsByGroup: msgsByGroup,
+		build:       func(t *testing.T, m int) bMessage { return c.message(t, m, parity) },
 	}
+	v.use(t, c.message(t, 1, parity))
+	return v
 }
 
 type variantB struct {
@@ -410,6 +461,55 @@ type variantB struct {
 	msgs        []*segments.SegmentMessage   // the first group's messages (the single group's, usually)
 	msgsByGroup [][]*segments.SegmentMessage // every group's messages, in topic order
 	nodes       []*variantBNode              // built lazily on the first pubsubOpts call, inside the bubble
+	// build makes message m, for multi-message cells.
+	build func(t *testing.T, m int) bMessage
+	// base is each node's broadcaster counters at the switch to the current message; nil on message 1.
+	base []segmentbroadcaster.Counters
+	// mu guards what the broadcaster loops read while the driver switches messages.
+	mu sync.Mutex
+	// commits and known are every message's commitments and groups so far: an earlier message's
+	// commitment stays valid, as an earlier slot's bid does.
+	commits []segmentauth.CommittedGroups
+	known   [][]byte
+}
+
+// use makes msg the variant's current message and admits its groups.
+func (v *variantB) use(t *testing.T, msg bMessage) {
+	t.Helper()
+	v.payload, v.slot, v.parts, v.wireBytes = msg.payload, msg.slot, msg.parts, msg.wireBytes
+	v.msgs, v.msgsByGroup = msg.msgsByGroup[0], msg.msgsByGroup
+	commit := commitmentForGroups(t, msg.msgsByGroup)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.commits = append(v.commits, commit)
+	v.known = append(v.known, msg.parts...)
+}
+
+// committed admits a group of any message so far.
+func (v *variantB) committed(group []byte) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, c := range v.commits {
+		if c(group) {
+			return true
+		}
+	}
+	return false
+}
+
+// nextMessage switches the variant to message m of a multi-message cell: its groups admitted,
+// every node re-armed on them, the counters windowed to it. The publisher's broadcaster is the
+// one started as publisher, so it stays node 0.
+func (v *variantB) nextMessage(t *testing.T, m, pub int) {
+	if pub != 0 {
+		t.Fatalf("variant B publishes from node 0 only; SEGMENT_PUBLISHER=rotate asked for node %d", pub)
+	}
+	v.use(t, v.build(t, m))
+	v.base = make([]segmentbroadcaster.Counters, len(v.nodes))
+	for i, node := range v.nodes {
+		v.base[i] = node.broadcaster.Counters()
+		node.arm(v.parts)
+	}
 }
 
 func (v *variantB) name() string { return "variantB" }
@@ -425,6 +525,55 @@ func (v *variantB) wireForm() wireForm {
 	return w
 }
 
+// partialObserve and segKeys make B visible to the diffusion instrument. B's segments ride in
+// rpc.Partial, so neither the message-id path nor DeliverMessage sees them: before this, B's
+// curves were empty in both columns, not just the heard one.
+func (v *variantB) partialObserve() partialObserveFn { return partialSegmentObserver() }
+
+// segKeys is every group's segments in index order, groups in topic order -- the same summing
+// convention wireForm uses, so a multi-group cell reads back whole rather than as group 0.
+func (v *variantB) segKeys() []string {
+	out := make([]string, 0, len(v.msgsByGroup)*len(v.msgs))
+	for _, msgs := range v.msgsByGroup {
+		h, err := segments.HasherByID(msgs[0].Descriptor.HashID)
+		if err != nil {
+			return nil
+		}
+		out = append(out, partialSegKeys(msgs[0].Descriptor.GroupID(h), len(msgs))...)
+	}
+	return out
+}
+
+// reportDiffusion writes the cell's per-segment curves, keyed on the partial path.
+func (v *variantB) reportDiffusion(t *testing.T, s diffusionStats) {
+	out := diffusionOut()
+	if !diffusionCurves() || out == "" {
+		return
+	}
+	if s.msg > 1 {
+		out = fmt.Sprintf("%s.m%d", out, s.msg)
+	}
+	keys := v.segKeys()
+	if len(keys) == 0 {
+		t.Logf("      per-segment curves: no keys for this arm; not written")
+		return
+	}
+	need := 0
+	for _, msgs := range v.msgsByGroup {
+		need += int(msgs[0].Descriptor.Required()) // lint:ignore uintcast -- bounded by MaxSegments.
+	}
+	mx := diffusionMatrix{Arm: "variantB/" + v.policy.String(), N: s.n, Segments: len(keys), Need: need}
+	for _, tr := range s.tracers {
+		got, heard := segmentDiffusion(tr, wireArm{}, keys, s.startAt)
+		mx.FirstGot = append(mx.FirstGot, got)
+		mx.Heard = append(mx.Heard, heard)
+	}
+	if err := writeDiffusionMatrix(out, mx); err != nil {
+		t.Fatalf("writing the diffusion matrix: %v", err)
+	}
+	t.Logf("      per-segment curves: %d nodes x %d segments -> %s", len(mx.FirstGot), mx.Segments, out)
+}
+
 // topicNames is the envelope topic for a single group, or one topic per group.
 func (v *variantB) topicNames() []string {
 	if v.groups <= 1 {
@@ -437,9 +586,11 @@ func (v *variantB) topicNames() []string {
 	return out
 }
 
-// isPart reports whether a reassembled envelope is one of the payload's groups.
+// isPart reports whether a reassembled envelope is one of the groups of any message so far.
 func (v *variantB) isPart(envelope []byte) bool {
-	for _, p := range v.parts {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for _, p := range v.known {
 		if bytes.Equal(p, envelope) {
 			return true
 		}
@@ -454,7 +605,7 @@ func (v *variantB) pubsubOpts(t *testing.T, i int) []pubsub.Option {
 	// bubble never counts as a durable block, so synctest could not advance virtual time and every
 	// cell would crawl in real time. The driver adds the tracer to what AppendPubSubOpts returns.
 	if v.nodes == nil {
-		v.nodes = newVariantBNodes(t, v.n, v.policy, v.replication, v.pushDivisor, v.groups)
+		v.nodes = newVariantBNodes(t, v.n, v.policy, v.replication, v.pushDivisor)
 	}
 	return v.nodes[i].broadcaster.AppendPubSubOpts(nil)
 }
@@ -477,20 +628,21 @@ func (v *variantB) setup(t *testing.T, nw *simNetwork, _ diffusionParams) diffus
 	return r
 }
 
-// startNode starts a node's broadcaster loop on wg, with the cell's commitment and the
-// completion rule: one envelope callback per group, done when every group is in. The loop is
-// stopped inside the bubble by the run's cancel: a goroutine still running when the bubble
-// exits is a deadlock panic, not a leak warning.
+// startNode starts a node's broadcaster loop on wg, with the cell's commitments and the
+// completion rule: one envelope callback per group, done when every group of the current
+// message is in. The loop is stopped inside the bubble by the run's cancel: a goroutine still
+// running when the bubble exits is a deadlock panic, not a leak warning.
 func (v *variantB) startNode(t *testing.T, node *variantBNode, isPublisher bool, wg *sync.WaitGroup) {
+	node.arm(v.parts)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		err := node.broadcaster.Start(segmentbroadcaster.Callbacks{
-			Auth: segmentauth.New(commitmentForGroups(t, v.msgsByGroup)),
+			Auth: segmentauth.New(v.committed),
 			OnEnvelope: func(envelope []byte) error {
 				require.Equal(t, true, v.isPart(envelope))
-				if !isPublisher && node.remaining.Add(-1) == 0 {
-					node.once.Do(func() { close(node.done) })
+				if !isPublisher {
+					node.reassembled(envelope)
 				}
 				return nil
 			},
@@ -543,7 +695,7 @@ func (v *variantB) onTimeout(t *testing.T, completed, n int) {
 	// announces, of served segments, or of request budget, and by the next run the state is gone.
 	for i := 1; i < n; i++ {
 		select {
-		case <-v.nodes[i].done:
+		case <-v.nodes[i].completed():
 		default:
 			// Diagnostic only -- the driver fails the test after the censored report.
 			t.Logf("node %d never reassembled the envelope; %d/%d completed; stuck counters %+v",
@@ -554,15 +706,20 @@ func (v *variantB) onTimeout(t *testing.T, completed, n int) {
 }
 
 func (v *variantB) report(t *testing.T, s diffusionStats) {
+	v.reportDiffusion(t, s)
 	// Censored cells still report: onTimeout already failed the test.
-	var pushed, served, requested, received, reissued int
-	for _, node := range v.nodes {
-		c := node.broadcaster.Counters()
-		pushed += c.SegmentsPushed
-		served += c.SegmentsServed
-		requested += c.SegmentsRequested
-		received += c.SegmentsReceived
-		reissued += c.RequestsReissued
+	var pushed, served, requested, received, reissued, late int
+	for i, node := range v.nodes {
+		c, b := node.broadcaster.Counters(), segmentbroadcaster.Counters{}
+		if v.base != nil {
+			b = v.base[i] // this message's share of a multi-message cell's totals
+		}
+		pushed += c.SegmentsPushed - b.SegmentsPushed
+		served += c.SegmentsServed - b.SegmentsServed
+		requested += c.SegmentsRequested - b.SegmentsRequested
+		received += c.SegmentsReceived - b.SegmentsReceived
+		reissued += c.RequestsReissued - b.RequestsReissued
+		late += c.PushesPastWindow - b.PushesPastWindow
 	}
 	// The headline number: how many copies of the payload a node takes in. Variant A measured 6.3
 	// here, and that was the binding constraint. Normalised by the *required* count, so a coded
@@ -581,9 +738,16 @@ func (v *variantB) report(t *testing.T, s diffusionStats) {
 		v.policy.String(), s.n, required, planned, s.virt.Round(time.Millisecond),
 		completionStats(s.compTimes, s.n-1, s.deadline),
 		pushed, served, requested, received, copiesPerNode)
-	t.Logf("        reissued requests %d; partial traffic: tx %d B over %d RPCs, rx %d B over %d RPCs (%.2fx payload rx/node); publisherTx %d B; dropped RPCs %d; full-gossip rx/node %d B; groups %d",
+	// Payload and bitmap signalling on separate lines because they are separate bases. The
+	// copies figure is payload only, as variant A's is; the bitmap bytes are this variant's
+	// control cost and belong beside A's ctrl/node, not inside its copies.
+	t.Logf("        reissued requests %d; partial payload: tx %d B over %d RPCs, rx %d B over %d RPCs (%.2fx payload rx/node); publisherTx %d B; dropped RPCs %d; full-gossip rx/node %d B; groups %d",
 		reissued, s.partialTx, s.partialTxRPCs, s.partialRx, s.partialRPCs,
 		float64(s.partialRx)/float64(s.n)/float64(payloadBytes), s.partialPublisherTx, s.drops, s.rxBytes/s.n, len(v.msgsByGroup))
+	t.Logf("        bitmap signalling: tx %d B, rx %d B (%d B/node rx); gossip control rx/node %d B",
+		s.partialMetaTx, s.partialMetaRx, s.partialMetaRx/s.n, s.ctrlRx/s.n)
+	// None can fall inside PushWindow of publish, so in a cell complete by then all were post-completion.
+	t.Logf("        push window: %d push decisions withheld past it", late)
 
 	switch v.policy {
 	case segmentbroadcaster.PushNone:
@@ -633,14 +797,15 @@ func (r *bRun) cancel() {
 }
 
 func (r *bRun) watch(ctx context.Context, wg *sync.WaitGroup, start time.Time, signal func(int, time.Duration)) {
-	// The broadcaster's OnEnvelope callback closes each node's done channel on reassembly; a
-	// per-node watcher stamps that instant and hands it to the driver's signal.
+	// The broadcaster's OnEnvelope callback closes each node's done channel on reassembly of the
+	// current message; a per-node watcher stamps that instant and hands it to the driver's signal.
 	for i := 1; i < r.n; i++ {
+		done := r.v.nodes[i].completed()
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
 			select {
-			case <-r.v.nodes[idx].done:
+			case <-done:
 				signal(idx, time.Since(start))
 			case <-ctx.Done():
 			}
@@ -666,7 +831,7 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 	msgs := segmentMessagesFor(t, sk, slot, payload, segments.DefaultSegmentSize, 0)
 
 	synctest.Test(t, func(t *testing.T) {
-		nodes := newVariantBNodes(t, 2, segmentbroadcaster.PushNone, 1, 0, 1)
+		nodes := newVariantBNodes(t, 2, segmentbroadcaster.PushNone, 1, 0)
 		nw, stop := newSimNetwork(t, networkConfig{
 			links: uniformLinks(2, defaultRate),
 			edges: line(2),
@@ -681,6 +846,7 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 			wg.Add(1)
 			target := node
 			isPublisher := i == 0
+			target.arm([][]byte{payload})
 			go func() {
 				defer wg.Done()
 				require.NoError(t, target.broadcaster.Start(segmentbroadcaster.Callbacks{
@@ -688,7 +854,7 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 					OnEnvelope: func(envelope []byte) error {
 						require.DeepEqual(t, payload, envelope)
 						if !isPublisher {
-							target.once.Do(func() { close(target.done) })
+							target.reassembled(envelope)
 						}
 						return nil
 					},
@@ -732,7 +898,7 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), networkOpTimeout)
 		defer cancel()
 		select {
-		case <-nodes[1].done:
+		case <-nodes[1].completed():
 		case <-ctx.Done():
 			t.Logf("publisher counters: %+v", nodes[0].broadcaster.Counters())
 			t.Logf("receiver  counters: %+v", nodes[1].broadcaster.Counters())
@@ -753,5 +919,71 @@ func TestVariantBAnnounceThenPull(t *testing.T) {
 		require.Equal(t, len(msgs), recv.SegmentsRequested)
 		require.Equal(t, len(msgs), recv.SegmentsReceived)
 		require.Equal(t, 1, recv.GroupsCompleted)
+	})
+}
+
+// TestVariantBMessages pins the multi-message cell's per-message state: message 1 is the
+// single-message payload, no group id repeats, earlier commitments stay admitted, and an earlier
+// message's envelope never completes a node on the current one.
+func TestVariantBMessages(t *testing.T) {
+	const parity = 2
+	c := bCell{segmentSize: 1 << 14, payloadLen: 1 << 16, groups: 2, slot: primitives.Slot(2048)}
+	c.payload = mainnetLikePayload(c.payloadLen, 11)
+	h, err := segments.HasherByID(segments.HashSHA256)
+	require.NoError(t, err)
+	groupIDs := func(msg bMessage) [][]byte {
+		var out [][]byte
+		for _, msgs := range msg.msgsByGroup {
+			out = append(out, msgs[0].Descriptor.GroupID(h))
+		}
+		return out
+	}
+
+	t.Run("derivation", func(t *testing.T) {
+		require.DeepEqual(t, mainnetLikePayload(c.payloadLen, 11), c.message(t, 1, parity).payload)
+		require.Equal(t, primitives.Slot(2048), c.message(t, 1, parity).slot)
+		require.Equal(t, primitives.Slot(4098), c.message(t, 2, parity).slot)
+		seen := map[string]int{}
+		for m := 1; m <= 3; m++ {
+			ids := groupIDs(c.message(t, m, parity))
+			require.DeepEqual(t, ids, groupIDs(c.message(t, m, parity)))
+			for _, id := range ids {
+				prev, dup := seen[string(id)]
+				require.Equal(t, false, dup, fmt.Sprintf("message %d repeats a group id of message %d", m, prev))
+				seen[string(id)] = m
+			}
+		}
+	})
+
+	t.Run("switch", func(t *testing.T) {
+		v := c.variant(t, 4, segmentbroadcaster.PushPhase, 1, parity)
+		first := c.message(t, 1, parity)
+		v.nextMessage(t, 2, 0)
+		second := c.message(t, 2, parity)
+		for _, id := range append(groupIDs(first), groupIDs(second)...) {
+			require.Equal(t, true, v.committed(id))
+		}
+		require.Equal(t, false, v.committed(make([]byte, 32)))
+		require.Equal(t, true, v.isPart(first.parts[0]))
+		require.Equal(t, true, v.isPart(second.parts[1]))
+		require.DeepEqual(t, second.payload, v.payload)
+
+		node := &variantBNode{}
+		node.arm(v.parts)
+		for _, p := range first.parts {
+			node.reassembled(p)
+		}
+		node.reassembled(second.parts[0])
+		select {
+		case <-node.completed():
+			t.Fatal("message 2 completed before its last group")
+		default:
+		}
+		node.reassembled(second.parts[1])
+		select {
+		case <-node.completed():
+		default:
+			t.Fatal("message 2 did not complete on its last group")
+		}
 	})
 }

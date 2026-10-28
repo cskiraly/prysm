@@ -14,7 +14,7 @@ func TestCodelQueueDropsPersistentBadQueue(t *testing.T) {
 			target   = 5 * time.Millisecond
 			interval = 100 * time.Millisecond
 		)
-		q := newCoDelQueue(target, interval)
+		q := newCoDelQueue(target, interval, &queueStats{})
 		q.MTU = 1
 
 		// Build a queue that stays full for more than one interval.
@@ -58,7 +58,7 @@ func TestCodelQueueNoDropOnTransientQueue(t *testing.T) {
 			target   = 5 * time.Millisecond
 			interval = 100 * time.Millisecond
 		)
-		q := newCoDelQueue(target, interval)
+		q := newCoDelQueue(target, interval, &queueStats{})
 		q.MTU = 1
 
 		for i := range 2 {
@@ -101,7 +101,7 @@ func BenchmarkCodelQueueEnqueueDequeue(b *testing.B) {
 		packets[i] = &Packet{buf: data}
 	}
 
-	q := newCoDelQueue(5*time.Millisecond, 100*time.Millisecond)
+	q := newCoDelQueue(5*time.Millisecond, 100*time.Millisecond, &queueStats{})
 	for _, p := range packets {
 		q.Enqueue(p)
 	}

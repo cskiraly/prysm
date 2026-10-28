@@ -64,6 +64,11 @@ type NetworkConfig struct {
 type Network struct {
 	Hosts   []host.Host
 	Pubsubs []*pubsub.PubSub
+	// Sim is the simulated network itself, kept for its link counters: Sim.LinkStats()[i] is
+	// node i's uplink and downlink queue statistics, including CoDel drops. Drops were
+	// invisible until 2026-09-20, which matters most on thin links -- precisely where a
+	// heterogeneity sweep spends its time.
+	Sim *simnet.Simnet
 }
 
 func (s *Network) Len() int { return len(s.Hosts) }
@@ -121,7 +126,7 @@ func New(t *testing.T, cfg NetworkConfig) (*Network, func()) {
 	}
 	opts = append(opts, cfg.PubsubOpts...)
 
-	out := &Network{Hosts: meta.Nodes, Pubsubs: make([]*pubsub.PubSub, n)}
+	out := &Network{Hosts: meta.Nodes, Pubsubs: make([]*pubsub.PubSub, n), Sim: network}
 	for i, h := range meta.Nodes {
 		nodeOpts := opts
 		if cfg.PerNodeOpts != nil {
@@ -200,10 +205,10 @@ func JoinAndSubscribe(t *testing.T, nw *Network, topicStr string, wallClock bool
 // StartBackgroundTraffic makes every node flood a separate gossip topic with random-entropy
 // messages for the run's duration, so the payload under study competes with co-resident load for
 // the same per-node uplinks and outbound queues -- the pressure a single payload cannot create
-// (F2b finding, standing in for attestation, blob and DAS gossip). interval and msgBytes set each
-// node's own publish cadence and size; the aggregate seen by any node is that times its mesh
-// in-degree, as with real gossip. Returns a stop func and a per-node sent-bytes counter for
-// verified exposure. A non-positive interval is a no-op.
+// (F2b finding, standing in for attestation, blob and
+// DAS gossip). interval and msgBytes set each node's own publish cadence and size; the aggregate
+// seen by any node is that times its mesh in-degree, as with real gossip. Returns a stop func and
+// a per-node sent-bytes counter for verified exposure. A non-positive interval is a no-op.
 //
 // The publisher goroutines live in the caller's synctest bubble and must be stopped before it
 // exits: cancel the returned context, then the caller's own defer wg.Wait already drains them.

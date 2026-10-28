@@ -42,6 +42,24 @@ type phaseForwarding struct {
 	srcMode   PhaseSourceMode
 	srcDelay  time.Duration
 	srcDegree int
+	// srcPushDegree > 0 replaces the push degree for the publisher's own messages; the peers
+	// not pushed are announced as usual (the source's second copy of a
+	// frame races only its own first copy, since nobody else holds the frame yet).
+	srcPushDegree int
+	// srcPushQuota > 0 caps the frames of one group the publisher pushes to each mesh peer; its
+	// other frames are offered, each to the peers it has pushed and offered least, so each mesh
+	// peer pulls a share as it pulls from a relay (WithPhaseSourcePushQuota). srcLoad counts, per
+	// recent group, what each peer was pushed and offered.
+	srcPushQuota int
+	srcLoad      map[string]map[peer.ID]*srcPeerLoad
+	srcLoadRoots []string
+	// srcOfferPace > 0 holds the publisher's offers of its own frames until the frames it has named,
+	// pushed or offered, are below srcOfferNeed times the time since publish over the pace, so its
+	// HAVE, which names them, grows as a relay's does (WithPhaseSourceOfferPace).
+	srcOfferPace  time.Duration
+	srcOfferNeed  int
+	srcOffers     map[string]*srcOfferQueue
+	srcOfferRoots []string
 
 	// Meshless mode dissolves the topic mesh's role in forwarding: push candidates are all
 	// connected gossipsub-capable topic peers rather than the mesh, ranked per message as
@@ -59,12 +77,53 @@ type phaseForwarding struct {
 	// sender's pushes across messages, at the price of predictability.
 	selRR bool
 	rrCtr atomic.Uint64
+	// sel=fewest pushes to the mesh peers known to hold the fewest frames of the message's
+	// group -- what they announced in HAVE bitmaps or we pushed them -- ties by the rank hash.
+	selFewest bool
+	// selBacklog, when positive, ranks a peer with more than this many bytes still queued from us
+	// after every peer below it: a straggler looks furthest behind because it drains slowly.
+	selBacklog int64
+	// selGrace, when positive, ranks last a peer unproven for the group: pushed at least degree
+	// frames, the first more than selGrace ago, and no HAVE or hose ack from it for the group.
+	selGrace time.Duration
+	// selDemoted, when set, hears each (peer, root) pair the first time the guard demotes it.
+	selDemoted func(p peer.ID, root string)
+	// selTolerance, when set, replaces sel=fewest's argmax on relayed messages by a draw that caps
+	// what an under-reporting peer can take (WithPhaseSelectFewestTolerant); selFrames is the
+	// group's frame count the proportional draw measures deficits against.
+	selTolerance PhaseSelectTolerance
+	selFrames    int
+	// selKeys caches each peer's run-stable sort key for the seeded draw.
+	selKeys map[peer.ID]string
 
 	// Fixed budget switches the phase transition off and keeps only the split: push to at
 	// most degree of the mesh peers not known to hold the message and announce to the rest,
 	// without the known-holder count shrinking the push. Isolates the announce-instead-of-
 	// push half of phase forwarding from the estimator half.
 	fixedBudget bool
+
+	// srcConnections widens the publisher's own push candidates from the mesh to every
+	// connected topic peer, so a fast source spreads distinct frames over all its first-hop
+	// uplinks; the announce stays mesh-scoped.
+	srcConnections bool
+}
+
+// WithPhaseSourceConnections makes the publisher rank its own messages over every connected
+// gossipsub topic peer instead of its mesh, pushing to the phase degree (or the source push
+// degree) and announcing only to mesh peers not pushed. Relays keep mesh-scoped candidates.
+// Must follow WithPhaseForwarding.
+func WithPhaseSourceConnections() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase source connections requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("phase source connections requires WithPhaseForwarding first")
+		}
+		gs.phaseForward.srcConnections = true
+		return nil
+	}
 }
 
 // WithPhaseFixedBudget keeps phase forwarding's split (push r, announce the rest) but drops
@@ -97,6 +156,260 @@ func WithPhaseSelectRR() Option {
 		gs.phaseForward.selRR = true
 		return nil
 	}
+}
+
+// WithPhaseSelectFewest switches phase forwarding's push-target selection to sel=fewest: the
+// mesh peers known to hold the fewest frames of the message's group go first, so a push lands
+// where the receiver can forward it at once (the Earliest-Latest peer rule of Abeni, Kiraly,
+// Lo Cigno, NETWORKING 2009, on group state). Requires WithPhaseForwarding and WithHaveBitmaps;
+// without the IHAVE side only the peers' HAVEs count, not our own pushes.
+func WithPhaseSelectFewest() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase selection requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("phase selection requires WithPhaseForwarding first")
+		}
+		if gs.have == nil {
+			return fmt.Errorf("sel=fewest requires WithHaveBitmaps first")
+		}
+		gs.phaseForward.selFewest = true
+		return nil
+	}
+}
+
+// WithPhaseSelectFewestBacklog is sel=fewest with a backlog guard: a mesh peer with more than
+// maxBytes still queued from us ranks after every peer at or below it, fewest-first inside each
+// class. ELp pushes to the peer that can forward at once; a straggler looks furthest behind
+// because it drains slowly, and every pusher would otherwise feed it. Requires
+// WithPhaseSelectFewest.
+func WithPhaseSelectFewestBacklog(maxBytes int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase selection requires a gossipsub router")
+		}
+		if gs.phaseForward == nil || !gs.phaseForward.selFewest {
+			return fmt.Errorf("the backlog guard requires WithPhaseSelectFewest first")
+		}
+		if maxBytes <= 0 {
+			return fmt.Errorf("the backlog guard needs a positive byte threshold")
+		}
+		gs.phaseForward.selBacklog = maxBytes
+		return nil
+	}
+}
+
+// WithPhaseSelectFewestGuard is sel=fewest with a proof guard against the mute peer, which
+// sends no HAVE and so looks furthest behind to every pusher: a mesh peer we pushed at least the
+// phase degree's frames of a group, the first more than grace ago, that has sent no HAVE bitmap
+// or hose ack for the group ranks with the backlogged class, last. Honest peers prove within a
+// round trip. demoted, when non-nil, is called on the event loop the first time each (peer,
+// root) pair is demoted. Requires WithPhaseSelectFewest and the IHAVE bitmap side, which records
+// our pushes.
+func WithPhaseSelectFewestGuard(grace time.Duration, demoted func(p peer.ID, root string)) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase selection requires a gossipsub router")
+		}
+		if gs.phaseForward == nil || !gs.phaseForward.selFewest {
+			return fmt.Errorf("the proof guard requires WithPhaseSelectFewest first")
+		}
+		if !gs.have.ihaveOn {
+			return fmt.Errorf("the proof guard requires WithHaveAnnounceBitmaps first")
+		}
+		if grace <= 0 {
+			return fmt.Errorf("the proof guard needs a positive grace")
+		}
+		gs.phaseForward.selGrace = grace
+		gs.phaseForward.selDemoted = demoted
+		return nil
+	}
+}
+
+// PhaseSelectTolerance is how sel=fewest picks its push targets among the mesh peers that appear
+// furthest behind.
+type PhaseSelectTolerance int
+
+const (
+	// PhaseSelectArgmax pushes to the peers that appear to hold the fewest frames: the default.
+	PhaseSelectArgmax PhaseSelectTolerance = iota
+	// PhaseSelectLowerHalf draws uniformly among the peers at or below the median apparent
+	// holding.
+	PhaseSelectLowerHalf
+	// PhaseSelectProportional draws with probability proportional to the frames of the group a
+	// peer appears to lack.
+	PhaseSelectProportional
+)
+
+// WithPhaseSelectFewestTolerant replaces sel=fewest's argmax with a draw that bounds what a peer
+// can take by under-reporting. What a pusher knows of a peer is what the peer said plus what the
+// pusher sent it, so a peer that reports only the latter wins every argmax and passes every local
+// proof; a draw caps its share near its fair share whatever it claims. PhaseSelectLowerHalf draws
+// uniformly among the peers at or below the median apparent holding, so an under-reporter takes
+// at most budget / ceil(half) of the draws; PhaseSelectProportional draws each target with
+// probability proportional to frames less its apparent holding, which needs the group's frame
+// count. Both draw only among the peers the backlog and proof guards leave in the first class, in
+// the degree the phase grants, and fill any budget the draw leaves from the fewest order; the
+// seeded source of WithDeterministicRand is used when set. The publisher's own messages keep the
+// argmax: it ranks its batch at publish time on its own pushes alone, before any peer has
+// reported anything for the group. Requires WithPhaseSelectFewest.
+func WithPhaseSelectFewestTolerant(mode PhaseSelectTolerance, frames int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase selection requires a gossipsub router")
+		}
+		if gs.phaseForward == nil || !gs.phaseForward.selFewest {
+			return fmt.Errorf("the tolerant draw requires WithPhaseSelectFewest first")
+		}
+		switch mode {
+		case PhaseSelectLowerHalf:
+		case PhaseSelectProportional:
+			if frames <= 0 {
+				return fmt.Errorf("the proportional draw needs the group's frame count")
+			}
+		default:
+			return fmt.Errorf("unknown tolerant draw %d", mode)
+		}
+		gs.phaseForward.selTolerance = mode
+		gs.phaseForward.selFrames = frames
+		return nil
+	}
+}
+
+// tolerantOrder reorders cands, in sel=fewest order with the slow class last, so its first budget
+// entries are the tolerant draw; whatever the draw leaves keeps its fewest order behind them, so
+// a short draw fills from there and the announce order is the fewest order. Event loop.
+func (pf *phaseForwarding) tolerantOrder(gs *GossipSubRouter, cands []peer.ID, known map[peer.ID]int, slow map[peer.ID]bool, budget int) []peer.ID {
+	fast := 0
+	for fast < len(cands) && !slow[cands[fast]] {
+		fast++
+	}
+	pool := cands[:fast]
+	if pf.selTolerance == PhaseSelectLowerHalf && fast > 0 {
+		median := known[cands[(fast-1)/2]]
+		e := 0
+		for e < fast && known[cands[e]] <= median {
+			e++
+		}
+		pool = cands[:e]
+	}
+	if len(pool) == 0 || budget <= 0 {
+		return cands
+	}
+	pool = append([]peer.ID(nil), pool...)
+	if gs.rng != nil && gs.p != nil && gs.p.host != nil {
+		// A function of the seed: peer ids are fresh every run, the address is not.
+		if pf.selKeys == nil {
+			pf.selKeys = make(map[peer.ID]string)
+		}
+		for _, p := range pool {
+			if _, ok := pf.selKeys[p]; !ok {
+				pf.selKeys[p] = gs.stablePeerKey(p)
+			}
+		}
+		sort.Slice(pool, func(i, j int) bool { return pf.selKeys[pool[i]] < pf.selKeys[pool[j]] })
+	}
+	intn := rand.Intn
+	if gs.rng != nil {
+		intn = gs.rng.Intn
+	}
+	k := min(budget, len(pool))
+	chosen := make(map[peer.ID]bool, k)
+	out := make([]peer.ID, 0, len(cands))
+	switch pf.selTolerance {
+	case PhaseSelectLowerHalf:
+		for i := range k {
+			j := i + intn(len(pool)-i)
+			pool[i], pool[j] = pool[j], pool[i]
+			chosen[pool[i]] = true
+			out = append(out, pool[i])
+		}
+	case PhaseSelectProportional:
+		w := make([]int, len(pool))
+		total := 0
+		for i, p := range pool {
+			w[i] = max(0, pf.selFrames-known[p])
+			total += w[i]
+		}
+		for range k {
+			if total <= 0 {
+				break // nobody appears to lack anything: the fewest order fills the rest
+			}
+			r, j := intn(total), 0
+			for r >= w[j] {
+				r -= w[j]
+				j++
+			}
+			chosen[pool[j]] = true
+			out = append(out, pool[j])
+			total -= w[j]
+			w[j] = 0
+		}
+	}
+	for _, p := range cands {
+		if !chosen[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// unproven reports whether the proof guard demotes p for root at now. Event loop.
+func (pf *phaseForwarding) unproven(gs *GossipSubRouter, p peer.ID, root string, now time.Time) bool {
+	if pf.selGrace <= 0 {
+		return false
+	}
+	pe := gs.have.pushed[p][root]
+	if pe == nil || pe.bits.Count() < pf.degree || now.Sub(pe.first) <= pf.selGrace {
+		return false
+	}
+	if gs.have.peers[p][root] != nil {
+		return false // a HAVE, a claim or a hose ack for the group is the proof
+	}
+	if !pe.demoted {
+		pe.demoted = true
+		if pf.selDemoted != nil {
+			pf.selDemoted(p, root)
+		}
+	}
+	return true
+}
+
+// backlogged reports whether more than the guard's threshold is queued to p from us.
+func (pf *phaseForwarding) backlogged(gs *GossipSubRouter, p peer.ID) bool {
+	if pf.selBacklog <= 0 || gs.p == nil {
+		return false
+	}
+	q, ok := gs.p.peers[p]
+	return ok && q.QueuedBytes() > pf.selBacklog
+}
+
+// fewestRoot is the group root sel=fewest ranks mid's candidates by; false when sel=fewest is
+// off or mid is not a structured group member, which falls back to sel=rank.
+func (pf *phaseForwarding) fewestRoot(gs *GossipSubRouter, mid string) (string, bool) {
+	if !pf.selFewest || gs.have == nil {
+		return "", false
+	}
+	root, _, ok := gs.have.index(mid)
+	return root, ok
+}
+
+// knownFrames is how many frames of root p is known to hold or to have in flight from us: the
+// union of its HAVE bitmap and what we pushed it. Called on the event loop.
+func (h *haveState) knownFrames(p peer.ID, root string) int {
+	var u haveBits
+	if pe := h.peers[p]; pe != nil && pe[root] != nil {
+		u.Or(pe[root].bits.b)
+	}
+	if pe := h.pushed[p]; pe != nil && pe[root] != nil {
+		u.Or(pe[root].bits.b)
+	}
+	return u.Count()
 }
 
 // WithPhaseMeshless widens phase forwarding's candidate set from the topic mesh to every
@@ -140,6 +453,382 @@ const (
 	// chosen, bounded upload.
 	PhaseSourceWidePush
 )
+
+// WithPhaseSourcePushDegree sets the push degree the publisher uses for its own messages in
+// place of the forwarding degree; the mesh peers not pushed are announced as usual. Ignored
+// under PhaseSourceWidePush, which has its own width. Must follow WithPhaseForwarding.
+func WithPhaseSourcePushDegree(r int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase source push degree requires a gossipsub router")
+		}
+		if gs.phaseForward == nil {
+			return fmt.Errorf("phase source push degree requires WithPhaseForwarding first")
+		}
+		if r <= 0 {
+			return fmt.Errorf("phase source push degree must be positive")
+		}
+		gs.phaseForward.srcPushDegree = r
+		return nil
+	}
+}
+
+// WithPhaseSourcePushQuota caps what the publisher pushes of one group to each mesh peer at quota
+// frames; a frame no peer under the quota takes is offered instead, to the peers pushed and offered
+// least (all non-pushed mesh peers, or srcDegree of them under PhaseSourceRotate). Must follow
+// WithPhaseForwarding and WithHaveBitmaps.
+func WithPhaseSourcePushQuota(quota int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase source push quota requires a gossipsub router")
+		}
+		if gs.phaseForward == nil || gs.have == nil {
+			return fmt.Errorf("phase source push quota requires WithPhaseForwarding and WithHaveBitmaps first")
+		}
+		if quota <= 0 {
+			return fmt.Errorf("phase source push quota must be positive")
+		}
+		gs.phaseForward.srcPushQuota = quota
+		gs.phaseForward.srcLoad = make(map[string]map[peer.ID]*srcPeerLoad)
+		return nil
+	}
+}
+
+// srcPeerLoad is what the publisher has pushed and offered one mesh peer of one group.
+type srcPeerLoad struct{ pushed, offered int }
+
+// srcLoadMaxRoots bounds the groups whose per-peer load the publisher remembers.
+const srcLoadMaxRoots = 8
+
+// quotaTrim is trim for the publisher's own frame under a push quota: cands in order of load
+// (pushed plus offered, then the rank hash), pushes to the first budget under the quota and not
+// held, removes the rest from tosend and returns the peers to offer the frame to, and how many held
+// peers a push passed over.
+func (pf *phaseForwarding) quotaTrim(root, mid string, cands []peer.ID, budget int, tosend map[peer.ID]struct{}, held map[peer.ID]bool) ([]peer.ID, int) {
+	load := pf.srcLoad[root]
+	if load == nil {
+		load = make(map[peer.ID]*srcPeerLoad)
+		pf.srcLoad[root] = load
+		pf.srcLoadRoots = append(pf.srcLoadRoots, root)
+		if len(pf.srcLoadRoots) > srcLoadMaxRoots {
+			delete(pf.srcLoad, pf.srcLoadRoots[0])
+			pf.srcLoadRoots = pf.srcLoadRoots[1:]
+		}
+	}
+	get := func(p peer.ID) *srcPeerLoad {
+		l := load[p]
+		if l == nil {
+			l = &srcPeerLoad{}
+			load[p] = l
+		}
+		return l
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		li, lj := get(cands[i]), get(cands[j])
+		if a, b := li.pushed+li.offered, lj.pushed+lj.offered; a != b {
+			return a < b
+		}
+		ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
+		if ri != rj {
+			return ri > rj
+		}
+		return cands[i] > cands[j]
+	})
+	pushed, withheld := 0, 0
+	var offer []peer.ID
+	for _, p := range cands {
+		if pushed < budget && get(p).pushed < pf.srcPushQuota {
+			if !held[p] {
+				get(p).pushed++
+				pushed++
+				continue
+			}
+			withheld++
+		}
+		delete(tosend, p)
+		offer = append(offer, p)
+	}
+	if pf.srcMode == PhaseSourceRotate && len(offer) > pf.srcDegree {
+		offer = offer[:pf.srcDegree]
+	}
+	for _, p := range offer {
+		get(p).offered++
+	}
+	return offer, withheld
+}
+
+// WithPhaseSourceOfferPace holds the publisher's offers of its own frames so that the frames it has
+// named reach need only pace after publish, as a relay's holding does: an offer of a frame not yet
+// named waits while the named count is at the budget, need times the time since publish over pace.
+// Pushes are not held. Must follow WithPhaseForwarding and WithHaveBitmaps; meant with the paced
+// origin HAVE and WithPhaseSourcePushQuota.
+func WithPhaseSourceOfferPace(pace time.Duration, need int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("phase source offer pace requires a gossipsub router")
+		}
+		if gs.phaseForward == nil || gs.have == nil {
+			return fmt.Errorf("phase source offer pace requires WithPhaseForwarding and WithHaveBitmaps first")
+		}
+		if pace <= 0 || need < 1 {
+			return fmt.Errorf("phase source offer pace requires pace > 0 and need >= 1")
+		}
+		pf := gs.phaseForward
+		pf.srcOfferPace, pf.srcOfferNeed = pace, need
+		pf.srcOffers = make(map[string]*srcOfferQueue)
+		return nil
+	}
+}
+
+// srcOfferQueue is one group's held offers: its publish time, the offers in arrival order, the
+// frames released so far, and whether a pump is scheduled.
+type srcOfferQueue struct {
+	start    time.Time
+	items    []offerItem
+	released haveBits
+	armed    bool
+}
+
+// originOfferPaced takes over an offer of mid to p when mid is a frame of a group we publish and
+// offers are paced, and reports whether it did. Router goroutine, from the announce path.
+func (gs *GossipSubRouter) originOfferPaced(p peer.ID, topic, mid string) bool {
+	pf := gs.phaseForward
+	if pf == nil || pf.srcOfferPace == 0 || gs.have == nil || gs.have.originPaced == nil {
+		return false
+	}
+	root, _, ok := gs.have.index(mid)
+	if !ok || !gs.have.originPaced.owns(root) {
+		return false
+	}
+	q := pf.srcOffers[root]
+	if q == nil {
+		q = &srcOfferQueue{start: time.Now()}
+		pf.srcOffers[root] = q
+		pf.srcOfferRoots = append(pf.srcOfferRoots, root)
+		if len(pf.srcOfferRoots) > srcLoadMaxRoots {
+			delete(pf.srcOffers, pf.srcOfferRoots[0])
+			pf.srcOfferRoots = pf.srcOfferRoots[1:]
+		}
+	}
+	q.items = append(q.items, offerItem{p: p, topic: topic, mid: mid})
+	gs.originOfferPump(root)
+	return true
+}
+
+// originOfferPump releases root's held offers while the named frames, what our writers popped and
+// what was released, are under the budget; an offer of a frame already named goes at once. It
+// reschedules itself while offers wait. Router goroutine.
+func (gs *GossipSubRouter) originOfferPump(root string) {
+	pf := gs.phaseForward
+	q := pf.srcOffers[root]
+	if q == nil {
+		return
+	}
+	budget := 1 << 30
+	if elapsed := time.Since(q.start); elapsed < pf.srcOfferPace {
+		budget = int(int64(pf.srcOfferNeed) * int64(elapsed) / int64(pf.srcOfferPace))
+	}
+	named := &haveBits{}
+	named.Or(q.released.Bytes())
+	o := gs.have.originPaced
+	o.mu.Lock()
+	if r := o.roots[root]; r != nil {
+		named.Or(r.popped.Bytes())
+	}
+	o.mu.Unlock()
+	n := named.Count()
+	for len(q.items) > 0 {
+		it := q.items[0]
+		if _, index, ok := gs.have.index(it.mid); ok && !named.Has(index) {
+			if n >= budget {
+				break
+			}
+			named.Set(index)
+			q.released.Set(index)
+			n++
+		}
+		q.items = q.items[1:]
+		gs.originOfferRelease(it)
+	}
+	if len(q.items) > 0 && !q.armed {
+		q.armed = true
+		time.AfterFunc(diluteTick, func() {
+			select {
+			case gs.p.eval <- func() {
+				q.armed = false
+				gs.originOfferPump(root)
+			}:
+			case <-gs.p.ctx.Done():
+			}
+		})
+	}
+}
+
+// originOfferRelease sends a held offer as the announce path would have: through the hose, or as
+// an immediate IHAVE that joins the paced HAVE.
+func (gs *GossipSubRouter) originOfferRelease(it offerItem) {
+	if _, ok := gs.p.peers[it.p]; !ok {
+		return
+	}
+	if gs.hoseOffers != nil {
+		gs.offerLater(it.p, it.topic, it.mid)
+		return
+	}
+	ids := gs.haveIHaveIDs(it.p, []string{it.mid})
+	if len(ids) == 0 {
+		return
+	}
+	ihave := rpcWithControl(nil, []*pb.ControlIHave{{TopicID: &it.topic, MessageIDs: ids}}, nil, nil, nil, nil)
+	ihave.urgent = gs.haveAnnounceUrgent()
+	gs.sendRPC(it.p, ihave, ihave.urgent)
+	gs.haveOriginOffered(it.mid)
+}
+
+// originOfferRefuses reports whether an ask for mid goes unanswered under paced offers: a frame of
+// a group we publish that we have not yet sent, told in our HAVE or offered, as a relay that has
+// not received it would leave it. Router goroutine.
+func (gs *GossipSubRouter) originOfferRefuses(mid string) bool {
+	pf := gs.phaseForward
+	if pf == nil || pf.srcOfferPace == 0 || gs.have == nil || gs.have.originPaced == nil {
+		return false
+	}
+	root, index, ok := gs.have.index(mid)
+	if !ok {
+		return false
+	}
+	if q := pf.srcOffers[root]; q != nil && q.released.Has(index) {
+		return false
+	}
+	o := gs.have.originPaced
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	r := o.roots[root]
+	return r != nil && !r.popped.Has(index) && !r.told.Has(index)
+}
+
+// WithOriginDataHold holds the data of this node's own messages from some peers for a while: held
+// reports whether data for mid toward p is held, and until when. While held, the publish path pushes
+// mid to unheld peers only, announcing to held ones as to any peer not pushed, and an ask from a held
+// peer is answered when the hold ends, as over a congested link. Relayed messages and announcements
+// are untouched. pushes counts the (frame, peer) pushes withheld, answers the answers deferred; either
+// may be nil.
+func WithOriginDataHold(held func(p peer.ID, mid string) (until time.Time, ok bool), pushes, answers *atomic.Int64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("origin data hold requires a gossipsub router")
+		}
+		if held == nil {
+			return fmt.Errorf("origin data hold requires a predicate")
+		}
+		gs.originHold = &originHold{held: held, pushes: pushes, answers: answers, waiting: make(map[originHoldKey]*originHoldBatch)}
+		return nil
+	}
+}
+
+// originHold is WithOriginDataHold's predicate, its counters and the answers waiting for a hold to end.
+type originHold struct {
+	held            func(p peer.ID, mid string) (time.Time, bool)
+	pushes, answers *atomic.Int64
+	waiting         map[originHoldKey]*originHoldBatch
+}
+
+// originHoldKey is one peer's answers due at one instant, in Unix nanoseconds.
+type originHoldKey struct {
+	p     peer.ID
+	until int64
+}
+
+// originHoldBatch is the answers of one key, and their ids so a repeated ask is folded in.
+type originHoldBatch struct {
+	msgs []*pb.Message
+	mids map[string]struct{}
+}
+
+// originHeld reports whether data for mid, one of our own messages, is held from p now, and until
+// when. Router goroutine.
+func (gs *GossipSubRouter) originHeld(p peer.ID, mid string) (time.Time, bool) {
+	if gs.originHold == nil {
+		return time.Time{}, false
+	}
+	until, ok := gs.originHold.held(p, mid)
+	if !ok || !time.Now().Before(until) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// originHeldPeers is the peers of cands our own mid is held from; nil when none.
+func (gs *GossipSubRouter) originHeldPeers(mid string, cands []peer.ID) map[peer.ID]bool {
+	var held map[peer.ID]bool
+	for _, p := range cands {
+		if _, ok := gs.originHeld(p, mid); ok {
+			if held == nil {
+				held = make(map[peer.ID]bool)
+			}
+			held[p] = true
+		}
+	}
+	return held
+}
+
+// originHoldCount adds n to the withheld pushes.
+func (gs *GossipSubRouter) originHoldCount(n int) {
+	if gs.originHold != nil && gs.originHold.pushes != nil && n > 0 {
+		gs.originHold.pushes.Add(int64(n))
+	}
+}
+
+// originHoldDefers takes over the answer of msg to p when msg is our own and held from p, and reports
+// whether it did; the answer leaves on the event loop when the hold ends. Router goroutine.
+func (gs *GossipSubRouter) originHoldDefers(p peer.ID, mid string, msg *Message) bool {
+	h := gs.originHold
+	if h == nil || msg.ReceivedFrom != gs.p.host.ID() {
+		return false
+	}
+	until, ok := gs.originHeld(p, mid)
+	if !ok {
+		return false
+	}
+	key := originHoldKey{p: p, until: until.UnixNano()}
+	b := h.waiting[key]
+	if b == nil {
+		b = &originHoldBatch{mids: make(map[string]struct{})}
+		h.waiting[key] = b
+		time.AfterFunc(time.Until(until), func() {
+			select {
+			case gs.p.eval <- func() { gs.originHoldRelease(key) }:
+			case <-gs.p.ctx.Done():
+			}
+		})
+	}
+	if _, dup := b.mids[mid]; !dup {
+		b.mids[mid] = struct{}{}
+		b.msgs = append(b.msgs, msg.Message)
+		if h.answers != nil {
+			h.answers.Add(1)
+		}
+	}
+	return true
+}
+
+// originHoldRelease sends the answers due at key as an ordinary answer. Router goroutine.
+func (gs *GossipSubRouter) originHoldRelease(key originHoldKey) {
+	b := gs.originHold.waiting[key]
+	delete(gs.originHold.waiting, key)
+	if b == nil {
+		return
+	}
+	if _, ok := gs.p.peers[key.p]; !ok {
+		return
+	}
+	gs.sendingSolicited = true
+	gs.sendRPC(key.p, rpcWithControl(b.msgs, nil, nil, nil, nil, nil), false)
+	gs.sendingSolicited = false
+}
 
 // WithPhaseSourcePolicy selects the source-side staggering policy for phase forwarding.
 // Must be applied together with WithPhaseForwarding. delay is used by PhaseSourceDelay;
@@ -195,7 +884,7 @@ func WithPhaseForwarding(match func(topic string) bool, degree int) Option {
 // over-budget ones and returning them, rank-ordered, so the caller can announce to them
 // instead. Peers outside the mesh set (direct and floodsub peers) are never trimmed.
 // fromSelf applies the source policy: it may widen the push (WidePush), and the caller
-// narrows or defers the returned announce list per srcMode.
+// narrows or defers the returned announce list per srcMode; a held peer is never pushed.
 func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, gmap map[peer.ID]struct{}, tosend map[peer.ID]struct{}, fromSelf bool) []peer.ID {
 	holders := 0
 	if !pf.fixedBudget {
@@ -210,6 +899,8 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 	degree := pf.degree
 	if fromSelf && pf.srcMode == PhaseSourceWidePush {
 		degree = pf.srcDegree
+	} else if fromSelf && pf.srcPushDegree > 0 {
+		degree = pf.srcPushDegree
 	}
 	budget := degree - holders
 	if budget < 0 {
@@ -221,7 +912,19 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 			cands = append(cands, p)
 		}
 	}
-	if budget >= len(cands) {
+	// Our own frame goes to no peer it is held from (WithOriginDataHold): the push skips them.
+	var held map[peer.ID]bool
+	if fromSelf {
+		held = gs.originHeldPeers(mid, cands)
+	}
+	if fromSelf && pf.srcPushQuota > 0 && pf.srcMode != PhaseSourceWidePush {
+		if root, _, ok := gs.have.index(mid); ok {
+			offer, withheld := pf.quotaTrim(root, mid, cands, budget, tosend, held)
+			gs.originHoldCount(withheld)
+			return offer
+		}
+	}
+	if budget >= len(cands) && len(held) == 0 {
 		return nil
 	}
 	if pf.selRR {
@@ -233,6 +936,33 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 		sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
 		k := int((pf.rrCtr.Add(1) - 1) % uint64(len(cands)))
 		cands = append(cands[k:], cands[:k]...)
+	} else if root, ok := pf.fewestRoot(gs, mid); ok {
+		known := make(map[peer.ID]int, len(cands))
+		slow := make(map[peer.ID]bool, len(cands))
+		var now time.Time
+		if pf.selGrace > 0 {
+			now = time.Now()
+		}
+		for _, p := range cands {
+			known[p] = gs.have.knownFrames(p, root)
+			slow[p] = pf.unproven(gs, p, root, now) || pf.backlogged(gs, p) // unproven first, so every demotion is heard
+		}
+		sort.Slice(cands, func(i, j int) bool {
+			if si, sj := slow[cands[i]], slow[cands[j]]; si != sj {
+				return sj
+			}
+			if ki, kj := known[cands[i]], known[cands[j]]; ki != kj {
+				return ki < kj
+			}
+			ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
+			if ri != rj {
+				return ri > rj
+			}
+			return cands[i] > cands[j]
+		})
+		if pf.selTolerance != PhaseSelectArgmax && !fromSelf {
+			cands = pf.tolerantOrder(gs, cands, known, slow, budget)
+		}
 	} else {
 		// sel=rank: per (message, peer) hash so different messages spread their pushes across
 		// different peers, and the choice is stable rather than map-order dependent.
@@ -244,11 +974,20 @@ func (pf *phaseForwarding) trim(gs *GossipSubRouter, mid string, csum checksum, 
 			return cands[i] > cands[j]
 		})
 	}
-	announce := make([]peer.ID, 0, len(cands)-budget)
-	for _, p := range cands[budget:] {
+	announce := make([]peer.ID, 0, max(0, len(cands)-budget))
+	pushed, withheld := 0, 0
+	for _, p := range cands {
+		if pushed < budget {
+			if !held[p] {
+				pushed++
+				continue
+			}
+			withheld++
+		}
 		delete(tosend, p)
 		announce = append(announce, p)
 	}
+	gs.originHoldCount(withheld)
 	if pf.meshless && pf.announceWidth > 0 && len(announce) > pf.announceWidth {
 		// Rank-ordered, so the announce set rotates per message like the push set does.
 		announce = announce[:pf.announceWidth]
@@ -295,9 +1034,13 @@ func (pf *phaseForwarding) scheduleDeferredIHave(gs *GossipSubRouter, topic, mid
 				if _, ok := gs.p.peers[pid]; !ok {
 					continue
 				}
+				ids := gs.haveIHaveIDs(pid, []string{mid})
+				if len(ids) == 0 {
+					continue
+				}
 				gs.sendRPC(pid, rpcWithControl(nil,
-					[]*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{mid}}},
-					nil, nil, nil, nil), false)
+					[]*pb.ControlIHave{{TopicID: &topic, MessageIDs: ids}},
+					nil, nil, nil, nil), gs.haveAnnounceUrgent())
 			}
 		}:
 		case <-gs.p.ctx.Done():
@@ -699,7 +1442,7 @@ func (gs *GossipSubRouter) tailHedgeMid(mid string) int {
 		if _, was := tried[p]; was {
 			continue
 		}
-		if gs.peerParked(p) {
+		if gs.peerParkedFor(p, mid) {
 			continue
 		}
 		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopic[mid], mid) {
@@ -745,6 +1488,9 @@ func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
 	if gs.iwantPromised != nil {
 		if gs.iwantPromised[mid] == nil {
 			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
+		}
+		if _, open := gs.iwantPromised[mid][from]; open {
+			return // the earlier promise keeps its deadline (see iwantAllowed)
 		}
 		askedAt := time.Now()
 		gs.iwantPromised[mid][from] = askedAt
@@ -1266,6 +2012,12 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 		if gs.iwantPromised[mid] == nil {
 			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
 		}
+		// A re-ask of a peer whose promise for this id is still open keeps the earlier
+		// deadline: overwriting it let every retry postpone the break, so a silent sole
+		// announcer asked every window was never judged (Q131).
+		if _, open := gs.iwantPromised[mid][from]; open {
+			return true
+		}
 		askedAt := gs.iwantAsked[mid]
 		gs.iwantPromised[mid][from] = askedAt
 		m, f := mid, from
@@ -1292,6 +2044,13 @@ func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Tim
 	if at, open := peers[from]; !open || !at.Equal(askedAt) {
 		return
 	}
+	if gs.haveHolds(mid) {
+		gs.promiseHeld.Add(1)
+		if gs.promiseRecheck {
+			gs.absolvePromise(mid, from)
+			return
+		}
+	}
 	gs.notePromiseBreak(mid, from)
 	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(askedAt) {
 		delete(gs.iwantAsked, mid)
@@ -1317,10 +2076,14 @@ func (gs *GossipSubRouter) notePromiseBreak(mid string, p peer.ID) {
 			delete(gs.iwantPromised, mid)
 		}
 	}
-	gs.parkBreaks[p]++
 	if gs.parkBreaksCtr != nil {
 		gs.parkBreaksCtr.Add(1)
 	}
+	if gs.parkGroups != nil {
+		gs.noteGroupBreak(mid, p)
+		return
+	}
+	gs.parkBreaks[p]++
 	if gs.parkBreaks[p] >= gs.parkK {
 		if _, already := gs.parkedUntil[p]; !already {
 			if gs.parksCtr != nil {
@@ -1367,6 +2130,7 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	// for a fresh offer that may never come (relays announce once).
 	gs.redrivePulls()
 	gs.sweepOffers()
+	gs.sweepGroupParks()
 }
 
 // WithIHaveCommitmentPark treats an IHAVE as a binding offer under the IWANT discipline:
@@ -1424,18 +2188,19 @@ type groupPush struct {
 	need    int
 	held    map[peer.ID]map[string]map[string]struct{}
 	vetoes  *atomic.Int64 // optional, application-supplied; counts (message, peer) push vetoes
+	// project (WithGroupCompletionProjection) counts the members we pushed to p ourselves
+	// together with the evidenced ones: what p will hold once our frames in flight land. The
+	// evidence alone arrives a have-signal delay late, and by then the overrun has
+	// already left.
+	project bool
+	pushed  map[peer.ID]map[string]map[string]struct{}
 }
 
-// note records that p evidenced holding mid.
-func (g *groupPush) note(p peer.ID, mid string) {
-	key, ok := g.extract(mid)
-	if !ok {
-		return
-	}
-	byGroup, ok := g.held[p]
+func groupPushAdd(m map[peer.ID]map[string]map[string]struct{}, p peer.ID, key, mid string) {
+	byGroup, ok := m[p]
 	if !ok {
 		byGroup = make(map[string]map[string]struct{})
-		g.held[p] = byGroup
+		m[p] = byGroup
 	}
 	mids, ok := byGroup[key]
 	if !ok {
@@ -1445,14 +2210,60 @@ func (g *groupPush) note(p peer.ID, mid string) {
 	mids[mid] = struct{}{}
 }
 
+// note records that p evidenced holding mid.
+func (g *groupPush) note(p peer.ID, mid string) {
+	key, ok := g.extract(mid)
+	if !ok {
+		return
+	}
+	groupPushAdd(g.held, p, key, mid)
+}
+
+// notePushed records that we pushed mid to p. Router goroutine, from the push loop.
+func (g *groupPush) notePushed(p peer.ID, mid string) {
+	key, ok := g.extract(mid)
+	if !ok {
+		return
+	}
+	if g.pushed == nil {
+		g.pushed = make(map[peer.ID]map[string]map[string]struct{})
+	}
+	groupPushAdd(g.pushed, p, key, mid)
+}
+
 // complete reports whether p has evidenced enough distinct members of mid's group to
-// complete without mid.
+// complete without mid — with the projection, whether p will have once our own pushes land.
 func (g *groupPush) complete(p peer.ID, mid string) bool {
 	key, ok := g.extract(mid)
 	if !ok {
 		return false
 	}
-	return len(g.held[p][key]) >= g.need
+	held := g.held[p][key]
+	if !g.project {
+		return len(held) >= g.need
+	}
+	n := len(held)
+	for m := range g.pushed[p][key] {
+		if _, dup := held[m]; !dup {
+			n++
+		}
+	}
+	return n >= g.need
+}
+
+// WithGroupCompletionProjection makes the group-completion veto count the members this node
+// has itself pushed to a peer along with the ones the peer evidenced, so the push stops when
+// the frames in flight will complete the peer rather than when the peer says they did.
+// Requires WithGroupCompletionPush.
+func WithGroupCompletionProjection() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok || gs.groupPush == nil {
+			return fmt.Errorf("group completion projection requires WithGroupCompletionPush first")
+		}
+		gs.groupPush.project = true
+		return nil
+	}
 }
 
 // WithGroupCompletionPush stops pushing group members to peers evidenced to hold at least
@@ -1762,7 +2573,7 @@ const (
 
 // recordOffer notes that peer p announced mid; a fact, kept until delivery or expiry.
 func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
-	if gs.offerTable == nil || gs.p.seenMessage(mid) {
+	if gs.offerTable == nil || gs.haveSeen(mid) {
 		return
 	}
 	if gs.offerByPeer[p] >= offerPerPeer {
@@ -1826,7 +2637,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	if gs.offerTable == nil {
 		return
 	}
-	if gs.p.seenMessage(mid) {
+	if gs.haveSeen(mid) {
 		gs.clearOffers(mid)
 		return
 	}
@@ -1839,7 +2650,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 	}
 	cands := make([]peer.ID, 0, len(offers))
 	for p := range offers {
-		if gs.peerParked(p) {
+		if gs.peerParkedFor(p, mid) {
 			continue
 		}
 		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopic[mid], mid) {
@@ -1916,7 +2727,7 @@ func (gs *GossipSubRouter) backlogPulls(mids []string, topicOf map[string]string
 		if _, ok := taken[mid]; ok {
 			continue
 		}
-		if gs.p.seenMessage(mid) {
+		if gs.haveSeen(mid) {
 			continue
 		}
 		gs.pullBacklog = append(gs.pullBacklog, pullCandidate{mid: mid, topic: topicOf[mid], from: from})
@@ -1959,13 +2770,13 @@ func (gs *GossipSubRouter) redrivePulls() {
 	for remaining > 0 && scanned < len(gs.pullBacklog) {
 		c := gs.pullBacklog[scanned]
 		scanned++
-		if gs.p.seenMessage(c.mid) {
+		if gs.haveSeen(c.mid) {
 			continue // delivered: drop for good
 		}
 		if gs.requestGate != nil && !gs.requestGate.Allow(c.from, c.topic, c.mid) {
 			continue // gate refusal is final for this candidate
 		}
-		if gs.peerParked(c.from) {
+		if gs.peerParkedFor(c.from, c.mid) {
 			continue // parked announcer: never re-ask
 		}
 		if _, out := gs.pullOutstanding[c.mid]; out {
