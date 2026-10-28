@@ -618,6 +618,16 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		})
 	}
 
+	// SEGMENT_V05: the v0.5 rules (specv05_test.go), last, after the options they build on.
+	v05Rules, v05On := specV05FromEnv(t)
+	v05Reset()
+	if v05On {
+		if rr.active {
+			t.Fatal("SEGMENT_V05 needs the request policy on every node; the regime rule gives it to some")
+		}
+		t.Logf("spec v0.5 rules: %+v", v05Rules)
+	}
+
 	perNode := func(i int) []pubsub.Option {
 		out := []pubsub.Option{pubsub.WithIHaveRPCObservation(announceStats)}
 		if coalesceControl {
@@ -672,6 +682,9 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		}
 		if sendDelaySet[i] && sendDelay > 0 {
 			out = append(out, pubsub.WithSendDelay(sendDelay))
+		}
+		if v05On {
+			out = append(out, pubsub.WithSpecV05(v05Rules, &v05Ctr))
 		}
 		return out
 	}

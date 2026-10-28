@@ -12,6 +12,7 @@ go_test(
         "horizon_test.go",
         "hose_test.go",
         "instrument_test.go",
+        "linkbytes_test.go",
         "multimessage_test.go",
         "overlap_test.go",
         "pair_test.go",
@@ -30,6 +31,7 @@ go_test(
         "segmentflood_test.go",
         "segmentgate_test.go",
         "segmentid_test.go",
+        "specv05_test.go",
         "spytrace_test.go",
         "stagger_test.go",
         "stem_test.go",
@@ -45,6 +47,7 @@ go_test(
         "variants_test.go",
         "wireform_test.go",
         "wiresize_test.go",
+        "xcheck_test.go",
     ],
     deps = [
         "//beacon-chain/p2p:go_default_library",

@@ -81,7 +81,7 @@ func q6CellFromEnv(t *testing.T) q6Cell {
 		for _, f := range strings.Split(v, ",") {
 			f = strings.TrimSpace(f)
 			switch f {
-			case "whole", "segmented", "phase", "ecrs":
+			case "whole", "segmented", "phase":
 				c.arms = append(c.arms, f)
 			default:
 				t.Fatalf("bad SEGMENT_ARMS entry %q", f)

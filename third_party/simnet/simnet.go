@@ -36,6 +36,7 @@ type Simnet struct {
 	wg          sync.WaitGroup
 	router      VariableLatencyRouter
 	links       []*Simlink
+	conns       []*SimConn
 }
 
 // NodeBiDiLinkSettings defines the bidirectional link settings for a network node.
@@ -90,9 +91,22 @@ func (n *Simnet) LinkStats() []LinkStats {
 	return stats
 }
 
+// ConnStats returns every endpoint's socket counters in NewEndpoint order (node index order for a
+// network built by simlibp2p): what each socket sent and what its downlink delivered to it. Unlike a
+// queue's enqueued bytes, BytesRcvd excludes what still waits in the downlink. Call it once the
+// topology is up; it does not lock against a concurrent NewEndpoint.
+func (n *Simnet) ConnStats() []ConnStats {
+	stats := make([]ConnStats, len(n.conns))
+	for i, c := range n.conns {
+		stats[i] = c.Stats()
+	}
+	return stats
+}
+
 func (n *Simnet) NewEndpoint(addr *net.UDPAddr, linkSettings NodeBiDiLinkSettings) *SimConn {
 	n.init()
 	c := NewBlockingSimConn(addr)
+	n.conns = append(n.conns, c)
 	link := NewSimlink(
 		n.closeSignal,
 		linkSettings,
