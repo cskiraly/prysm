@@ -154,7 +154,7 @@ func stemLevels(nw *simNetwork, p *stemPolicy, uplinks []int, geo cellGeo, from 
 		}
 		if p.name == "capable" {
 			add(fmt.Sprintf("capable (>= %d Mbps up, <= %v one-way)", p.minBps/simlibp2p.OneMbps, p.maxOneWay), 0x63617061626c65, func(i int) bool {
-				ow := quicMinRTT(nodeHost(nw, from), nw.Hosts[i].ID()) / 2
+				ow := quicMinRTT(nw, from, nw.Hosts[i].ID()) / 2
 				return i < len(uplinks) && uplinks[i] >= p.minBps && ow > 0 && ow <= p.maxOneWay
 			})
 		}

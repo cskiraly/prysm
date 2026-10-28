@@ -121,8 +121,8 @@ func TestPromiseRecheck(t *testing.T) {
 		for _, mid := range []string{held, open} {
 			gs.iwantPromised[mid] = map[peer.ID]time.Time{p: at}
 		}
-		gs.promiseDue(held, p, at, at)
-		gs.promiseDue(open, p, at, at)
+		gs.promiseDue(held, p, at)
+		gs.promiseDue(open, p, at)
 		return gs
 	}
 	t.Run("off, both promises break and the held one is counted", func(t *testing.T) {

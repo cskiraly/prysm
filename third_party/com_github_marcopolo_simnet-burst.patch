@@ -1,6 +1,6 @@
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel.go fork_simnet/codel.go
---- base_simnet/codel.go	2026-10-22 14:12:58.201431442 +0200
-+++ fork_simnet/codel.go	2026-10-22 14:12:58.204990266 +0200
+--- base_simnet/codel.go	2026-10-22 16:34:11.673757792 +0200
++++ fork_simnet/codel.go	2026-10-22 16:34:11.681030159 +0200
 @@ -2,6 +2,7 @@
  
  import (
@@ -83,8 +83,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel.go fork_simnet
  
  func (q *coDelQueue) doDequeue(now time.Time) (p packetWithTimestamp, okToDrop bool) {
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel_test.go fork_simnet/codel_test.go
---- base_simnet/codel_test.go	2026-10-22 14:12:58.201431442 +0200
-+++ fork_simnet/codel_test.go	2026-10-22 14:12:58.204990266 +0200
+--- base_simnet/codel_test.go	2026-10-22 16:34:11.673757792 +0200
++++ fork_simnet/codel_test.go	2026-10-22 16:34:11.681030159 +0200
 @@ -14,7 +14,7 @@
  			target   = 5 * time.Millisecond
  			interval = 100 * time.Millisecond
@@ -113,8 +113,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel_test.go fork_s
  		q.Enqueue(p)
  	}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/fq_codel.go fork_simnet/fq_codel.go
---- base_simnet/fq_codel.go	2026-10-22 14:12:58.201431442 +0200
-+++ fork_simnet/fq_codel.go	2026-10-22 14:12:58.204990266 +0200
+--- base_simnet/fq_codel.go	2026-10-22 16:34:11.673757792 +0200
++++ fork_simnet/fq_codel.go	2026-10-22 16:34:11.681030159 +0200
 @@ -25,6 +25,10 @@
  
  	hash maphash.Hash
@@ -157,8 +157,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/fq_codel.go fork_sim
  		q.newFlows.append(&listNode[*coDelQueueWithCredits]{v: fq})
  	}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_simnet/ratelink.go
---- base_simnet/ratelink.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/ratelink.go	2026-10-22 14:12:58.205347160 +0200
+--- base_simnet/ratelink.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/ratelink.go	2026-10-22 16:34:11.683186340 +0200
 @@ -14,16 +14,30 @@
  
  // Creates a new RateLimiter with the following parameters:
@@ -195,8 +195,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_sim
  	}
  }
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go fork_simnet/ratelink_test.go
---- base_simnet/ratelink_test.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/ratelink_test.go	2026-10-22 14:12:58.205347160 +0200
+--- base_simnet/ratelink_test.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/ratelink_test.go	2026-10-22 16:34:11.683186340 +0200
 @@ -26,7 +26,7 @@
  		)
  
@@ -207,8 +207,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go for
  		chunk := make([]byte, mtu)
  
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork_simnet/simconn_test.go
---- base_simnet/simconn_test.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/simconn_test.go	2026-10-22 14:12:58.205347160 +0200
+--- base_simnet/simconn_test.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/simconn_test.go	2026-10-22 16:34:11.683186340 +0200
 @@ -214,6 +214,7 @@
  		DefaultFlowBucketCount,
  		1500,
@@ -218,8 +218,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork
  		closeSignal,
  	)
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simnet/simlink.go
---- base_simnet/simlink.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/simlink.go	2026-10-22 14:12:58.205437636 +0200
+--- base_simnet/simlink.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/simlink.go	2026-10-22 16:34:11.683186340 +0200
 @@ -1,6 +1,8 @@
  package simnet
  
@@ -352,8 +352,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
 +	return v
 +}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork_simnet/simlink_test.go
---- base_simnet/simlink_test.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/simlink_test.go	2026-10-22 14:12:58.205347160 +0200
+--- base_simnet/simlink_test.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/simlink_test.go	2026-10-22 16:34:11.683186340 +0200
 @@ -46,6 +46,7 @@
  			128,
  			mtu,
@@ -363,8 +363,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork
  			closeSignal,
  		)
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simnet.go fork_simnet/simnet.go
---- base_simnet/simnet.go	2026-10-22 14:12:58.201928938 +0200
-+++ fork_simnet/simnet.go	2026-10-22 14:12:58.205437636 +0200
+--- base_simnet/simnet.go	2026-10-22 16:34:11.674216117 +0200
++++ fork_simnet/simnet.go	2026-10-22 16:34:11.683186340 +0200
 @@ -36,6 +36,7 @@
  	wg          sync.WaitGroup
  	router      VariableLatencyRouter

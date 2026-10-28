@@ -11,7 +11,6 @@ import (
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 	"github.com/quic-go/quic-go"
@@ -184,9 +183,8 @@ func (k *hoseKnobs) sized(t *testing.T, links []simlibp2p.NodeLinkSettingsAndCou
 	return &c
 }
 
-// opts is node i's hose options; hostOf is read lazily, when the window asks for a base round trip:
-// the in-process network's host, or the Shadow node's own.
-func (k *hoseKnobs) opts(i int, hostOf func() host.Host) []pubsub.Option {
+// opts is node i's hose options; nw is read lazily, when the window asks for a base round trip.
+func (k *hoseKnobs) opts(i int, nw func() *simNetwork) []pubsub.Option {
 	if k == nil {
 		return nil
 	}
@@ -207,7 +205,7 @@ func (k *hoseKnobs) opts(i int, hostOf func() host.Host) []pubsub.Option {
 		cfg.Max = math.Max(cfg.Max, 100000) // the estimate, not a configured cap, bounds it
 		cfg.Estimate = &pubsub.HoseEstimate{
 			MeanRTT: func() time.Duration {
-				if r := quicMeanMinRTT(hostOf()); r > 0 {
+				if r := quicMeanMinRTT(nw(), i); r > 0 {
 					return r
 				}
 				return k.staticRTT
@@ -218,12 +216,12 @@ func (k *hoseKnobs) opts(i int, hostOf func() host.Host) []pubsub.Option {
 			Forward:         k.forward,
 		}
 		if k.transport {
-			cfg.Estimate.Delivered = func() uint64 { return quicDelivered(hostOf()) }
+			cfg.Estimate.Delivered = func() uint64 { return quicDelivered(nw(), i) }
 		}
 	case k.static != nil:
 		cfg.Init, cfg.Min, cfg.Max = k.static[i], k.static[i], k.static[i]
 	}
-	cfg.BaseRTT = func(p peer.ID) time.Duration { return quicMinRTT(hostOf(), p) }
+	cfg.BaseRTT = func(p peer.ID) time.Duration { return quicMinRTT(nw(), i, p) }
 	opts = append(opts, pubsub.WithHoseWindow(cfg))
 	if k.offers > 0 {
 		opts = append(opts, pubsub.WithHoseOffers(k.offers))
@@ -231,21 +229,13 @@ func (k *hoseKnobs) opts(i int, hostOf func() host.Host) []pubsub.Option {
 	return opts
 }
 
-// nodeHost is node i's host on the in-process network; nil without one.
-func nodeHost(nw *simNetwork, i int) host.Host {
+// quicConns is node i's QUIC connections.
+func quicConns(nw *simNetwork, i int) []*quic.Conn {
 	if nw == nil || i >= len(nw.Hosts) {
 		return nil
 	}
-	return nw.Hosts[i]
-}
-
-// quicConns is the host's QUIC connections.
-func quicConns(h host.Host) []*quic.Conn {
-	if h == nil {
-		return nil
-	}
 	var out []*quic.Conn
-	for _, c := range h.Network().Conns() {
+	for _, c := range nw.Hosts[i].Network().Conns() {
 		var qc *quic.Conn
 		if c.As(&qc) && qc != nil {
 			out = append(out, qc)
@@ -254,10 +244,10 @@ func quicConns(h host.Host) []*quic.Conn {
 	return out
 }
 
-// quicDelivered is the host's bytes sent less bytes lost over all its QUIC connections.
-func quicDelivered(h host.Host) uint64 {
+// quicDelivered is node i's bytes sent less bytes lost over all its QUIC connections.
+func quicDelivered(nw *simNetwork, i int) uint64 {
 	var sent, lost uint64
-	for _, qc := range quicConns(h) {
+	for _, qc := range quicConns(nw, i) {
 		s := qc.ConnectionStats()
 		sent, lost = sent+s.BytesSent, lost+s.BytesLost
 	}
@@ -267,11 +257,11 @@ func quicDelivered(h host.Host) uint64 {
 	return sent - lost
 }
 
-// quicMeanMinRTT is the mean minimum RTT over the host's QUIC connections; zero when none.
-func quicMeanMinRTT(h host.Host) time.Duration {
+// quicMeanMinRTT is the mean minimum RTT over node i's QUIC connections; zero when none.
+func quicMeanMinRTT(nw *simNetwork, i int) time.Duration {
 	var sum time.Duration
 	n := 0
-	for _, qc := range quicConns(h) {
+	for _, qc := range quicConns(nw, i) {
 		if r := qc.ConnectionStats().MinRTT; r > 0 {
 			sum += r
 			n++
@@ -301,7 +291,7 @@ func hoseEstimateLines(t *testing.T, nw *simNetwork, pub int, k *hoseKnobs) []st
 			ratio = append(ratio, s.Estimate*8/float64(k.uplink[i]))
 			valid, ticks, probes = valid+s.Valid, ticks+s.Ticks, probes+s.Probes
 			seen, queued = seen+s.FwdSeen, queued+s.FwdQueued
-			rtt = append(rtt, hoseMs(quicMeanMinRTT(nodeHost(nw, i))))
+			rtt = append(rtt, hoseMs(quicMeanMinRTT(nw, i)))
 		}
 		if len(ratio) == 0 {
 			return ""
@@ -325,13 +315,13 @@ func hoseEstimateLines(t *testing.T, nw *simNetwork, pub int, k *hoseKnobs) []st
 	return lines
 }
 
-// quicMinRTT is the smallest minimum RTT over the host's QUIC connections to p; zero when unknown.
-func quicMinRTT(h host.Host, p peer.ID) time.Duration {
-	if h == nil {
+// quicMinRTT is the smallest minimum RTT over node i's QUIC connections to p; zero when unknown.
+func quicMinRTT(nw *simNetwork, i int, p peer.ID) time.Duration {
+	if nw == nil || i >= len(nw.Hosts) {
 		return 0
 	}
 	var best time.Duration
-	for _, c := range h.Network().ConnsToPeer(p) {
+	for _, c := range nw.Hosts[i].Network().ConnsToPeer(p) {
 		var qc *quic.Conn
 		if !c.As(&qc) || qc == nil {
 			continue

@@ -48,7 +48,7 @@ type diffusionStats struct {
 	compTimes          []time.Duration
 	drops, dups        int
 	rxBytes, txBytes   int
-	linkRx             int // bytes the downlinks took in less their drops, all protocols, publish to completion
+	linkRx             int // bytes delivered by all downlinks, all protocols, by completion
 	socketRx           int // what the downlinks handed the sockets over the same interval (link rx counts at the queue's intake)
 	idwSent, idwRecv   int
 	ctrlRx             int
@@ -220,11 +220,9 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		if driven {
 			gd.setGates(gates)
 		}
-		// Built once: the network and the cross-check's dump read the same links and graph.
-		links, edges := meshLinks(t, p.n, p.rate), meshGraph(t, p.n)
 		nw, stop := newSimNetwork(t, networkConfig{
-			links:   links,
-			edges:   edges,
+			links:   meshLinks(t, p.n, p.rate),
+			edges:   meshGraph(t, p.n),
 			latency: simnet.StaticLatency(p.latency),
 			perNodeOpts: func(i int) []pubsub.Option {
 				opts := []pubsub.Option{pubsub.WithRawTracer(tracers[i]), pubsub.WithRequestObservation()}
@@ -248,9 +246,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 		defer r.cancel()
 		stats.meshSummary = r.settle(t, tracers)
 		tMeshed := time.Now()
-		xc := xcDumpOpen(t)
-		defer xc.close(t)
-		xc.net(t, p, links, edges, pushDegreeOf(v))
 
 		ctx, cancel := context.WithTimeout(context.Background(), networkOpTimeout)
 		defer cancel()
@@ -321,7 +316,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			stats.pub, stats.msg, stats.msgs = plan.pubs[m-1], m, len(plan.pubs)
 			breaks0, parks0, retries0 := parkBreaks.Load(), parks.Load(), offerRetries.Load()
 			held0 := promisesHeld(nw)
-			v050 := v05Now()
 
 			// The announce-rate histogram describes the measured diffusion, not the settle heartbeats.
 			announceStats.Reset()
@@ -338,7 +332,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			stats.compAt = make([]time.Duration, p.n)
 			stats.rxAtComp = make([]int, p.n)
 			stats.horizon = newHorizonSnapshot(t, p.n, p.deadline, stats.pub, base)
-			stats.horizon.degree, stats.horizon.askWindow = pushDegreeOf(v), xcAskWindow()
 			horizonTimer := time.NewTimer(p.deadline)
 			defer horizonTimer.Stop()
 			takeHorizon := func() {
@@ -354,10 +347,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 			}
 			signal := func(node int, at time.Duration) { done <- completionEvent{node: node, at: at} }
 			r.watch(ctx, &wg, start, signal)
-			xc.mesh(t, m, stats.pub, nw, tracers)
-			pubsub.HaveRevoked.Store(0)
-			pubsub.AsksForHeldDropped.Store(0)
-			pubsub.StaleAsksDropped.Store(0)
 			if err := r.publish(ctx, t); err != nil {
 				t.Fatal(err)
 			}
@@ -423,9 +412,6 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 				t.Logf("=== message %d/%d, publisher node %d%s", m, len(plan.pubs), stats.pub, cold)
 				reportCell(t, v, stats)
 				t.Logf("        commitment enforcement this message: %d broken promises, %d peers parked; offer-table retries %d; promises due with the index held %d", parkBreaks.Load()-breaks0, parks.Load()-parks0, offerRetries.Load()-retries0, promisesHeld(nw)-held0)
-				if os.Getenv("SEGMENT_V05") != "" {
-					t.Logf("        %s", v050.line(v05Now()))
-				}
 				sums = append(sums, summarise(stats))
 			}
 			if timedOut {
@@ -454,7 +440,7 @@ func runDiffusion(t *testing.T, p diffusionParams, v variant) {
 func reportCell(t *testing.T, v variant, stats diffusionStats) {
 	v.report(t, stats)
 	if stats.linkRx > 0 && stats.n > 0 {
-		t.Logf("        link rx/node %dB (each downlink's intake less its drops, publish to completion: UDP payloads, every protocol)", stats.linkRx/stats.n)
+		t.Logf("        link rx/node %dB (what each downlink delivered by completion: UDP payloads, every protocol)", stats.linkRx/stats.n)
 		t.Logf("        socket rx/node %dB (what the downlinks handed the sockets from the publish to completion; link rx counts bytes as a downlink queue takes them in, less its drops)", stats.socketRx/stats.n)
 	}
 	if w, ok := v.(wireFormer); ok {

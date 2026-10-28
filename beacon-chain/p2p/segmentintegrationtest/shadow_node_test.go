@@ -29,7 +29,6 @@ import (
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	"github.com/cskiraly/eth-networking-lab/shadowsim"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -92,12 +91,6 @@ func shadowRefuse(t *testing.T, n int, seed uint64) {
 	}
 }
 
-// ownHoster is a variant that reads per-node transport state through the in-process network (the
-// hose window's base round trips), told the one host a Shadow node's process runs instead.
-type ownHoster interface {
-	setOwnHost(h host.Host)
-}
-
 // shadowRun is one node's part of a variant once it has joined: the publisher's publish, a
 // receiver's watch (the publisher's only drains), and the teardown.
 type shadowRun struct {
@@ -117,9 +110,6 @@ type shadowCell struct {
 	v        variant // pubsubOpts, per node
 	join     func(t *testing.T, ps *pubsub.PubSub, self peer.ID, idx int, seed uint64) shadowRun
 	declined func(idx int) int64
-	// next switches the cell to message m of a multi-message cell and returns its wire form
-	// (shadow_messages_test.go); nil for a variant without multi-message support.
-	next func(t *testing.T, m int) wireArm
 }
 
 func shadowCellFromEnv(t *testing.T, n, idx int) shadowCell {
@@ -161,10 +151,6 @@ func shadowCellFromEnv(t *testing.T, n, idx int) shadowCell {
 					return v.gate(idx).declined.Load()
 				}
 				return 0
-			},
-			next: func(t *testing.T, m int) wireArm {
-				v.nextMessage(t, m, 0)
-				return v.arm
 			},
 		}
 	case "c":
@@ -289,11 +275,6 @@ func TestShadowNode(t *testing.T) {
 	seed := meshGraphSeed(t)
 	edges := shadowEdges(t, e.N)
 	shadowRefuse(t, e.N, seed)
-	plan := messagePlanFromEnv(t, e.N, failureDeadline(t))
-	multi := len(plan.pubs) > 1
-	if multi {
-		shadowMultiRefuse(t, plan, sc)
-	}
 
 	priv, err := shadowsim.Identity(seed, e.Index)
 	require.NoError(t, err)
@@ -303,9 +284,6 @@ func TestShadowNode(t *testing.T) {
 	h, err := shadowsim.NewHost(priv, e.Transport, e.IP(e.Index), e.Port)
 	require.NoError(t, err)
 	defer h.Close()
-	if oh, ok := v.(ownHoster); ok {
-		oh.setOwnHost(h) // what the in-process variant reads through the network: the hose's round trips
-	}
 	warmBytes := warmupBytes(t)
 	if warmBytes > 0 {
 		// Every node reads and discards what its peers push at the warm instant.
@@ -324,13 +302,11 @@ func TestShadowNode(t *testing.T) {
 
 	// The option order is the harness's (gossipsim.New, then the driver): signing off, the
 	// production configuration, the study's substrate options, then this node's own -- the
-	// tracer, request observation, the id function, the heartbeat phase and paced gossip, and the
-	// arm's options, as the driver hands them per node. (The authority gates, which the driver
-	// adds between the last two, are refused above.)
+	// tracer, request observation, the id function and the arm's options, as the driver hands
+	// them per node.
 	subOpts, perNode := substrateOpts(t, e.N, meshLinks(t, e.N, defaultRate), nil, func(i int) []pubsub.Option {
 		opts := []pubsub.Option{pubsub.WithRawTracer(tracer), pubsub.WithRequestObservation()}
 		opts = append(opts, structuredIDOpts()...)
-		opts = append(opts, gossipPaceOpts(t, i, seed)...)
 		return append(opts, v.pubsubOpts(t, i)...)
 	})
 	opts := []pubsub.Option{
@@ -367,16 +343,13 @@ func TestShadowNode(t *testing.T) {
 	defer run.cancel()
 
 	// Receivers watch from subscription on: completion is dated from the publish instant, which
-	// every node knows in advance. The publisher only drains its own subscriptions. A
-	// multi-message cell watches each message from its own publish (shadowMessages).
+	// every node knows in advance. The publisher only drains its own subscriptions.
 	var compAt atomic.Int64
 	var completed atomic.Bool
-	if !multi {
-		run.watch(ctx, func() {
-			compAt.Store(int64(time.Since(e.PublishAt)))
-			completed.Store(true)
-		})
-	}
+	run.watch(ctx, func() {
+		compAt.Store(int64(time.Since(e.PublishAt)))
+		completed.Store(true)
+	})
 
 	// The link-level warm-up, the harness's (transportwarmup_test.go): at the warm instant every
 	// node pushes the bytes down each of its connections, one peer at a time in a per-node
@@ -419,10 +392,6 @@ func TestShadowNode(t *testing.T) {
 			"warm_bps2": int64(ws.secondHalfRate()), "warm_overrun": map[bool]int64{true: 1}[overrun]}
 	}
 
-	if multi {
-		shadowMessages(t, e, plan, sc, run, h, tracer, start)
-		return
-	}
 	shadowsim.SleepUntil(e.PublishAt)
 	meshAtPublish := tracer.MeshPeers()
 	peersAtPublish := len(h.Network().Peers())

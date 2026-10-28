@@ -37,8 +37,7 @@ diff --git a/BUILD.bazel b/BUILD.bazel
          "rpc_queue.go",
          "score.go",
          "score_params.go",
-@@ -31,6 +43,9 @@
-+        "specv05.go",
+@@ -31,6 +43,8 @@
          "subscription.go",
          "subscription_filter.go",
          "tag_tracer.go",
@@ -49,8 +48,8 @@ diff --git a/BUILD.bazel b/BUILD.bazel
          "trace.go",
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/adversaries.go fork/adversaries.go
 --- base/adversaries.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/adversaries.go	2026-10-22 13:36:32.090556753 +0200
-@@ -0,0 +1,434 @@
++++ fork/adversaries.go	2026-10-04 18:17:17.134771196 +0200
+@@ -0,0 +1,411 @@
 +package pubsub
 +
 +import (
@@ -132,36 +131,13 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/adversaries.go fork/adversa
 +		gs.withheldServes.Add(int64(len(held)))
 +	}
 +	if gs.withholdDelay > 0 {
-+		asked := gs.p.peers[p] // the connection the ask came on
 +		time.AfterFunc(gs.withholdDelay, func() {
 +			select {
 +			case gs.p.eval <- func() {
-+				cur, ok := gs.p.peers[p]
-+				if !ok {
++				if _, ok := gs.p.peers[p]; !ok {
 +					return
 +				}
-+				late := held
-+				if gs.v05 != nil {
-+					// Under v0.5 the late serve goes on the connection it was asked on, and only for
-+					// groups still alive; off v0.5 it leaves as the measured arms sent it.
-+					if cur != asked {
-+						return
-+					}
-+					late = nil
-+					for _, m := range held {
-+						if !gs.expiredID(gs.p.idGen.RawID(m)) {
-+							late = append(late, m)
-+						}
-+					}
-+					if len(late) == 0 {
-+						return
-+					}
-+				}
-+				// The late serve is an answer: under v0.5's A′ a full queue owes it as one, and the
-+				// writer never projects it away. Off v0.5 it leaves as the measured arms sent it.
-+				gs.sendingSolicited = gs.v05OfferSkipped()
-+				gs.sendRPC(p, rpcWithControl(late, nil, nil, nil, nil, nil), false)
-+				gs.sendingSolicited = false
++				gs.sendRPC(p, rpcWithControl(held, nil, nil, nil, nil, nil), false)
 +			}:
 +			case <-gs.p.ctx.Done():
 +			}
@@ -486,8 +462,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/adversaries.go fork/adversa
 +	}
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/comm.go fork/comm.go
---- base/comm.go	2026-10-22 13:36:32.085115449 +0200
-+++ fork/comm.go	2026-10-22 13:36:32.090556753 +0200
+--- base/comm.go	2026-10-04 18:17:17.125515716 +0200
++++ fork/comm.go	2026-10-04 18:17:17.134771196 +0200
 @@ -122,6 +122,14 @@
  
  	r := msgio.NewVarintReaderSize(s, p.maxMessageSize)
@@ -503,18 +479,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/comm.go fork/comm.go
  		// Peek at the message length to know when we should mark the start time
  		// for measuring how long it took to receive a message.
  		_, _ = r.NextMsgLen()
-@@ -247,6 +255,10 @@
- 				return ctx.Err()
- 			}
- 		}
-+		outgoing.noteAsksWritten(rpc) // v0.5's E: the promise starts now
-+		if rpc.lostOnly {
-+			return nil // its asks were lost on the wire: nothing to write
-+		}
- 		size := uint64(proto.Size(&rpc.RPC))
- 
- 		buf := pool.Get(varint.UvarintSize(size) + int(size))
-@@ -263,11 +275,19 @@
+@@ -263,11 +271,19 @@
  			return err
  		}
  
@@ -530,11 +495,11 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/comm.go fork/comm.go
  			p.rpcLogger.Debug("failed to send message", "peer", s.Conn().RemotePeer(), "rpc", rpc, "err", err)
  			return err
  		}
-+		p.upload.noteWithID(rpc, len(out), s.Conn().RemotePeer(), p.idGen.RawID)
++		p.upload.note(rpc, len(out), s.Conn().RemotePeer())
  		p.rpcLogger.Debug("sent", "peer", s.Conn().RemotePeer(), "rpc", rpc)
  		return nil
  	}
-@@ -296,6 +316,7 @@
+@@ -296,6 +312,7 @@
  		}
  
  		err = writeRpc(rpc)
@@ -544,7 +509,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/comm.go fork/comm.go
  			p.logger.Debug("error writing message to peer", "peer", s.Conn().RemotePeer(), "err", err)
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/controlcoalesce.go fork/controlcoalesce.go
 --- base/controlcoalesce.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/controlcoalesce.go	2026-10-22 13:36:32.091069297 +0200
++++ fork/controlcoalesce.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,150 @@
 +package pubsub
 +
@@ -698,7 +663,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/controlcoalesce.go fork/con
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/dispatchcredits_test.go fork/dispatchcredits_test.go
 --- base/dispatchcredits_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/dispatchcredits_test.go	2026-10-22 13:36:32.091069297 +0200
++++ fork/dispatchcredits_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,166 @@
 +package pubsub
 +
@@ -867,8 +832,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/dispatchcredits_test.go for
 +	})
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/extensions.go fork/extensions.go
---- base/extensions.go	2026-10-22 13:36:32.085329788 +0200
-+++ fork/extensions.go	2026-10-22 13:36:32.091069297 +0200
+--- base/extensions.go	2026-10-04 18:17:17.125684422 +0200
++++ fork/extensions.go	2026-10-04 18:17:17.133771201 +0200
 @@ -87,13 +87,13 @@
  	peerExtensions    map[peer.ID]PeerExtensions // peer's extensions
  	sentExtensions    map[peer.ID]struct{}
@@ -901,9 +866,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/extensions.go fork/extensio
  			Partial: rpc,
  		},
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub.go
---- base/gossipsub.go	2026-10-22 13:36:32.085497320 +0200
-+++ fork/gossipsub.go	2026-10-22 13:36:32.093884815 +0200
-@@ -593,44 +593,118 @@
+--- base/gossipsub.go	2026-10-04 18:17:17.125771246 +0200
++++ fork/gossipsub.go	2026-10-04 18:17:17.134771196 +0200
+@@ -593,44 +593,117 @@
  	peers      map[peer.ID]protocol.ID // peer protocols
  	extensions *extensionsState
  
@@ -1048,7 +1013,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
 +	offerRetryCtr                                                *atomic.Int64                    // offer-table diagnostics: timer-driven retries sent
 +	pullOutstanding                                              map[string]time.Time             // ids pulled and not yet delivered, expiring on the discipline window
 +	pullBacklog                                                  []pullCandidate                  // declined candidates (budget or discipline), re-driven as slots free
-+	v05                                                          *specV05                         // optional: the rules spec v0.5 added (specv05.go)
 +	requestGate                                                  RequestGate                      // optional application veto on requesting an announced id
 +	deferred                                                     map[string]*deferredEntry        // declined announcements, replayable when the gate opens
 +	deferredMax                                                  int                              // cap on deferred entries
@@ -1060,7 +1024,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  
  	protos  []protocol.ID
  	feature GossipSubFeatureTest
-@@ -642,6 +716,12 @@
+@@ -642,6 +715,12 @@
  	tagTracer    *tagTracer
  	gate         *peerGater
  
@@ -1073,7 +1037,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	// config for gossipsub parameters
  	params GossipSubParams
  
-@@ -708,6 +788,10 @@
+@@ -708,6 +787,10 @@
  	// start the heartbeat
  	go gs.heartbeatTimer()
  
@@ -1084,16 +1048,15 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	// start the PX connectors
  	for i := 0; i < gs.params.Connectors; i++ {
  		go gs.connector()
-@@ -837,6 +921,8 @@
+@@ -837,6 +920,7 @@
  	delete(gs.control, p)
  	delete(gs.outbound, p)
  	delete(gs.unwanted, p)
 +	gs.haveForget(p)
-+	gs.v05PeerGone(p)
  }
  
  func (gs *GossipSubRouter) EnoughPeers(topic string, suggested int) bool {
-@@ -902,10 +988,42 @@
+@@ -902,7 +986,33 @@
  	tmids := make(map[string][]string)
  	for _, msg := range msgs {
  		mid := gs.p.idGen.ID(msg)
@@ -1127,16 +1090,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
  			continue
  		}
-+		if from == gs.p.host.ID() && gs.have != nil && gs.have.idontwantOn {
-+			// Our own message, as Topic.validate passes it here: with HAVE bitmaps our HAVE for its
-+			// group goes once the publish is planned (haveOrigin) or follows our pops (an origin HAVE
-+			// mode), not once per message as each joins a batch.
-+			continue
-+		}
- 		topic := msg.GetTopic()
- 		tmids[topic] = append(tmids[topic], mid)
- 	}
-@@ -916,23 +1034,55 @@
+@@ -916,23 +1026,55 @@
  		// shuffle the messages got from the RPC envelope
  		gs.shuffleStrings(mids)
  		// send IDONTWANT to all the mesh peers
@@ -1206,7 +1160,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		}
  	}
  }
-@@ -959,10 +1109,31 @@
+@@ -959,10 +1101,31 @@
  	}
  
  	out := rpcWithControl(iWantResponses, nil, iwant, nil, prune, nil)
@@ -1238,7 +1192,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	// we ignore IHAVE gossip from any peer whose score is below the gossip threshold
  	score := gs.score.Score(p)
  	if score < gs.gossipThreshold {
-@@ -970,8 +1141,20 @@
+@@ -970,8 +1133,20 @@
  		return nil
  	}
  
@@ -1259,7 +1213,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	if gs.peerhave[p] > gs.params.MaxIHaveMessages {
  		gs.logger.Debug("IHAVE: peer has advertised too many times within this heartbeat interval; ignoring", "peer", p, "count", gs.peerhave[p])
  		return nil
-@@ -1004,18 +1187,61 @@
+@@ -1004,18 +1179,55 @@
  				break checkIwantMsgsLoop
  			}
  
@@ -1292,8 +1246,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
 +
 +// considerAnnounced records one announced id from p and makes it a candidate to ask for.
 +func (gs *GossipSubRouter) considerAnnounced(p peer.ID, topic, mid string, iwant map[string]string, candidates *[]string) {
-+	if gs.haveSeen(mid) || gs.expiredID(mid) {
-+		return // held, or of a group past its lifetime (v0.5's D′): no offer, no ask
++	if gs.haveSeen(mid) {
++		return
 +	}
 +	// An announce names the id a HAVE bitmap cannot; learn it so the bitmap's holders count
 +	// for this message before it arrives.
@@ -1306,13 +1260,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
 +	gs.noteAnnouncedHolder(mid, p)
 +	gs.noteRarityAnnouncer(mid, p)
 +	gs.recordOffer(mid, topic, p)
-+	if gs.v05LastResort() {
-+		gs.noteOffered(p, topic, mid)
-+	}
 +	if gs.parkGroups != nil && gs.peerParkedFor(p, mid) {
-+		// B′: a parked announcer is not asked now, but when every announcer is parked each is
-+		// asked once more, later.
-+		gs.lastResort(mid)
 +		return
 +	}
 +	if _, dup := iwant[mid]; dup {
@@ -1328,7 +1276,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	if len(candidates) == 0 {
  		return nil
  	}
-@@ -1031,16 +1257,55 @@
+@@ -1031,16 +1243,55 @@
  		return nil
  	}
  	gs.shuffleStrings(candidates)
@@ -1384,7 +1332,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	if gs.requestGate != nil {
  		// Only the dispatched set is reported, so an application budget is charged for requests
  		// that were actually made rather than for ids a later policy refused.
-@@ -1086,7 +1351,7 @@
+@@ -1086,7 +1337,7 @@
  			out = append(out, mid)
  			continue
  		}
@@ -1393,56 +1341,34 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			continue
  		}
  		if !gs.iwantBudgetAllowed(mid) {
-@@ -1106,10 +1371,46 @@
- 	}
- 
+@@ -1108,8 +1359,24 @@
  	ihave := make(map[string]*pb.Message)
-+	if n := countIWantIDs(ctl); n > 0 {
-+		var inMesh int64
-+		for _, peers := range gs.mesh {
-+			if _, ok := peers[p]; ok {
-+				inMesh = n
-+				break
-+			}
-+		}
-+		gs.p.upload.noteAsksIn(n, inMesh)
-+	}
  	for _, iwant := range ctl.GetIwant() {
  		for _, mid := range iwant.GetMessageIDs() {
 -			// Check if that peer has sent IDONTWANT before, if so don't send them the message
 -			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok {
 +			// An ask by index resolves to the id we hold there, or to nothing.
 +			askRoot, askIndex, byIndex := decodeWant(mid)
-+			if gs.expiredID(mid) {
-+				continue // an ask for a group past its lifetime is ignored, without penalty (v0.5's D′)
-+			}
 +			mid, skip := gs.haveResolveWant(mid)
 +			if skip || gs.discloseRefuses(p, mid) || gs.originOfferRefuses(mid) {
 +				continue
 +			}
-+			if byIndex && gs.havePeerHolds(p, askRoot, askIndex) {
-+				// The peer's own HAVE names the index: the ask is stale, overtaken by that HAVE on
-+				// the urgent lane, and the HAVE wins (the spec's §4.5, which also penalises; an
-+				// honest asker drops such asks before writing them).
-+				AsksForHeldDropped.Add(1)
-+				continue
-+			}
 +			gs.offerAnswered(p, mid)
 +			if byIndex {
-+				// The ask supersedes a claim the peer sent for this index, never its HAVE (haveRevoke).
++				// The ask supersedes any bitmap the peer sent for this index (havebitmap.go).
 +				if q := gs.haveQueue(p); q != nil {
 +					q.haveRevoke(askRoot, askIndex)
 +				}
 +			}
 +			// Check if that peer has sent IDONTWANT before, if so don't send them the message.
-+			// An ask by index passes the peer's unwanted set: a claim it sent ahead of decode (plan
-+			// §7c D7 idea 2) put the ids there, and a node that fell short must be able to pull the
-+			// rest; a HAVE for the index was handled above.
++			// An ask by index is explicit and later than any bitmap the peer sent, so it is
++			// answered regardless: a receiver that suppressed a group ahead of decode and fell
++			// short must be able to pull the rest.
 +			if _, ok := gs.unwanted[p][computeChecksum(mid)]; ok && !byIndex {
  				continue
  			}
  
-@@ -1127,6 +1428,11 @@
+@@ -1127,6 +1394,11 @@
  				continue
  			}
  
@@ -1454,7 +1380,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			ihave[mid] = msg.Message
  		}
  	}
-@@ -1138,18 +1444,28 @@
+@@ -1138,13 +1410,14 @@
  	gs.logger.Debug("IWANT: Sending messages to peer", "messageCount", len(ihave), "peer", p)
  
  	msgs := make([]*pb.Message, 0, len(ihave))
@@ -1472,21 +1398,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	}
  
  	return msgs
- }
- 
-+// countIWantIDs is the ask ids an RPC's control carries.
-+func countIWantIDs(ctl *pb.ControlMessage) int64 {
-+	var n int64
-+	for _, iwant := range ctl.GetIwant() {
-+		n += int64(len(iwant.GetMessageIDs()))
-+	}
-+	return n
-+}
-+
- func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.ControlPrune {
- 	var prune []string
- 
-@@ -1298,6 +1614,13 @@
+@@ -1298,6 +1571,13 @@
  	totalUnwantedIds := 0
  	// Remember all the unwanted message ids
  	var unwanted map[checksum]int
@@ -1500,7 +1412,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  mainIDWLoop:
  	for _, idontwant := range idontwants {
  		for _, mid := range idontwant.GetMessageIDs() {
-@@ -1308,6 +1631,14 @@
+@@ -1308,6 +1588,14 @@
  			}
  
  			totalUnwantedIds++
@@ -1515,7 +1427,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			if unwanted == nil {
  				unwanted = gs.unwanted[p]
  				if unwanted == nil {
-@@ -1316,6 +1647,13 @@
+@@ -1316,6 +1604,13 @@
  				}
  			}
  			unwanted[computeChecksum(mid)] = gs.params.IDontWantMessageTTL
@@ -1529,7 +1441,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		}
  	}
  }
-@@ -1424,12 +1762,22 @@
+@@ -1424,12 +1719,22 @@
  
  func (gs *GossipSubRouter) PublishBatch(messages []*Message, opts *BatchPublishOptions) {
  	strategy := opts.Strategy
@@ -1552,7 +1464,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  
  	for p, rpc := range strategy.All() {
  		// Re-check IDONTWANT here, not only at plan time above: a batch plans every
-@@ -1450,7 +1798,7 @@
+@@ -1450,7 +1755,7 @@
  		if rpc = gs.withoutUnwanted(rpc, p); rpc == nil {
  			continue
  		}
@@ -1561,7 +1473,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	}
  }
  
-@@ -1485,24 +1833,69 @@
+@@ -1485,24 +1790,63 @@
  			kept = append(kept, msg)
  		}
  	}
@@ -1595,7 +1507,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
 +}
 +
  func (gs *GossipSubRouter) Publish(msg *Message) {
-+	gs.haveOrigin([]*Message{msg}, nil) // our HAVE ahead of the data, as PublishBatch sends it
  	for p, rpc := range gs.rpcs(msg) {
 -		gs.sendRPC(p, rpc, false)
 +		gs.haveOriginLead(p, rpc)
@@ -1605,11 +1516,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  
  func (gs *GossipSubRouter) rpcs(msg *Message) iter.Seq2[peer.ID, *RPC] {
  	return func(yield func(peer.ID, *RPC) bool) {
-+		if gs.expiredID(gs.p.idGen.ID(msg)) {
-+			// A late copy of a group past its lifetime: not served, forwarded or announced (v0.5's
-+			// D′). The application has it delivered regardless; what it does with it is its own.
-+			return
-+		}
  		gs.mcache.Put(msg)
 +		gs.pacedBorn(gs.p.idGen.ID(msg))
 +		// A message we forward is validated and in mcache: servable. Our own messages never
@@ -1633,7 +1539,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		// (N,q,g): a message from a peer we asked is a claim->arrival sample for that peer.
  		if gs.nqg != nil {
  			gs.nqgObserve(gs.p.idGen.ID(msg), from)
-@@ -1549,10 +1942,23 @@
+@@ -1549,10 +1893,23 @@
  			}
  
  			csum := computeChecksum(gs.p.idGen.ID(msg))
@@ -1657,7 +1563,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  					continue
  				}
  				tosend[p] = struct{}{}
-@@ -1561,7 +1967,9 @@
+@@ -1561,7 +1918,9 @@
  			if gs.phaseForward != nil && gs.phaseForward.match(topic) {
  				mid := gs.p.idGen.ID(msg)
  				cand := gmap
@@ -1668,7 +1574,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  					// Meshless: every connected gossipsub-capable topic peer is a candidate,
  					// gated the way flood publish gates, and the mesh stops deciding who
  					// gets eager copies.
-@@ -1581,23 +1989,63 @@
+@@ -1581,23 +1940,63 @@
  							// announce is owed.
  							continue
  						}
@@ -1734,7 +1640,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			if pid == from || pid == peer.ID(msg.GetFrom()) {
  				continue
  			}
-@@ -1605,7 +2053,19 @@
+@@ -1605,7 +2004,19 @@
  				// The peer requested partial messages. We'll skip sending them full messages
  				continue
  			}
@@ -1754,7 +1660,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			if !yield(pid, out) {
  				return
  			}
-@@ -1622,9 +2082,23 @@
+@@ -1622,9 +2033,23 @@
  				if gs.iSupportSendingPartial(topic) && gs.peerRequestsPartial(pid, topic) {
  					continue
  				}
@@ -1779,7 +1685,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  				if !yield(pid, ihave) {
  					return
  				}
-@@ -1633,6 +2107,21 @@
+@@ -1633,6 +2058,21 @@
  	}
  }
  
@@ -1801,7 +1707,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  func (gs *GossipSubRouter) peerSupportsSendingPartial(p peer.ID, topic string) bool {
  	if !gs.extensions.myExtensions.PartialMessages {
  		return false
-@@ -1760,12 +2249,34 @@
+@@ -1760,12 +2200,34 @@
  	gs.sendRPC(p, out, false)
  }
  
@@ -1838,7 +1744,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	}
  
  	// Any pending control messages?
-@@ -1806,22 +2317,33 @@
+@@ -1806,22 +2268,33 @@
  
  	// If we're below the max message size, go ahead and send
  	if !out.exceedsSizeLimits(gs.p.maxMessageSize, gs.p.maxControlMessageSize) {
@@ -1876,7 +1782,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	// push control messages that need to be retried
  	ctl := rpc.GetControl()
  	if ctl != nil {
-@@ -1829,21 +2351,83 @@
+@@ -1829,21 +2302,80 @@
  	}
  }
  
@@ -1937,9 +1843,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		err = q.Push(rpc, false)
  	}
  	if err != nil {
-+		if gs.v05OfferSkipped() && errIsQueueFull(err) {
-+			gs.oweRefused(p, q, rpc) // before doDropRPC, which strips the gossip from the control
-+		}
  		gs.doDropRPC(rpc, p, "queue full")
 -		return
 +		return false
@@ -1965,7 +1868,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  }
  
  func (gs *GossipSubRouter) heartbeatTimer() {
-@@ -2146,11 +2730,22 @@
+@@ -2146,11 +2678,22 @@
  
  	// advance the message history window
  	gs.mcache.Shift()
@@ -1988,7 +1891,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	if len(gs.peerhave) > 0 {
  		// throw away the old map and make a new one
  		gs.peerhave = make(map[peer.ID]int)
-@@ -2180,10 +2775,12 @@
+@@ -2180,10 +2723,12 @@
  			delete(gs.unwanted, p)
  		}
  	}
@@ -2001,7 +1904,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		gs.logger.Info("peer didn't follow up in IWANT requests; adding penalty", "peer", p, "requestCount", count)
  		gs.score.AddPenalty(p, count)
  	}
-@@ -2285,7 +2882,16 @@
+@@ -2285,7 +2830,16 @@
  		_, inExclude := exclude[p]
  		_, direct := gs.direct[p]
  
@@ -2019,7 +1922,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			peers = append(peers, p)
  		}
  	}
-@@ -2327,6 +2933,29 @@
+@@ -2327,6 +2881,29 @@
  
  		for _, p := range peers {
  			peerMids := mids
@@ -2049,7 +1952,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  			if len(mids) > gs.params.MaxIHaveLength {
  				// we do this per peer so that we emit a different set for each peer.
  				// we have enough redundancy in the system that this will significantly increase the message
-@@ -2335,7 +2964,7 @@
+@@ -2335,7 +2912,7 @@
  				gs.shuffleStrings(mids)
  				copy(peerMids, mids)
  			}
@@ -2058,7 +1961,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  		}
  	}
  
-@@ -2362,6 +2991,9 @@
+@@ -2362,6 +2939,9 @@
  
  func (gs *GossipSubRouter) enqueueGossip(p peer.ID, ihave *pb.ControlIHave) {
  	gossip := gs.gossip[p]
@@ -2069,8 +1972,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossipsub.go fork/gossipsub
  	gs.gossip[p] = gossip
  }
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossip_tracer.go fork/gossip_tracer.go
---- base/gossip_tracer.go	2026-10-22 13:36:32.073492106 +0200
-+++ fork/gossip_tracer.go	2026-10-22 13:36:32.091069297 +0200
+--- base/gossip_tracer.go	2026-10-04 18:17:17.113771312 +0200
++++ fork/gossip_tracer.go	2026-10-04 18:17:17.134771196 +0200
 @@ -1,6 +1,7 @@
  package pubsub
  
@@ -2186,8 +2089,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossip_tracer.go fork/gossi
  	if !ok {
  		return
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossip_tracer_test.go fork/gossip_tracer_test.go
---- base/gossip_tracer_test.go	2026-10-22 13:36:32.073492106 +0200
-+++ fork/gossip_tracer_test.go	2026-10-22 13:36:32.091069297 +0200
+--- base/gossip_tracer_test.go	2026-10-04 18:17:17.113771312 +0200
++++ fork/gossip_tracer_test.go	2026-10-04 18:17:17.134771196 +0200
 @@ -1,6 +1,7 @@
  package pubsub
  
@@ -2234,8 +2137,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/gossip_tracer_test.go fork/
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitmap.go
 --- base/havebitmap.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/havebitmap.go	2026-10-22 13:36:32.093884815 +0200
-@@ -0,0 +1,2886 @@
++++ fork/havebitmap.go	2026-10-04 18:17:17.135771191 +0200
+@@ -0,0 +1,2693 @@
 +package pubsub
 +
 +import (
@@ -2417,11 +2320,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +type haveState struct {
 +	index func(mid string) (root string, index uint32, ok bool)
 +	mine  map[string]*haveEntry
-+	// tomb is the groups past their active lifetime under v0.5's D′, by heartbeats left: their
-+	// mine aged out GROUP_TTL after the last chunk, and only the id is kept, for another holdTTL.
-+	tomb map[string]int
-+	// own mirrors mine for the writers (ownView).
-+	own   ownView
 +	mids  map[string]*haveIDs
 +	peers map[peer.ID]map[string]*haveEntry
 +	// pushed is what we have pushed to each peer per root. The phase announce names a message
@@ -2479,13 +2377,11 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	return &haveState{
 +		index: index,
 +		mine:  make(map[string]*haveEntry),
-+		tomb:  make(map[string]int),
 +		mids:  make(map[string]*haveIDs),
 +		peers: make(map[peer.ID]map[string]*haveEntry),
 +
 +		pushed:      make(map[peer.ID]map[string]*haveEntry),
 +		idontwantOn: true,
-+		own:         ownView{bits: make(map[string]*haveBits)},
 +	}
 +}
 +
@@ -2572,16 +2468,12 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	if !ok || len(root) != haveRootLen {
 +		return
 +	}
-+	if h.tomb[root] > 0 {
-+		return // past its active lifetime: only the tombstone is left (v0.5's D′)
-+	}
 +	e := h.mine[root]
 +	if e == nil {
 +		e = &haveEntry{}
 +		h.mine[root] = e
 +	}
 +	e.bits.Set(index)
-+	h.own.set(root, index)
 +	e.ttl = h.holdTTL
 +	gs.haveLearnID(mid)
 +}
@@ -2632,9 +2524,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	root, enc, ok := decodeHave(mid)
 +	if !ok {
 +		return false
-+	}
-+	if gs.expired(root) {
-+		return true // a HAVE for a group past its lifetime is ignored, without penalty (v0.5's D′)
 +	}
 +	roots := h.peers[p]
 +	if roots == nil {
@@ -2698,21 +2587,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	if h == nil {
 +		return
 +	}
-+	for root, n := range h.tomb {
-+		if n--; n <= 0 {
-+			delete(h.tomb, root)
-+			h.own.revive(root)
-+		} else {
-+			h.tomb[root] = n
-+		}
-+	}
 +	for root, e := range h.mine {
 +		if e.ttl--; e.ttl <= 0 {
 +			delete(h.mine, root)
-+			h.own.forget(root)
-+			if gs.v05Expiry() {
-+				gs.expireGroup(root)
-+			}
 +			if h.holders != nil {
 +				h.holders.forget(root)
 +			}
@@ -2825,9 +2702,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	originSent func(m *pb.Message) (root string, index uint32, ok bool)
 +	shared     map[string]*haveBits
 +	originMesh map[string]bool
-+	// ownHeld, when set, reports whether we hold the frame an ask id names: dispatch drops such
-+	// asks (enableStaleAsks).
-+	ownHeld func(mid string) bool
 +}
 +
 +// WithHaveDispatch moves two decisions to dispatch time, per peer: cancel drops a queued frame
@@ -2861,7 +2735,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +		return nil
 +	}
 +	q.enableHave(h.msgIndex, h.cancel, h.attach)
-+	q.enableStaleAsks(h.ownHeldID)
 +	if h.rarest {
 +		q.enableRarest(h.haveHolders)
 +	}
@@ -2949,17 +2822,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +}
 +
 +// enableProjection installs the dispatch-time projection once (WithHaveDispatchProjection).
-+// enableStaleAsks installs the dispatch-time drop of asks for frames we hold by now (the spec's
-+// §7.2): an ask queued behind data while its frame arrived from someone else would otherwise leave
-+// after our HAVE for the frame, which overtakes it on the urgent lane.
-+func (q *rpcQueue) enableStaleAsks(held func(mid string) bool) {
-+	q.queueMu.Lock()
-+	defer q.queueMu.Unlock()
-+	if q.have != nil && q.have.ownHeld == nil {
-+		q.have.ownHeld = held
-+	}
-+}
-+
 +func (q *rpcQueue) enableProjection(need uint32, fanIn int) {
 +	q.queueMu.Lock()
 +	defer q.queueMu.Unlock()
@@ -3228,150 +3090,18 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +
 +// haveRevoke clears one index of what the peer claimed: it asked for that frame by index, so
 +// whatever bitmap said it held the frame is superseded for it. Router goroutine.
-+// HaveRevoked counted the announced bits an ask by index cleared before an ask stopped revoking
-+// real HAVEs; it stays zero and is kept for the harness's known answer. AsksForHeldDropped counts
-+// asks by index dropped because the asker's own HAVE named the index (the ask was stale), and
-+// StaleAsksDropped the ask ids a writer dropped at dispatch because we hold the frame by now.
-+// Process-wide, for a harness.
-+var HaveRevoked, AsksForHeldDropped, StaleAsksDropped atomic.Int64
-+
-+// haveRevoke clears index from what the peer claimed (D7 idea 2's suppress, encodeHaveClaim), so
-+// its ask after the claim is answered. It never touches what the peer said it holds: an ask that
-+// arrives after the asker's own HAVE for the index left its queue before the frame arrived and
-+// was overtaken by the HAVE on the urgent lane, and the HAVE is the later word (handleIWant drops
-+// such an ask). Router goroutine.
 +func (q *rpcQueue) haveRevoke(root string, index uint32) {
 +	q.queueMu.Lock()
 +	defer q.queueMu.Unlock()
 +	if q.have == nil {
 +		return
 +	}
++	if b := q.have.theirs[root]; b != nil {
++		b.Clear(index)
++	}
 +	if c := q.have.claim[root]; c != nil {
 +		c.Clear(index)
 +	}
-+}
-+
-+// havePeerHolds reports whether p's HAVE for root names index. Router goroutine.
-+func (gs *GossipSubRouter) havePeerHolds(p peer.ID, root string, index uint32) bool {
-+	h := gs.have
-+	if h == nil {
-+		return false
-+	}
-+	e := h.peers[p][root]
-+	return e != nil && e.bits.Has(index)
-+}
-+
-+// ownView mirrors what we hold (haveState.mine) for the writers, which drop at dispatch the asks
-+// for frames we have received since they were queued (the spec's §7.2) and run off the router's
-+// goroutine, where mine lives.
-+type ownView struct {
-+	mu   sync.RWMutex
-+	bits map[string]*haveBits
-+	// dead is the groups past their active lifetime (v0.5's D′): every index reads as held, so a
-+	// writer drops the asks for them.
-+	dead map[string]bool
-+}
-+
-+// kill marks root past its lifetime; revive forgets its tombstone.
-+func (o *ownView) kill(root string) {
-+	o.mu.Lock()
-+	defer o.mu.Unlock()
-+	delete(o.bits, root)
-+	if o.dead == nil {
-+		o.dead = make(map[string]bool)
-+	}
-+	o.dead[root] = true
-+}
-+
-+func (o *ownView) revive(root string) {
-+	o.mu.Lock()
-+	defer o.mu.Unlock()
-+	delete(o.dead, root)
-+}
-+
-+func (o *ownView) set(root string, index uint32) {
-+	o.mu.Lock()
-+	defer o.mu.Unlock()
-+	b := o.bits[root]
-+	if b == nil {
-+		b = &haveBits{}
-+		o.bits[root] = b
-+	}
-+	b.Set(index)
-+}
-+
-+func (o *ownView) or(root string, enc []byte) {
-+	o.mu.Lock()
-+	defer o.mu.Unlock()
-+	b := o.bits[root]
-+	if b == nil {
-+		b = &haveBits{}
-+		o.bits[root] = b
-+	}
-+	b.Or(enc)
-+}
-+
-+func (o *ownView) forget(root string) {
-+	o.mu.Lock()
-+	defer o.mu.Unlock()
-+	delete(o.bits, root)
-+}
-+
-+func (o *ownView) has(root string, index uint32) bool {
-+	o.mu.RLock()
-+	defer o.mu.RUnlock()
-+	if o.dead[root] {
-+		return true
-+	}
-+	b := o.bits[root]
-+	return b != nil && b.Has(index)
-+}
-+
-+// ownHeldID reports whether we hold the frame an ask id names: an ask by index, or a frame's id.
-+// Any goroutine.
-+func (h *haveState) ownHeldID(mid string) bool {
-+	root, index, ok := decodeWant(mid)
-+	if !ok {
-+		if root, index, ok = h.index(mid); !ok || len(root) != haveRootLen {
-+			return false
-+		}
-+	}
-+	return h.own.has(root, index)
-+}
-+
-+// dropHeldAsks returns rpc without the ask ids held reports, and how many it dropped; nil when
-+// nothing worth writing is left. Never mutates rpc.
-+func dropHeldAsks(rpc *RPC, held func(string) bool) (*RPC, int) {
-+	n := 0
-+	for _, w := range rpc.Control.GetIwant() {
-+		for _, mid := range w.GetMessageIDs() {
-+			if held(mid) {
-+				n++
-+			}
-+		}
-+	}
-+	if n == 0 {
-+		return rpc, 0
-+	}
-+	c := rpc.Control
-+	ctl := &pb.ControlMessage{Ihave: c.Ihave, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-+	for _, w := range c.Iwant {
-+		var kept []string
-+		for _, mid := range w.GetMessageIDs() {
-+			if !held(mid) {
-+				kept = append(kept, mid)
-+			}
-+		}
-+		if len(kept) > 0 {
-+			ctl.Iwant = append(ctl.Iwant, &pb.ControlIWant{MessageIDs: kept})
-+		}
-+	}
-+	out := shallowRPCCopy(rpc)
-+	out.Control = ctl
-+	if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-+		return nil, n
-+	}
-+	return out, n
 +}
 +
 +// haveClaim folds the peer's claim bitmap in. Router goroutine.
@@ -4026,18 +3756,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	if e == nil {
 +		e = &haveEntry{first: time.Now()}
 +		roots[root] = e
-+	} else if gs.v05OfferSkipped() && e.bits.Count() == 0 {
-+		// Every push counted to p was skipped or refused (v0.5's A′): the guard's clock starts
-+		// again at this one, which p can receive.
-+		e.first = time.Now()
 +	}
 +	e.bits.Set(index)
 +	e.ttl = h.pushTTL
-+	if gs.v05OfferSkipped() {
-+		if q, ok := gs.p.peers[p]; ok {
-+			q.unowe(root, index) // pushed now: no longer owed as an offer
-+		}
-+	}
 +}
 +
 +// haveIHaveIDs returns mids with the structured ids among them replaced by one HAVE per group
@@ -4841,21 +4562,14 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +	pushed[root][p] = struct{}{}
 +}
 +
-+// haveOrigin sends our HAVE for each group in a publish, once, to the topic's mesh, and under
-+// WithOriginHave also to the peers the batch pushed it to: the HAVE a source sends before its data,
-+// so no relay pushes its frames back (the spec's §5.1 before P4). Preprocess no longer sends one per
-+// message as each is added to a batch, N growing HAVEs before the data. Not under an origin HAVE
-+// mode, whose HAVE follows the pops (P4) or the mode's rule. Router goroutine.
++// haveOrigin sends our HAVE for each group in a published batch, once, to the topic's mesh and the peers the batch pushed it to.
 +func (gs *GossipSubRouter) haveOrigin(msgs []*Message, pushed map[string]map[peer.ID]struct{}) {
 +	h := gs.have
-+	if h == nil || !h.idontwantOn || h.originPaced != nil {
++	if h == nil || !h.originHave || !h.idontwantOn {
 +		return
 +	}
 +	sent := make(map[string]bool)
 +	for _, msg := range msgs {
-+		if !h.originHave && len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
-+			continue // by default only where stock IDONTWANT would have gone, above its threshold
-+		}
 +		root, _, ok := h.index(gs.p.idGen.ID(msg))
 +		if !ok || len(root) != haveRootLen || sent[root] || h.mine[root] == nil {
 +			continue
@@ -4897,7 +4611,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +		h.mine[root] = e
 +	}
 +	e.bits.Or(fullHaveBits(count).Bytes())
-+	h.own.or(root, fullHaveBits(count).Bytes())
 +	e.ttl = h.holdTTL
 +	if h.decodeClears && gs.gossipTracer != nil {
 +		gs.gossipTracer.fulfillPromisesWhere(func(mid string) bool { return h.haveInRoot(mid, root) })
@@ -5026,9 +4739,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +		if !ok || len(rt) != haveRootLen {
 +			continue
 +		}
-+		if gs.expired(rt) {
-+			continue // the group passed its lifetime while it decoded (v0.5's D′)
-+		}
 +		if _, held := gs.mcache.Get(mid); held {
 +			continue // it arrived after the decode claim
 +		}
@@ -5124,8 +4834,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap.go fork/havebitm
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/havebitmap_test.go
 --- base/havebitmap_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/havebitmap_test.go	2026-10-22 13:36:32.091069297 +0200
-@@ -0,0 +1,2013 @@
++++ fork/havebitmap_test.go	2026-10-04 18:17:17.134771196 +0200
+@@ -0,0 +1,1938 @@
 +package pubsub
 +
 +import (
@@ -6027,8 +5737,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/hav
 +
 +// TestSolicitedFramesAtDispatch is D7 idea 2's second unit known answer. A solicited frame the
 +// peer has since announced is stale and cancels like any other; a solicited frame the peer asked
-+// for after a full claim is written once the ask revoked its claimed bit; an ask never revokes what
-+// the peer said it holds; and a solicited frame is never projected away.
++// for after a full (no-claim) bitmap is written once the ask revoked its bit; and a solicited
++// frame is never projected away.
 +func TestSolicitedFramesAtDispatch(t *testing.T) {
 +	root := strings.Repeat("g", 32)
 +	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
@@ -6050,7 +5760,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/hav
 +	t.Run("an ask revokes the claimed bit", func(t *testing.T) {
 +		q := newRpcQueue(16)
 +		q.enableHave(testQueueIndex, true, false)
-+		q.haveClaim(root, fullHaveBits(128).Bytes())
++		q.haveTheirs(root, fullHaveBits(128).Bytes())
 +		q.haveRevoke(root, 6)
 +		pushed := testDataRPC(root, 5)
 +		if err := q.Push(pushed, false); err != nil {
@@ -6072,20 +5782,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/hav
 +			t.Fatalf("cancelled = %d, want 1", got)
 +		}
 +	})
-+	t.Run("an ask never revokes a HAVE", func(t *testing.T) {
-+		q := newRpcQueue(16)
-+		q.enableHave(testQueueIndex, true, false)
-+		q.haveTheirs(root, fullHaveBits(128).Bytes())
-+		q.haveRevoke(root, 6)
-+		answer := testDataRPC(root, 6)
-+		answer.solicited = true
-+		if err := q.Push(answer, false); err != nil {
-+			t.Fatal(err)
-+		}
-+		if rpc, err := q.Pop(ctx); err == nil {
-+			t.Fatalf("the peer holds frame 6 by its HAVE, which no ask revokes, so the answer cancels; popped %v", rpc)
-+		}
-+	})
 +	t.Run("never projected away", func(t *testing.T) {
 +		q := newRpcQueue(16)
 +		q.enableHave(testQueueIndex, true, false)
@@ -6093,7 +5789,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/hav
 +		var theirs haveBits
 +		theirs.Set(0)
 +		theirs.Set(1)
++		theirs.Set(2)
 +		q.haveTheirs(root, theirs.Bytes())
++		q.haveRevoke(root, 2)
 +		answer := testDataRPC(root, 2)
 +		answer.solicited = true
 +		if err := q.Push(answer, false); err != nil {
@@ -7076,72 +6774,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/havebitmap_test.go fork/hav
 +		}
 +	})
 +}
-+
-+// TestStaleAsksAtDispatch is the spec's §7.2 known answer for asks: a queued ask for a frame we
-+// have received since leaves no more, an ask for one we still lack does, and an RPC left with
-+// nothing to say is not written.
-+func TestStaleAsksAtDispatch(t *testing.T) {
-+	root := strings.Repeat("s", 32)
-+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-+	defer cancel()
-+	held := map[string]bool{encodeWant(root, 1): true}
-+	q := newRpcQueue(16)
-+	q.enableHave(testQueueIndex, true, false)
-+	q.enableStaleAsks(func(mid string) bool { return held[mid] })
-+	ask := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Iwant: []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 1), encodeWant(root, 2)}}}}}}
-+	only := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Iwant: []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 1)}}}}}}
-+	before := StaleAsksDropped.Load()
-+	for _, r := range []*RPC{ask, only} {
-+		if err := q.Push(r, false); err != nil {
-+			t.Fatal(err)
-+		}
-+	}
-+	rpc, err := q.Pop(ctx)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if ids := rpc.Control.GetIwant()[0].GetMessageIDs(); len(ids) != 1 || ids[0] != encodeWant(root, 2) {
-+		t.Fatalf("the ask for frame 1, held by now, drops and frame 2's stays: got %v", ids)
-+	}
-+	if len(ask.Control.Iwant[0].MessageIDs) != 2 {
-+		t.Fatal("the queued RPC was mutated")
-+	}
-+	if rpc, err := q.Pop(ctx); err == nil {
-+		t.Fatalf("an RPC whose only ask is stale is not written, popped %v", rpc)
-+	}
-+	if got := StaleAsksDropped.Load() - before; got != 2 {
-+		t.Fatalf("stale asks dropped = %d, want 2", got)
-+	}
-+}
-+
-+// TestOwnViewAndPeerHolds: the writers' mirror of what we hold follows arrivals, a full claim and
-+// expiry, and havePeerHolds reads a peer's HAVE.
-+func TestOwnViewAndPeerHolds(t *testing.T) {
-+	root := strings.Repeat("o", 32)
-+	h := newHaveState(func(mid string) (string, uint32, bool) { return testIndex(mid) })
-+	h.own.set(root, 3)
-+	if !h.ownHeldID(encodeWant(root, 3)) || h.ownHeldID(encodeWant(root, 4)) {
-+		t.Fatal("own view: index 3 held, 4 not")
-+	}
-+	h.own.or(root, fullHaveBits(8).Bytes())
-+	if !h.ownHeldID(encodeWant(root, 7)) {
-+		t.Fatal("own view: a full claim holds index 7")
-+	}
-+	h.own.forget(root)
-+	if h.ownHeldID(encodeWant(root, 3)) {
-+		t.Fatal("own view: a forgotten root holds nothing")
-+	}
-+	gs := &GossipSubRouter{have: h}
-+	var b haveBits
-+	b.Set(5)
-+	h.peers["p"] = map[string]*haveEntry{root: {bits: b}}
-+	if !gs.havePeerHolds("p", root, 5) || gs.havePeerHolds("p", root, 6) || gs.havePeerHolds("q", root, 5) {
-+		t.Fatal("havePeerHolds: p holds 5 only, q nothing")
-+	}
-+}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseestimate.go fork/hoseestimate.go
 --- base/hoseestimate.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hoseestimate.go	2026-10-22 13:36:32.091069297 +0200
++++ fork/hoseestimate.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,342 @@
 +package pubsub
 +
@@ -7487,7 +7122,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseestimate.go fork/hosees
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseestimate_test.go fork/hoseestimate_test.go
 --- base/hoseestimate_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hoseestimate_test.go	2026-10-22 13:36:32.091491981 +0200
++++ fork/hoseestimate_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,131 @@
 +package pubsub
 +
@@ -7622,7 +7257,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseestimate_test.go fork/h
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hosefwd.go fork/hosefwd.go
 --- base/hosefwd.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hosefwd.go	2026-10-22 13:36:32.091491981 +0200
++++ fork/hosefwd.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,277 @@
 +package pubsub
 +
@@ -7903,7 +7538,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hosefwd.go fork/hosefwd.go
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hosefwd_test.go fork/hosefwd_test.go
 --- base/hosefwd_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hosefwd_test.go	2026-10-22 13:36:32.091491981 +0200
++++ fork/hosefwd_test.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,95 @@
 +package pubsub
 +
@@ -8002,7 +7637,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hosefwd_test.go fork/hosefw
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hose.go fork/hose.go
 --- base/hose.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hose.go	2026-10-22 13:36:32.091069297 +0200
++++ fork/hose.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,536 @@
 +package pubsub
 +
@@ -8542,7 +8177,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hose.go fork/hose.go
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseoffer.go fork/hoseoffer.go
 --- base/hoseoffer.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hoseoffer.go	2026-10-22 13:36:32.091491981 +0200
++++ fork/hoseoffer.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,199 @@
 +package pubsub
 +
@@ -8745,7 +8380,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hoseoffer.go fork/hoseoffer
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hose_test.go fork/hose_test.go
 --- base/hose_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/hose_test.go	2026-10-22 13:36:32.091069297 +0200
++++ fork/hose_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,164 @@
 +package pubsub
 +
@@ -8913,7 +8548,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/hose_test.go fork/hose_test
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/ihaveobs.go fork/ihaveobs.go
 --- base/ihaveobs.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/ihaveobs.go	2026-10-22 13:36:32.091491981 +0200
++++ fork/ihaveobs.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,141 @@
 +package pubsub
 +
@@ -9058,7 +8693,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/ihaveobs.go fork/ihaveobs.g
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/linkdisclose.go fork/linkdisclose.go
 --- base/linkdisclose.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/linkdisclose.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/linkdisclose.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,639 @@
 +package pubsub
 +
@@ -9701,7 +9336,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/linkdisclose.go fork/linkdi
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/linkdisclose_test.go fork/linkdisclose_test.go
 --- base/linkdisclose_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/linkdisclose_test.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/linkdisclose_test.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,450 @@
 +package pubsub
 +
@@ -10154,8 +9789,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/linkdisclose_test.go fork/l
 +	})
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/mcache.go fork/mcache.go
---- base/mcache.go	2026-10-22 13:36:32.074338559 +0200
-+++ fork/mcache.go	2026-10-22 13:36:32.092065490 +0200
+--- base/mcache.go	2026-10-04 18:17:17.114496663 +0200
++++ fork/mcache.go	2026-10-04 18:17:17.134771196 +0200
 @@ -58,6 +58,14 @@
  	mc.history[0] = append(mc.history[0], CacheEntry{mid: mid, topic: msg.GetTopic()})
  }
@@ -10172,8 +9807,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/mcache.go fork/mcache.go
  	m, ok := mc.msgs[mid]
  	return m, ok
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/messagebatch.go fork/messagebatch.go
---- base/messagebatch.go	2026-10-22 13:36:32.074338559 +0200
-+++ fork/messagebatch.go	2026-10-22 13:36:32.092065490 +0200
+--- base/messagebatch.go	2026-10-04 18:17:17.114496663 +0200
++++ fork/messagebatch.go	2026-10-04 18:17:17.133771201 +0200
 @@ -47,22 +47,35 @@
  	rpc  *RPC
  }
@@ -10215,7 +9850,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/messagebatch.go fork/messag
  					continue
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pacedgossip.go fork/pacedgossip.go
 --- base/pacedgossip.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/pacedgossip.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/pacedgossip.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,238 @@
 +package pubsub
 +
@@ -10457,7 +10092,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pacedgossip.go fork/pacedgo
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pacedgossip_test.go fork/pacedgossip_test.go
 --- base/pacedgossip_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/pacedgossip_test.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/pacedgossip_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,97 @@
 +package pubsub
 +
@@ -10558,7 +10193,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pacedgossip_test.go fork/pa
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/parkscope.go fork/parkscope.go
 --- base/parkscope.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/parkscope.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/parkscope.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,179 @@
 +package pubsub
 +
@@ -10741,7 +10376,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/parkscope.go fork/parkscope
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/parkscope_test.go fork/parkscope_test.go
 --- base/parkscope_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/parkscope_test.go	2026-10-22 13:36:32.093884815 +0200
++++ fork/parkscope_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,140 @@
 +package pubsub
 +
@@ -10866,8 +10501,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/parkscope_test.go fork/park
 +		for _, mid := range []string{held, open} {
 +			gs.iwantPromised[mid] = map[peer.ID]time.Time{p: at}
 +		}
-+		gs.promiseDue(held, p, at, at)
-+		gs.promiseDue(open, p, at, at)
++		gs.promiseDue(held, p, at)
++		gs.promiseDue(open, p, at)
 +		return gs
 +	}
 +	t.Run("off, both promises break and the held one is counted", func(t *testing.T) {
@@ -10885,7 +10520,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/parkscope_test.go fork/park
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialinterest_test.go fork/partialinterest_test.go
 --- base/partialinterest_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/partialinterest_test.go	2026-10-22 13:36:32.092065490 +0200
++++ fork/partialinterest_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,354 @@
 +package pubsub
 +
@@ -11242,8 +10877,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialinterest_test.go for
 +	})
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialmessages/partialmsgs.go fork/partialmessages/partialmsgs.go
---- base/partialmessages/partialmsgs.go	2026-10-22 13:36:32.075043831 +0200
-+++ fork/partialmessages/partialmsgs.go	2026-10-22 13:36:32.092529854 +0200
+--- base/partialmessages/partialmsgs.go	2026-10-04 18:17:17.114837370 +0200
++++ fork/partialmessages/partialmsgs.go	2026-10-04 18:17:17.131895121 +0200
 @@ -41,6 +41,24 @@
  	// PublishPartial. Returning an error does not prevent other PublishActions
  	// from executing or affect the PeerState map.
@@ -11343,8 +10978,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialmessages/partialmsgs
  
  func (e *PartialMessagesExtension[PeerState]) HandleRPC(from peer.ID, rpc *pb.PartialMessagesExtension) error {
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialmessages/partialmsgs_test.go fork/partialmessages/partialmsgs_test.go
---- base/partialmessages/partialmsgs_test.go	2026-10-22 13:36:32.075043831 +0200
-+++ fork/partialmessages/partialmsgs_test.go	2026-10-22 13:36:32.092529854 +0200
+--- base/partialmessages/partialmsgs_test.go	2026-10-04 18:17:17.114837370 +0200
++++ fork/partialmessages/partialmsgs_test.go	2026-10-04 18:17:17.131895121 +0200
 @@ -26,6 +26,9 @@
  type testRouter struct {
  	sendRPC   func(p peer.ID, r *pubsub_pb.PartialMessagesExtension, urgent bool)
@@ -11496,8 +11131,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/partialmessages/partialmsgs
 +	}
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phaseforward.go
---- base/phaseforward.go	2026-10-22 13:36:32.082361265 +0200
-+++ fork/phaseforward.go	2026-10-22 13:36:32.093884815 +0200
+--- base/phaseforward.go	2026-10-04 18:17:17.122303858 +0200
++++ fork/phaseforward.go	2026-10-04 18:17:17.134771196 +0200
 @@ -42,6 +42,24 @@
  	srcMode   PhaseSourceMode
  	srcDelay  time.Duration
@@ -12469,7 +12104,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  }
  
  // --- F2a per-class admission loss (measurement-plan section 15) ---
-@@ -355,13 +1189,23 @@
+@@ -355,13 +1189,20 @@
  	return int(x%100) < gs.lossPct
  }
  
@@ -12487,15 +12122,12 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  	if gs.lossClass == lossClassNone || rpc == nil {
  		return rpc
  	}
-+	if gs.lossClass == lossClassIWant && gs.v05PromiseAtWrite() {
-+		return rpc // under v0.5's E the asks' loss is drawn at the writer (specv05.go, askLoss)
-+	}
  	dropped := int64(0)
 +	out := rpc
  	switch gs.lossClass {
  	case lossClassData:
  		if len(rpc.Publish) == 0 {
-@@ -378,62 +1222,85 @@
+@@ -378,62 +1219,85 @@
  		if dropped == 0 {
  			return rpc
  		}
@@ -12542,12 +12174,12 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  		switch gs.lossClass {
  		case lossClassIHave:
 -			idss := make([][]string, len(ctl.Ihave))
--			for i, e := range ctl.Ihave {
++			entries := make([]*pb.ControlIHave, len(ctl.Ihave))
+ 			for i, e := range ctl.Ihave {
 -				idss[i] = e.MessageIDs
 -			}
 -			dropped = filter(idss)
-+			entries := make([]*pb.ControlIHave, len(ctl.Ihave))
- 			for i, e := range ctl.Ihave {
+-			for i, e := range ctl.Ihave {
 -				e.MessageIDs = idss[i]
 +				kept, n := filterIDs(e.MessageIDs)
 +				if n == 0 {
@@ -12594,10 +12226,10 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +				entries[i] = &pb.ControlIDontWant{MessageIDs: kept}
  			}
 +			newCtl.Idontwant = entries
- 		}
++		}
 +		if dropped == 0 {
 +			return rpc
-+		}
+ 		}
 +		out = &RPC{from: rpc.from}
 +		out.Subscriptions = rpc.Subscriptions
 +		out.Publish = rpc.Publish
@@ -12614,7 +12246,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  		empty := true
  		for _, e := range ctl.Ihave {
  			empty = empty && len(e.MessageIDs) == 0
-@@ -448,7 +1315,7 @@
+@@ -448,7 +1312,7 @@
  			return nil
  		}
  	}
@@ -12623,7 +12255,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  }
  
  // phaseRank scores one (message, peer) pair. FNV-1a avalanched with the splitmix64
-@@ -517,6 +1384,129 @@
+@@ -517,6 +1381,129 @@
  	}
  }
  
@@ -12731,7 +12363,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		}
 +		gs.offerTried[mid][from] = time.Now()
 +	}
-+	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
++	if gs.iwantPromised != nil {
 +		if gs.iwantPromised[mid] == nil {
 +			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
 +		}
@@ -12743,7 +12375,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		m, f := mid, from
 +		time.AfterFunc(gs.parkPromise, func() {
 +			select {
-+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
++			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
 +			case <-gs.p.ctx.Done():
 +			}
 +		})
@@ -12753,7 +12385,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  // --- Deterministic randomness (common-random-numbers mode for the harness) ---
  //
  // Gossipsub's mesh draw runs the global math/rand over map-iteration-ordered candidate
-@@ -941,21 +1931,53 @@
+@@ -941,21 +1928,52 @@
  	}
  }
  
@@ -12776,7 +12408,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		gs.redrivePulls()
 +	}
 +	gs.clearOffers(mid)
-+	gs.v05ChunkDelivered(mid)
  }
  
  // iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
@@ -12809,7 +12440,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  		// Adaptive hedge (two-controller form) takes precedence over the fixed one.
  		if gs.adaptHedge != nil {
  			return gs.hedgeAllowedAdaptive(mid, elapsed)
-@@ -973,6 +1995,125 @@
+@@ -973,6 +1991,123 @@
  	if gs.iwantCount != nil {
  		gs.iwantCount[mid] = 1
  	}
@@ -12826,7 +12457,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +			}
 +		})
 +	}
-+	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
++	if gs.iwantPromised != nil {
 +		// Two-timer design: the promise is per (id, peer) and survives the discipline's
 +		// move-on, so a fast window re-asks elsewhere while the slow/withholding peer's
 +		// own deadline (parkPromise, which may exceed the window) still runs to judgment.
@@ -12845,7 +12476,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		m, f := mid, from
 +		time.AfterFunc(gs.parkPromise, func() {
 +			select {
-+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
++			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
 +			case <-gs.p.ctx.Done():
 +			}
 +		})
@@ -12857,15 +12488,13 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +// cleared (delivery of the id, from anyone) or re-made (a newer ask to the same peer) is not
 +// charged; an open one breaks: the asked peer is charged and possibly parked. The discipline
 +// slot is refunded only when this ask is still the current one (a shorter window has usually
-+// moved on already — then there is nothing left to refund). promisedAt identifies the promise;
-+// decidedAt is when the ask was decided, which differs from it when the promise starts at the
-+// write (v0.5's E).
-+func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, promisedAt, decidedAt time.Time) {
++// moved on already — then there is nothing left to refund).
++func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Time) {
 +	if gs.iwantPromised == nil {
 +		return
 +	}
 +	peers := gs.iwantPromised[mid]
-+	if at, open := peers[from]; !open || !at.Equal(promisedAt) {
++	if at, open := peers[from]; !open || !at.Equal(askedAt) {
 +		return
 +	}
 +	if gs.haveHolds(mid) {
@@ -12876,7 +12505,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		}
 +	}
 +	gs.notePromiseBreak(mid, from)
-+	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(decidedAt) {
++	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(askedAt) {
 +		delete(gs.iwantAsked, mid)
 +		if gs.iwantCount != nil {
 +			delete(gs.iwantCount, mid)
@@ -12935,7 +12564,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  	return true
  }
  
-@@ -983,12 +2124,52 @@
+@@ -983,12 +2118,51 @@
  	}
  	for mid, at := range gs.iwantAsked {
  		if time.Since(at) >= gs.iwantWindow {
@@ -12951,7 +12580,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +	// for a fresh offer that may never come (relays announce once).
 +	gs.redrivePulls()
 +	gs.sweepOffers()
-+	gs.sweepV05()
 +	gs.sweepGroupParks()
 +}
 +
@@ -12988,7 +12616,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  }
  
  // --- Announce-fed holder tracking (for phase forwarding) ---
-@@ -999,6 +2180,177 @@
+@@ -999,6 +2173,177 @@
  // that sent us an IHAVE for a message id holds it. Opt-in, because it changes the measured
  // behaviour of the existing phase arms.
  
@@ -13166,7 +12794,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  // WithPhaseAnnounceHolders feeds received IHAVEs into phase forwarding's holder estimate.
  func WithPhaseAnnounceHolders() Option {
  	return func(ps *PubSub) error {
-@@ -1047,17 +2399,468 @@
+@@ -1047,17 +2392,454 @@
  }
  
  // clearPhaseHolders drops holder entries older than the retention window; called from the
@@ -13373,9 +13001,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +	}
 +	if _, known := peers[p]; !known {
 +		gs.offerByPeer[p]++
-+		if gs.v05LastResort() {
-+			gs.noteOrder(mid, p)
-+		}
 +	}
 +	peers[p] = time.Now()
 +}
@@ -13393,7 +13018,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +	delete(gs.offerTable, mid)
 +	delete(gs.offerTried, mid)
 +	delete(gs.offerTopic, mid)
-+	gs.v05ClearList(mid)
 +}
 +
 +// sweepOffers ages out stale offers; called from the heartbeat sweep.
@@ -13407,9 +13031,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +				delete(peers, p)
 +				if gs.offerByPeer[p] > 0 {
 +					gs.offerByPeer[p]--
-+				}
-+				if gs.v05LastResort() {
-+					gs.dropOrder(mid, p)
 +				}
 +			}
 +		}
@@ -13430,15 +13051,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
 +		gs.clearOffers(mid)
 +		return
 +	}
-+	if gs.expiredID(mid) {
-+		return // the group passed its lifetime (v0.5's D′)
-+	}
 +	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 +		return // an ask is in flight; its own retry timer will fire
-+	}
-+	if gs.v05LastResort() {
-+		gs.retryV05(mid) // every announcer in announcement order, and the last resort
-+		return
 +	}
 +	offers := gs.offerTable[mid]
 +	if len(offers) == 0 {
@@ -13639,29 +13253,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  }
  
  // --- Application request gate ---
-@@ -1176,8 +2979,8 @@
- // noteDeclined records that p offered mid on topic and the gate said no. Called from the selection
- // path, where the peer and topic are both in hand.
- func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
--	if gs.deferred == nil {
--		return
-+	if gs.deferred == nil || (gs.v05 != nil && gs.v05.LedgerFromOffers) {
-+		return // under v0.5's C′ the offer table is the ledger
- 	}
- 	e, ok := gs.deferred[mid]
- 	if !ok {
-@@ -1205,6 +3008,10 @@
- // outstanding-request discipline and the promise tracker all apply exactly as they would to a fresh
- // announcement. A replay that bypassed them would be a second, unaccounted request channel.
- func (gs *GossipSubRouter) replayDeferred() {
-+	if gs.v05 != nil && gs.v05.LedgerFromOffers && gs.requestGate != nil {
-+		gs.replayLedger()
-+		return
-+	}
- 	if gs.deferred == nil || gs.requestGate == nil {
- 		return
- 	}
-@@ -1280,6 +3087,7 @@
+@@ -1280,6 +3062,7 @@
  		}
  		gs.iasked[pid] += len(lst)
  		gs.gossipTracer.AddPromise(pid, lst)
@@ -13671,7 +13263,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward.go fork/phasef
  		for _, mid := range lst {
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward_iwant_alloc_test.go fork/phaseforward_iwant_alloc_test.go
 --- base/phaseforward_iwant_alloc_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/phaseforward_iwant_alloc_test.go	2026-10-22 13:36:32.092831756 +0200
++++ fork/phaseforward_iwant_alloc_test.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,349 @@
 +package pubsub
 +
@@ -14024,7 +13616,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward_iwant_alloc_te
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward_srcconns_test.go fork/phaseforward_srcconns_test.go
 --- base/phaseforward_srcconns_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/phaseforward_srcconns_test.go	2026-10-22 13:36:32.092831756 +0200
++++ fork/phaseforward_srcconns_test.go	2026-10-04 18:17:17.134771196 +0200
 @@ -0,0 +1,346 @@
 +package pubsub
 +
@@ -14373,9 +13965,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/phaseforward_srcconns_test.
 +	})
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
---- base/pubsub.go	2026-10-22 13:36:32.085726506 +0200
-+++ fork/pubsub.go	2026-10-22 13:36:32.092831756 +0200
-@@ -94,6 +94,22 @@
+--- base/pubsub.go	2026-10-04 18:17:17.125967401 +0200
++++ fork/pubsub.go	2026-10-04 18:17:17.134771196 +0200
+@@ -94,6 +94,15 @@
  
  	// size of the outbound message channel that we maintain for each peer
  	peerOutboundQueueSize int
@@ -14383,13 +13975,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
 +	dispatchCredits *dispatchCredits
 +	// hose, when set, is the node-wide window over frames in flight (WithHoseWindow).
 +	hose *hoseWindow
-+	// queueHooks, when set, installs the writer's side of the v0.5 rules on each new peer queue
-+	// (WithSpecV05).
-+	queueHooks func(*rpcQueue)
-+	// admitMsg, when set, decides whether a received message enters at all: at ingress, before
-+	// Preprocess and validation, and again when validation finishes (WithSpecV05's D′: a chunk of a
-+	// group past its lifetime is ignored). processLoop goroutine.
-+	admitMsg func(*Message) bool
 +	// upload counts the bytes this node has written to its streams, by class (upload.go).
 +	upload uploadCounter
 +	// writersBlocked counts the writer goroutines inside a stream write: the hose estimate's
@@ -14398,7 +13983,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
  
  	// incoming messages from other peers
  	incoming chan incomingUnion
-@@ -191,6 +207,8 @@
+@@ -191,6 +200,8 @@
  	// normal doDropRPC path -- real queue pressure from a slow drain, not a probabilistic
  	// strip (that is F2a). Models a node whose send path cannot keep up.
  	sendDelay time.Duration
@@ -14407,7 +13992,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
  
  	inboundStreamsMx sync.Mutex
  	inboundStreams   map[peer.ID]inboundHandler
-@@ -328,6 +346,19 @@
+@@ -328,6 +339,14 @@
  
  	// unexported on purpose, not sending this over the wire
  	from peer.ID
@@ -14419,49 +14004,28 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
 +	// solicited marks an IWANT answer: the peer asked for these frames after any bitmap it
 +	// sent, so the dispatch-time cancel and projection leave them alone (havebitmap.go).
 +	solicited bool
-+	// asks is every ask id the writer writes with this RPC, lost ones included, for v0.5's E
-+	// (specv05.go): set by the writer as it pops the RPC, read at the write. lostOnly marks an RPC
-+	// whose asks a class loss took entirely: reported at the write, then nothing is written.
-+	asks     []string
-+	lostOnly bool
  }
  
  func (rpc *RPC) From() peer.ID {
-@@ -1135,6 +1166,11 @@
+@@ -1135,6 +1154,8 @@
  		}
  
  		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 +		rpcQueue.credits = p.dispatchCredits
 +		rpcQueue.hose, rpcQueue.peer = p.hose, pid
-+		if p.queueHooks != nil {
-+			p.queueHooks(rpcQueue)
-+		}
  		p.peers[pid] = rpcQueue
  		go p.handleNewPeer(p.ctx, pid, rpcQueue)
  	}
-@@ -1197,6 +1233,11 @@
+@@ -1197,6 +1218,8 @@
  			// we respawn the writer as we need to ensure there is a stream active
  			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
  			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 +			rpcQueue.credits = p.dispatchCredits
 +			rpcQueue.hose, rpcQueue.peer = p.hose, pid
-+			if p.queueHooks != nil {
-+				p.queueHooks(rpcQueue)
-+			}
  			p.peers[pid] = rpcQueue
  			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
  		}
-@@ -1713,6 +1754,9 @@
- 			}
- 
- 			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
-+			if p.admitMsg != nil && !p.admitMsg(msg) {
-+				continue
-+			}
- 			if p.shouldPush(msg) {
- 				toPush = append(toPush, msg)
- 			}
-@@ -1772,6 +1816,12 @@
+@@ -1772,6 +1795,12 @@
  	id := p.idGen.ID(msg)
  	if p.seenMessage(id) {
  		p.tracer.DuplicateMessage(msg)
@@ -14474,22 +14038,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/pubsub.go fork/pubsub.go
  		return false
  	}
  
-@@ -1825,6 +1875,12 @@
- }
- 
- func (p *PubSub) publishMessage(msg *Message) {
-+	if !msg.Local && p.admitMsg != nil && !p.admitMsg(msg) {
-+		// Its group died while it was being validated: ignored, and the tracers that saw it enter
-+		// validation see it end there.
-+		p.tracer.RejectMessage(msg, RejectValidationIgnored)
-+		return
-+	}
- 	if !p.markDelivered(p.idGen.ID(msg)) {
- 		return
- 	}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/requestobs.go fork/requestobs.go
 --- base/requestobs.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/requestobs.go	2026-10-22 13:36:32.092831756 +0200
++++ fork/requestobs.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,225 @@
 +package pubsub
 +
@@ -14717,25 +14268,22 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/requestobs.go fork/requesto
 +	}
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue.go
---- base/rpc_queue.go	2026-10-22 13:36:32.082879740 +0200
-+++ fork/rpc_queue.go	2026-10-22 13:36:32.093884815 +0200
-@@ -3,7 +3,15 @@
+--- base/rpc_queue.go	2026-10-04 18:17:17.122783926 +0200
++++ fork/rpc_queue.go	2026-10-04 18:17:17.134771196 +0200
+@@ -3,7 +3,12 @@
  import (
  	"context"
  	"errors"
 +	"fmt"
-+	"sort"
  	"sync"
 +	"sync/atomic"
 +	"time"
 +
-+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 +	"github.com/libp2p/go-libp2p/core/peer"
-+	"google.golang.org/protobuf/proto"
  )
  
  var (
-@@ -13,8 +21,15 @@
+@@ -13,8 +18,15 @@
  	ErrQueuePushOnClosed = errors.New("push on closed rpc queue")
  )
  
@@ -14752,7 +14300,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  	priority []*RPC
  }
  
-@@ -23,13 +38,25 @@
+@@ -23,13 +35,25 @@
  }
  
  func (q *priorityQueue) NormalPush(rpc *RPC) {
@@ -14779,7 +14327,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  func (q *priorityQueue) Pop() *RPC {
  	var rpc *RPC
  
-@@ -38,9 +65,20 @@
+@@ -38,9 +62,20 @@
  		q.priority[0] = nil
  		q.priority = q.priority[1:]
  	} else if len(q.normal) > 0 {
@@ -14803,7 +14351,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  	}
  
  	return rpc
-@@ -55,24 +93,252 @@
+@@ -55,24 +90,209 @@
  
  	closed  bool
  	maxSize int
@@ -14845,27 +14393,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +	// HoseConfig.PeerCap when one of them is acknowledged or expires.
 +	hoseToPeer int
 +	peerFree   chan struct{}
-+
-+	// The writer's side of the v0.5 rules (specv05.go), installed as the queue is made. onAsks
-+	// hears the ask ids of each RPC the writer pops, and when (E: the promise starts at the write);
-+	// askLoss, when set, is the IWANT class loss drawn there under E. onSkipped hears the pushes
-+	// projection skipped (A′). owed is the offers owed to the peer, per group, which ride on the next
-+	// RPC out or leave alone; owedAnswers the answers a full queue refused, one per chunk, requeued
-+	// as soon as there is room. owedFilter, when set, is the class loss the owed offers must pass;
-+	// owedSent counts the indices they carried. Under queueMu.
-+	onAsks      func(mids []string, at time.Time)
-+	askLoss     func(ids []string) (kept, lost []string)
-+	onSkipped   func(msgs []*pb.Message)
-+	owed        map[string]*owedGroup
-+	owedAnswers []*pb.Message
-+	owedFilter  func(*RPC) *RPC
-+	owedSent    *atomic.Int64
-+}
-+
-+// owedGroup is one group's offers owed to the peer.
-+type owedGroup struct {
-+	topic string
-+	bits  haveBits
  }
  
  func newRpcQueue(maxSize int) *rpcQueue {
@@ -14995,31 +14522,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +	}
 +	if projected > 0 {
 +		q.projected.Add(int64(projected))
-+		if q.onSkipped != nil {
-+			// A′: the skipped pushes go back to the router, which no longer counts them and owes
-+			// a mesh peer their offer. Read before notePopped below moves the projection.
-+			var skipped []*pb.Message
-+			for _, m := range rpc.Publish {
-+				if !(q.have.cancelOn && q.have.held(m)) && q.have.projectedComplete(m) {
-+					skipped = append(skipped, m)
-+				}
-+			}
-+			q.onSkipped(skipped)
-+		}
 +	}
 +	if kept == nil {
 +		return nil
-+	}
-+	if q.have.ownHeld != nil && kept.Control != nil && len(kept.Control.Iwant) > 0 {
-+		// Asks for frames we hold by now leave no more (the spec's §7.2).
-+		out, dropped := dropHeldAsks(kept, q.have.ownHeld)
-+		if dropped > 0 {
-+			StaleAsksDropped.Add(int64(dropped))
-+			if out == nil {
-+				return nil
-+			}
-+			kept = out
-+		}
 +	}
 +	if out := q.have.attach(kept); out != nil {
 +		q.attached.Add(1)
@@ -15060,7 +14565,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  	q.queueMu.Lock()
  	defer q.queueMu.Unlock()
  
-@@ -93,8 +359,17 @@
+@@ -93,8 +313,17 @@
  	}
  	if urgent {
  		q.queue.PriorityPush(rpc)
@@ -15079,7 +14584,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  	}
  
  	q.dataAvailable.Signal()
-@@ -113,28 +388,453 @@
+@@ -113,28 +342,131 @@
  	}
  
  	unregisterAfterFunc := context.AfterFunc(ctx, func() {
@@ -15098,11 +14603,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 -			return nil, ErrQueueCancelled
 -		default:
 +	for {
-+		q.requeueOwedAnswersLocked()
-+		for q.queue.Len() == 0 && len(q.owed) == 0 {
++		for q.queue.Len() == 0 {
 +			// Nothing to send: a held slot goes back so another peer's writer can use it.
 +			q.releaseCreditLocked()
-+			q.releaseHoseGrantLocked()
 +			select {
 +			case <-ctx.Done():
 +				return nil, ErrQueueCancelled
@@ -15112,15 +14615,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +			if q.closed {
 +				return nil, ErrQueueClosed
 +			}
-+			q.requeueOwedAnswersLocked()
-+		}
-+		if q.queue.Len() == 0 {
-+			// Only owed offers wait: they leave alone (A′), and take no window slot.
-+			q.releaseHoseGrantLocked()
-+			if out := q.withOwedLocked(nil); out != nil {
-+				return out, nil
-+			}
-+			continue
 +		}
 +		if len(q.queue.priority) > 0 {
 +			// The urgent lane neither takes nor waits for a slot.
@@ -15128,9 +14622,7 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +			q.queuedBytes -= int64(rpc.size)
 +			q.spaceAvailable.Signal()
 +			if out := q.dispatch(rpc); out != nil {
-+				if out = q.finishPopLocked(out); out != nil {
-+					return out, nil
-+				}
++				return out, nil
 +			}
 +			continue
 +		}
@@ -15159,7 +14651,11 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +				return nil, ErrQueueClosed
 +			}
 +			continue
-+		}
+ 		}
+-		q.dataAvailable.Wait()
+-		// It can receive a signal because the queue is closed.
+-		if q.closed {
+-			return nil, ErrQueueClosed
 +		if q.hose != nil && q.have != nil && !q.hoseHolding && q.hose.cfg.PeerCap > 0 &&
 +			q.hoseToPeer >= q.hose.cfg.PeerCap && q.hasDataLocked() {
 +			// This peer already has its cap of frames in flight: wait for one to be acknowledged
@@ -15226,328 +14722,16 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
 +			q.hoseAfterPopLocked(out)
 +		}
 +		if out != nil {
-+			if out = q.finishPopLocked(out); out != nil {
-+				return out, nil
-+			}
-+		}
-+	}
-+}
-+
-+// releaseHoseGrantLocked returns a window slot this writer was granted and has not used: the frame
-+// it waited for was discarded meanwhile (a group past its lifetime, v0.5's D′). Off the v0.5 paths a
-+// writer never holds a grant with nothing queued, so this does nothing there. Under queueMu.
-+func (q *rpcQueue) releaseHoseGrantLocked() {
-+	if q.hoseHolding {
-+		q.hoseHolding = false
-+		q.hose.unused()
-+	}
-+}
-+
-+// finishPopLocked is the last step before an RPC leaves the queue: what is owed rides on it (A′),
-+// and its asks are reported as written (E), the ones an IWANT class loss takes included, since that
-+// loss stands for the wire. nil when the loss took all it carried. Under queueMu.
-+func (q *rpcQueue) finishPopLocked(out *RPC) *RPC {
-+	if len(q.owed) > 0 {
-+		if with := q.withOwedLocked(out); with != nil {
-+			out = with
-+		}
-+	}
-+	if q.onAsks != nil {
-+		var mids []string
-+		for _, w := range out.GetControl().GetIwant() {
-+			mids = append(mids, w.GetMessageIDs()...)
-+		}
-+		if len(mids) > 0 {
-+			if q.askLoss != nil {
-+				if kept, lost := q.askLoss(mids); len(lost) > 0 {
-+					if out = withAsks(out, kept); out == nil {
-+						// All lost on the wire: written all the same, at the write (after any send
-+						// delay), and then nothing goes out.
-+						return &RPC{asks: mids, lostOnly: true}
-+					}
-+				}
-+			}
-+			// The asks are reported when the writer writes the RPC (noteWrite), after any send delay;
-+			// an RPC carrying asks is per peer, but it is copied before it is marked.
-+			out = shallowRPCCopy(out)
-+			out.asks = mids
-+		}
-+	}
-+	return out
-+}
-+
-+// noteAsksWritten reports rpc's asks as written now (E). The writer goroutine, at the write.
-+func (q *rpcQueue) noteAsksWritten(rpc *RPC) {
-+	if q.onAsks != nil && len(rpc.asks) > 0 {
-+		q.onAsks(rpc.asks, time.Now())
-+	}
-+}
-+
-+// withAsks returns rpc with its asks replaced by ids (none when ids is empty); nil when nothing
-+// else is left to write. Never mutates rpc.
-+func withAsks(rpc *RPC, ids []string) *RPC {
-+	c := rpc.Control
-+	ctl := &pb.ControlMessage{Ihave: c.Ihave, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-+	if len(ids) > 0 {
-+		ctl.Iwant = []*pb.ControlIWant{{MessageIDs: ids}}
-+	}
-+	out := shallowRPCCopy(rpc)
-+	out.urgent = rpc.urgent
-+	out.Control = ctl
-+	if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-+		return nil
-+	}
-+	return out
-+}
-+
-+// owe adds bits of root to what is owed to the peer as offers, and wakes the writer. Router
-+// goroutine (specv05.go).
-+func (q *rpcQueue) owe(topic, root string, bits *haveBits) {
-+	q.queueMu.Lock()
-+	defer q.queueMu.Unlock()
-+	if q.closed {
-+		return
-+	}
-+	if q.owed == nil {
-+		q.owed = make(map[string]*owedGroup)
-+	}
-+	g := q.owed[root]
-+	if g == nil {
-+		g = &owedGroup{topic: topic}
-+		q.owed[root] = g
-+	}
-+	g.bits.Or(bits.Bytes())
-+	q.dataAvailable.Signal()
-+}
-+
-+// unowe drops index of root from what is owed: we pushed it to the peer since. Router goroutine.
-+func (q *rpcQueue) unowe(root string, index uint32) {
-+	q.queueMu.Lock()
-+	defer q.queueMu.Unlock()
-+	if g := q.owed[root]; g != nil {
-+		g.bits.Clear(index)
-+	}
-+}
-+
-+// oweAnswer keeps an answer a full queue refused, to be queued once there is room. Router
-+// goroutine.
-+func (q *rpcQueue) oweAnswer(m *pb.Message) {
-+	q.queueMu.Lock()
-+	defer q.queueMu.Unlock()
-+	if q.closed {
-+		return
-+	}
-+	for _, o := range q.owedAnswers {
-+		if o == m || q.sameChunk(o, m) {
-+			return // one owed answer per chunk, as the spec's owed_answers bitmap holds
-+		}
-+	}
-+	// (Without a group and index, distinct messages stay distinct, even with equal payloads.)
-+	q.owedAnswers = append(q.owedAnswers, m)
-+	// The writer may have drained the queue and gone to sleep since the push was refused.
-+	q.dataAvailable.Signal()
-+}
-+
-+// sameChunk reports whether a and b are the same chunk: the same group and index, when the queue
-+// knows the index function and both have one. Otherwise only the same message object is.
-+func (q *rpcQueue) sameChunk(a, b *pb.Message) bool {
-+	if q.have != nil {
-+		ra, ia, oka := q.have.index(a)
-+		rb, ib, okb := q.have.index(b)
-+		if oka && okb {
-+			return ra == rb && ia == ib
-+		}
-+	}
-+	return false
-+}
-+
-+// requeueOwedAnswersLocked queues the owed answers while the queue has room: from there each is an
-+// ordinary answer, which the dispatch-time cancel drops if the peer has claimed it meanwhile.
-+// Under queueMu.
-+func (q *rpcQueue) requeueOwedAnswersLocked() {
-+	for len(q.owedAnswers) > 0 && q.queue.Len() < q.maxSize {
-+		m := q.owedAnswers[0]
-+		q.owedAnswers[0] = nil
-+		q.owedAnswers = q.owedAnswers[1:]
-+		rpc := &RPC{RPC: pb.RPC{Publish: []*pb.Message{m}}, solicited: true}
-+		rpc.size = proto.Size(&rpc.RPC)
-+		q.queue.NormalPush(rpc)
-+		q.queuedBytes += int64(rpc.size)
-+		if q.queuedBytes > q.peakQueued {
-+			q.peakQueued = q.queuedBytes
-+		}
-+	}
-+}
-+
-+// discardGroup drops a group past its lifetime from the queue (v0.5's D′): what is owed of it, and
-+// its frames, offers and asks in every queued RPC; its HAVEs stay. ofMsg and ofID tell a frame and
-+// an id of the group. Returns how many frames and ids it dropped. Queued RPCs are shared across
-+// peers, so a changed one is replaced by a copy. Router goroutine.
-+func (q *rpcQueue) discardGroup(root string, ofMsg func(*pb.Message) bool, ofID func(string) bool) int {
-+	q.queueMu.Lock()
-+	defer q.queueMu.Unlock()
-+	dropped := 0
-+	delete(q.owed, root)
-+	answers := q.owedAnswers[:0]
-+	for _, m := range q.owedAnswers {
-+		if ofMsg(m) {
-+			dropped++
-+			continue
-+		}
-+		answers = append(answers, m)
-+	}
-+	q.owedAnswers = answers
-+	filter := func(rpc *RPC) *RPC {
-+		n := 0
-+		var publish []*pb.Message
-+		for _, m := range rpc.Publish {
-+			if ofMsg(m) {
-+				n++
-+				continue
-+			}
-+			publish = append(publish, m)
-+		}
-+		ctl := rpc.GetControl()
-+		var ihave []*pb.ControlIHave
-+		var iwant []*pb.ControlIWant
-+		for _, ih := range ctl.GetIhave() {
-+			var ids []string
-+			for _, id := range ih.GetMessageIDs() {
-+				if ofID(id) {
-+					n++
-+					continue
-+				}
-+				ids = append(ids, id)
-+			}
-+			if len(ids) > 0 {
-+				ihave = append(ihave, &pb.ControlIHave{TopicID: ih.TopicID, MessageIDs: ids})
-+			}
-+		}
-+		for _, iw := range ctl.GetIwant() {
-+			var ids []string
-+			for _, id := range iw.GetMessageIDs() {
-+				if ofID(id) {
-+					n++
-+					continue
-+				}
-+				ids = append(ids, id)
-+			}
-+			if len(ids) > 0 {
-+				iwant = append(iwant, &pb.ControlIWant{MessageIDs: ids})
-+			}
-+		}
-+		if n == 0 {
-+			return rpc
-+		}
-+		dropped += n
-+		out := shallowRPCCopy(rpc)
-+		out.urgent = rpc.urgent
-+		out.Publish = publish
-+		if ctl != nil {
-+			out.Control = &pb.ControlMessage{Ihave: ihave, Iwant: iwant, Graft: ctl.Graft, Prune: ctl.Prune, Idontwant: ctl.Idontwant, Extensions: ctl.Extensions}
-+		}
-+		if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
-+			return nil
-+		}
-+		out.size = proto.Size(&out.RPC)
-+		return out
-+	}
-+	priority := q.queue.priority[:0]
-+	for _, rpc := range q.queue.priority {
-+		out := filter(rpc)
-+		q.queuedBytes -= int64(rpc.size)
-+		if out != nil {
-+			q.queuedBytes += int64(out.size)
-+			priority = append(priority, out)
- 		}
--		q.dataAvailable.Wait()
--		// It can receive a signal because the queue is closed.
--		if q.closed {
--			return nil, ErrQueueClosed
-+	}
-+	q.queue.priority = priority
-+	normal := q.queue.normal[:0]
-+	for _, e := range q.queue.normal {
-+		out := filter(e.rpc)
-+		q.queuedBytes -= int64(e.rpc.size)
-+		if out != nil {
-+			q.queuedBytes += int64(out.size)
-+			normal = append(normal, rankedRPC{rpc: out, rank: e.rank})
++			return out, nil
  		}
  	}
 -	rpc := q.queue.Pop()
-+	q.queue.normal = normal
- 	q.spaceAvailable.Signal()
+-	q.spaceAvailable.Signal()
 -	return rpc, nil
-+	return dropped
-+}
-+
-+// withOwedLocked returns out carrying what is owed, one IHAVE bitmap per group, less what the peer
-+// has told us it holds and the frame out carries; an RPC of the owed IHAVEs alone when out is nil.
-+// The owed bits are spent either way. nil when nothing is left to send. Under queueMu.
-+func (q *rpcQueue) withOwedLocked(out *RPC) *RPC {
-+	if len(q.owed) == 0 {
-+		return nil
-+	}
-+	roots := make([]string, 0, len(q.owed))
-+	for root := range q.owed {
-+		roots = append(roots, root)
-+	}
-+	sort.Strings(roots)
-+	var ihaves []*pb.ControlIHave
-+	for _, root := range roots {
-+		g := q.owed[root]
-+		delete(q.owed, root)
-+		b := &g.bits
-+		if h := q.have; h != nil {
-+			if t := h.theirs[root]; t != nil {
-+				b = b.AndNot(t)
-+			}
-+			if c := h.claim[root]; c != nil {
-+				b = b.AndNot(c)
-+			}
-+			if out != nil {
-+				for _, m := range out.Publish {
-+					if r, i, ok := h.index(m); ok && r == root {
-+						b.Clear(i)
-+					}
-+				}
-+			}
-+		}
-+		n := b.Count()
-+		if n == 0 {
-+			continue
-+		}
-+		topic := g.topic
-+		ihaves = append(ihaves, &pb.ControlIHave{TopicID: &topic, MessageIDs: []string{encodeHave(root, b)}})
-+		if q.owedSent != nil {
-+			q.owedSent.Add(int64(n))
-+		}
-+	}
-+	if len(ihaves) == 0 {
-+		return nil
-+	}
-+	extra := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Ihave: ihaves}}}
-+	if q.owedFilter != nil {
-+		if extra = q.owedFilter(extra); extra == nil {
-+			return nil
-+		}
-+	}
-+	if out == nil {
-+		return extra
-+	}
-+	with := shallowRPCCopy(out)
-+	ctl := &pb.ControlMessage{}
-+	if c := out.GetControl(); c != nil {
-+		ctl = &pb.ControlMessage{Ihave: c.Ihave, Iwant: c.Iwant, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-+	}
-+	ctl.Ihave = append(append([]*pb.ControlIHave(nil), ctl.Ihave...), extra.GetControl().GetIhave()...)
-+	with.Control = ctl
-+	return with
  }
  
  func (q *rpcQueue) Close() {
-@@ -142,10 +842,45 @@
+@@ -142,10 +474,45 @@
  	defer q.queueMu.Unlock()
  
  	q.closed = true
@@ -15593,1765 +14777,9 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/rpc_queue.go fork/rpc_queue
  // Occupancy returns the current queue length and its capacity, for the adaptive hedge's
  // local congestion signal (measurement-plan section 15, Job 2).
  func (q *rpcQueue) Occupancy() (length, capacity int) {
-diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/specv05.go fork/specv05.go
---- base/specv05.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/specv05.go	2026-10-22 13:36:32.093884815 +0200
-@@ -0,0 +1,826 @@
-+package pubsub
-+
-+import (
-+	"encoding/binary"
-+	"errors"
-+	"fmt"
-+	"sort"
-+	"strings"
-+	"sync/atomic"
-+	"time"
-+
-+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-+	"github.com/libp2p/go-libp2p/core/peer"
-+)
-+
-+// --- Version 0.5 of the protocol text: the rules its model check added ---
-+//
-+// The specification's v0.5 (segmented-broadcast-spec 5a729ff, from a model check of v0.4) added
-+// rules this implementation predated; its §9 lists them. Each is a switch here, so an arm can take
-+// them one at a time and the measured arms stay reproducible with every switch off:
-+//
-+//   - PromiseAtWrite (E, §6.1, §7.2): the promise behind the park starts when the writer writes the
-+//     ask, not when the ask is decided. An ask that waits behind the window, or that a full queue
-+//     refuses, opens no promise, so no peer is parked for an ask it never received.
-+//   - OfferSkipped (A′, §5.2, §7.2): a push that does not happen -- skipped by projection at the
-+//     writer, or refused by a full queue -- is no longer counted as pushed, and the chunk is offered
-+//     to the peer instead if it is in the mesh. An offer a full queue refuses is owed, as is an
-+//     answer: the next write to the peer carries what is owed. The guard's clock restarts once
-+//     every push counted to the peer has been skipped or refused.
-+//   - LastResort (B′, §6.1): every offer is kept, per connection and group; the retry tries the
-+//     announcers in announcement order, the ordered list first; and when every announcer of a chunk
-+//     is parked, each is asked once more, after PROMISE × 2ⁿ for the n-th such ask of the chunk.
-+//   - CloseWithConn (§6.1, §8.1): a peer's promises, offers, tried asks and last-resort counts go
-+//     with its connection; the retry moves on to the other announcers.
-+//   - Expiry (D′, §6.1, §7.2, §8.1): a group whose holdings aged out (GROUP_TTL after its last
-+//     chunk, holdTTL here) leaves a tombstone, its id, for another holdTTL. Its pull state goes at
-+//     once: offers, tried asks, asks in flight, promises, last-resort state, what is owed of it,
-+//     and its queued frames, offers and asks in every queue (its queued HAVEs stay). The retry, the
-+//     last resort and the announcement handler ignore it; the writer drops asks for it; a late copy
-+//     does not bring it back; a rebuild that returns after it does nothing.
-+//   - LedgerFromOffers (C′, §3, §4.2, §4.4): what the request gate declines, because no installed
-+//     block authenticates the group yet, stays in the offer table, which is the ledger: when the
-+//     application replays (the block installed), every offered index not held is asked for as a
-+//     retry is, in place of the separate deferral ledger (4 announcers per id, a cap on ids).
-+
-+// SpecV05 selects the v0.5 rules; the zero value is the implementation as measured before them.
-+type SpecV05 struct {
-+	PromiseAtWrite   bool
-+	OfferSkipped     bool
-+	LastResort       bool
-+	CloseWithConn    bool
-+	LedgerFromOffers bool
-+	Expiry           bool
-+}
-+
-+// SpecV05All is every v0.5 rule this package implements.
-+var SpecV05All = SpecV05{PromiseAtWrite: true, OfferSkipped: true, LastResort: true, CloseWithConn: true, LedgerFromOffers: true, Expiry: true}
-+
-+// SpecV05Counters counts what the v0.5 rules did; an application may share one across nodes.
-+type SpecV05Counters struct {
-+	// PromisesAtWrite is the promises opened by a written ask; AsksLost the asks a class-loss
-+	// injection dropped after the write, which open theirs too.
-+	PromisesAtWrite, AsksLost atomic.Int64
-+	// Unpushed is the pushes no longer counted (projection skips and full-queue refusals);
-+	// OffersOwed the indices owed to mesh peers as offers; OwedSent the indices that left in
-+	// owed IHAVEs; AnswersOwed the answers a full queue refused and the writer requeued.
-+	Unpushed, OffersOwed, OwedSent, AnswersOwed atomic.Int64
-+	// LastResortsArmed is the last-resort timers armed; LastResortAsks the asks they sent, of
-+	// which ParkedAsked went to a parked announcer; BeyondList the asks (retries and last
-+	// resorts) whose announcer was known only from the per-group offers, past the ordered list.
-+	LastResortsArmed, LastResortAsks, ParkedAsked, BeyondList atomic.Int64
-+	// ClosedPromises is the promises closed with their connection.
-+	ClosedPromises atomic.Int64
-+	// LedgerAsks is the ids a replay found in the offer table and handed to the retry (C′).
-+	LedgerAsks atomic.Int64
-+	// Expired is the groups that passed their lifetime under D′; ExpiredDiscards the queued
-+	// frames, offers and asks of such groups dropped from the queues.
-+	Expired, ExpiredDiscards atomic.Int64
-+}
-+
-+type specV05 struct {
-+	SpecV05
-+	ctr *SpecV05Counters
-+	// offered is every offer, per connection and group (B′): the bitmap of indices offered, the
-+	// topic, and when the announcer last offered the group. Router goroutine.
-+	offered map[peer.ID]map[string]*offeredGroup
-+	// offerOrder is each id's ordered announcer list, the first offerPerID in announcement order.
-+	offerOrder map[string][]peer.ID
-+	// lrArmedKeys and askedParked are B′'s per-chunk state: whether the last resort's timer is
-+	// armed, and the parked announcers it has asked, and when.
-+	lrArmedKeys map[string]bool
-+	askedParked map[string]map[peer.ID]time.Time
-+}
-+
-+type offeredGroup struct {
-+	bits  haveBits
-+	topic string
-+	last  time.Time
-+}
-+
-+// offeredRootsPerPeer bounds the groups whose offers are kept per connection: the live groups and
-+// those not yet tied to a block (the spec's MAX_PENDING_GROUPS) fit with room to spare.
-+const offeredRootsPerPeer = 64
-+
-+// WithSpecV05 turns on the chosen v0.5 rules. Each needs what it changes: PromiseAtWrite and
-+// LastResort the commitment park (and LastResort the offer table and the park per group);
-+// OfferSkipped the HAVE bitmaps with the IHAVE side. Must follow those options. ctr may be nil.
-+func WithSpecV05(rules SpecV05, ctr *SpecV05Counters) Option {
-+	return func(ps *PubSub) error {
-+		gs, ok := ps.rt.(*GossipSubRouter)
-+		if !ok {
-+			return fmt.Errorf("spec v0.5 rules require a gossipsub router")
-+		}
-+		if (rules.PromiseAtWrite || rules.LastResort) && gs.iwantPromised == nil {
-+			return fmt.Errorf("spec v0.5 E and B′ require WithIHaveCommitmentPark first")
-+		}
-+		if rules.LastResort && (gs.offerTable == nil || gs.parkGroups == nil) {
-+			return fmt.Errorf("spec v0.5 B′ requires WithOfferTable and WithIHaveParkPerGroup first")
-+		}
-+		if rules.LedgerFromOffers && !rules.LastResort {
-+			return fmt.Errorf("spec v0.5 C′ reads B′'s offers: it requires LastResort too")
-+		}
-+		if rules.Expiry && gs.have == nil {
-+			return fmt.Errorf("spec v0.5 D′ ages groups by their HAVE state: it requires WithHaveBitmaps first")
-+		}
-+		if rules.OfferSkipped && (gs.have == nil || !gs.have.ihaveOn) {
-+			return fmt.Errorf("spec v0.5 A′ requires WithHaveBitmaps and WithHaveAnnounceBitmaps first")
-+		}
-+		if ctr == nil {
-+			ctr = &SpecV05Counters{}
-+		}
-+		v := &specV05{SpecV05: rules, ctr: ctr}
-+		if rules.LastResort {
-+			v.offered = make(map[peer.ID]map[string]*offeredGroup)
-+			v.offerOrder = make(map[string][]peer.ID)
-+			v.lrArmedKeys = make(map[string]bool)
-+			v.askedParked = make(map[string]map[peer.ID]time.Time)
-+		}
-+		gs.v05 = v
-+		if rules.PromiseAtWrite || rules.OfferSkipped {
-+			ps.queueHooks = gs.v05QueueHooks
-+		}
-+		if rules.Expiry {
-+			// A received chunk of a group past its lifetime is ignored before anything else sees it:
-+			// no Preprocess (no IDONTWANT), no validation, no delivery, no forwarding (§4.2).
-+			ps.admitMsg = func(m *Message) bool { return !gs.expiredID(ps.idGen.ID(m)) }
-+		}
-+		return nil
-+	}
-+}
-+
-+func (gs *GossipSubRouter) v05PromiseAtWrite() bool { return gs.v05 != nil && gs.v05.PromiseAtWrite }
-+func (gs *GossipSubRouter) v05OfferSkipped() bool   { return gs.v05 != nil && gs.v05.OfferSkipped }
-+func (gs *GossipSubRouter) v05LastResort() bool     { return gs.v05 != nil && gs.v05.LastResort }
-+func (gs *GossipSubRouter) v05Expiry() bool         { return gs.v05 != nil && gs.v05.Expiry }
-+
-+// expired reports whether root is past its active lifetime (D′): only its tombstone is left.
-+func (gs *GossipSubRouter) expired(root string) bool {
-+	return gs.v05Expiry() && gs.have != nil && gs.have.tomb[root] > 0
-+}
-+
-+// expiredID reports whether the group mid names is past its lifetime.
-+func (gs *GossipSubRouter) expiredID(mid string) bool {
-+	if !gs.v05Expiry() {
-+		return false
-+	}
-+	root, _, ok := gs.groupIndex(mid)
-+	return ok && gs.expired(root)
-+}
-+
-+// v05QueueHooks installs the writer's side of E and A′ on a new peer queue. pubsub's goroutine,
-+// as the queue is made.
-+func (gs *GossipSubRouter) v05QueueHooks(q *rpcQueue) {
-+	p := q.peer
-+	// A writer's report reaches the router later, on its event loop; by then the connection may have
-+	// closed (or been replaced by a new queue). A report from a queue no longer the peer's is dropped,
-+	// so nothing is recreated for a closed connection (its promises closed with it).
-+	current := func() bool { cur, ok := gs.p.peers[p]; return ok && cur == q }
-+	if gs.v05.PromiseAtWrite {
-+		q.onAsks = func(mids []string, at time.Time) {
-+			// Never block a writer on the router, which may be waiting on this queue's lock.
-+			go func() {
-+				select {
-+				case gs.p.eval <- func() {
-+					if current() {
-+						gs.promisesFromWrite(p, mids, at)
-+					}
-+				}:
-+				case <-gs.p.ctx.Done():
-+				}
-+			}()
-+		}
-+		if gs.lossClass == lossClassIWant {
-+			// Under E an ask lost on the wire was written: the loss is drawn at the writer, after the
-+			// window and the queue, and the lost ask opens its promise as a delivered one does.
-+			q.askLoss = func(ids []string) (kept, lost []string) {
-+				for _, id := range ids {
-+					if gs.lossDecide(id, p) {
-+						lost = append(lost, id)
-+					} else {
-+						kept = append(kept, id)
-+					}
-+				}
-+				if n := int64(len(lost)); n > 0 {
-+					gs.v05.ctr.AsksLost.Add(n)
-+					if gs.lossDropped != nil {
-+						gs.lossDropped.Add(n)
-+					}
-+				}
-+				return kept, lost
-+			}
-+		}
-+	}
-+	if gs.v05.OfferSkipped {
-+		q.onSkipped = func(msgs []*pb.Message) {
-+			go func() {
-+				select {
-+				case gs.p.eval <- func() {
-+					if !current() {
-+						return
-+					}
-+					for _, m := range msgs {
-+						gs.unpush(p, m.GetTopic(), gs.p.idGen.RawID(m))
-+					}
-+				}:
-+				case <-gs.p.ctx.Done():
-+				}
-+			}()
-+		}
-+		q.owedSent = &gs.v05.ctr.OwedSent
-+		if gs.lossClass == lossClassIHave {
-+			// An owed offer leaves from the writer, past doSendRPC: the class loss must reach it.
-+			q.owedFilter = func(rpc *RPC) *RPC { return gs.applyClassLoss(rpc, p) }
-+		}
-+	}
-+}
-+
-+// --- E: the promise starts at the write ---
-+
-+// promisesFromWrite opens the park's promise for each ask the writer wrote to p at the time at, the
-+// writer's pop; its deadline is PROMISE after that. An ask re-written while its promise is open keeps
-+// the earlier deadline, as a re-ask did. Router goroutine.
-+func (gs *GossipSubRouter) promisesFromWrite(p peer.ID, mids []string, at time.Time) {
-+	if gs.iwantPromised == nil {
-+		return
-+	}
-+	wait := max(0, gs.parkPromise-time.Since(at))
-+	for _, mid := range mids {
-+		if gs.haveSeen(mid) || gs.expiredID(mid) {
-+			continue // arrived, or its group died, between the write and this event: nothing is owed
-+		}
-+		peers := gs.iwantPromised[mid]
-+		if peers == nil {
-+			peers = make(map[peer.ID]time.Time)
-+			gs.iwantPromised[mid] = peers
-+		}
-+		prev, open := peers[p]
-+		if open && !at.Before(prev) {
-+			continue // the earlier promise keeps its deadline (reports may arrive out of order)
-+		}
-+		peers[p] = at // an earlier report moves the deadline back; the later timer finds nothing
-+		if !open {
-+			gs.v05.ctr.PromisesAtWrite.Add(1)
-+		}
-+		m, f, decided := mid, p, gs.iwantAsked[mid]
-+		time.AfterFunc(wait, func() {
-+			select {
-+			case gs.p.eval <- func() { gs.promiseDue(m, f, at, decided) }:
-+			case <-gs.p.ctx.Done():
-+			}
-+		})
-+	}
-+}
-+
-+// --- A′: a push that does not happen is offered instead ---
-+
-+// unpush forgets a push to p of mid that will not be made, and owes p the offer when it is a
-+// mesh peer of the topic. A push to a connection outside the mesh (the source's wide first hop)
-+// is forgotten but not offered. Router goroutine.
-+func (gs *GossipSubRouter) unpush(p peer.ID, topic, mid string) {
-+	h := gs.have
-+	root, index, ok := h.index(mid)
-+	if !ok || len(root) != haveRootLen || gs.expired(root) {
-+		return
-+	}
-+	if pe := h.pushed[p]; pe != nil {
-+		if e := pe[root]; e != nil && e.bits.Has(index) {
-+			e.bits.Clear(index)
-+		}
-+	}
-+	gs.v05.ctr.Unpushed.Add(1)
-+	if _, inMesh := gs.mesh[topic][p]; !inMesh {
-+		return
-+	}
-+	var b haveBits
-+	b.Set(index)
-+	gs.owe(p, topic, root, &b)
-+}
-+
-+// owe records bits of root as owed to p: the writer's next write to p carries them as an IHAVE.
-+// Router goroutine.
-+func (gs *GossipSubRouter) owe(p peer.ID, topic, root string, bits *haveBits) {
-+	if gs.have.disclose != nil {
-+		return // link disclosure decides what p may be told, and owes nothing past it
-+	}
-+	if gs.expired(root) {
-+		return // a group past its lifetime is offered to nobody (D′)
-+	}
-+	q, ok := gs.p.peers[p]
-+	if !ok {
-+		return
-+	}
-+	gs.v05.ctr.OffersOwed.Add(int64(bits.Count()))
-+	q.owe(topic, root, bits)
-+}
-+
-+// oweRefused handles what a full queue refused to p: a push is unpushed (and owed as an offer to a
-+// mesh peer), an answer is owed, and an IHAVE bitmap is owed. Asks are not: under E, an ask that
-+// was never written opens no promise. Router goroutine, from doSendRPC, before doDropRPC strips
-+// the control.
-+func (gs *GossipSubRouter) oweRefused(p peer.ID, q *rpcQueue, rpc *RPC) {
-+	for _, m := range rpc.Publish {
-+		if rpc.solicited {
-+			gs.v05.ctr.AnswersOwed.Add(1)
-+			q.oweAnswer(m)
-+			continue
-+		}
-+		gs.unpush(p, m.GetTopic(), gs.p.idGen.RawID(m))
-+	}
-+	for _, ih := range rpc.GetControl().GetIhave() {
-+		topic := ih.GetTopicID()
-+		for _, id := range ih.GetMessageIDs() {
-+			var b haveBits
-+			root := ""
-+			if r, enc, ok := decodeHave(id); ok {
-+				root = r
-+				b.Or(enc)
-+			} else if r, i, ok := gs.have.index(id); ok && len(r) == haveRootLen {
-+				root = r
-+				b.Set(i)
-+			}
-+			if root != "" && b.Count() > 0 {
-+				gs.owe(p, topic, root, &b)
-+			}
-+		}
-+	}
-+}
-+
-+// --- B′: every offer kept, the announcement order, the last resort ---
-+
-+// chunkKey names the chunk mid is, whichever form names it: its group and index, or the id itself
-+// outside any group.
-+func (gs *GossipSubRouter) chunkKey(mid string) string {
-+	if root, index, ok := gs.groupIndex(mid); ok {
-+		var b [4]byte
-+		binary.BigEndian.PutUint32(b[:], index)
-+		return root + string(b[:])
-+	}
-+	return mid
-+}
-+
-+// groupIndex is the group and index mid names: a structured id or an ask by index.
-+func (gs *GossipSubRouter) groupIndex(mid string) (string, uint32, bool) {
-+	if gs.have != nil {
-+		if root, index, ok := gs.have.index(mid); ok && len(root) == haveRootLen {
-+			return root, index, true
-+		}
-+	}
-+	return decodeWant(mid)
-+}
-+
-+// noteOffered keeps p's offer of mid in its per-group bitmap, past the ordered lists' bounds.
-+// Router goroutine, from considerAnnounced.
-+func (gs *GossipSubRouter) noteOffered(p peer.ID, topic, mid string) {
-+	root, index, ok := gs.groupIndex(mid)
-+	if !ok {
-+		return
-+	}
-+	byRoot := gs.v05.offered[p]
-+	if byRoot == nil {
-+		byRoot = make(map[string]*offeredGroup)
-+		gs.v05.offered[p] = byRoot
-+	}
-+	g := byRoot[root]
-+	if g == nil {
-+		if len(byRoot) >= offeredRootsPerPeer {
-+			return // the peer's further groups are ignored until one ages out
-+		}
-+		g = &offeredGroup{topic: topic}
-+		byRoot[root] = g
-+	}
-+	g.bits.Set(index)
-+	g.last = time.Now()
-+}
-+
-+// noteOrder appends p to mid's ordered announcer list, which keeps announcement order.
-+func (gs *GossipSubRouter) noteOrder(mid string, p peer.ID) {
-+	gs.v05.offerOrder[mid] = append(gs.v05.offerOrder[mid], p)
-+}
-+
-+// dropOrder removes p from mid's ordered list.
-+func (gs *GossipSubRouter) dropOrder(mid string, p peer.ID) {
-+	l := gs.v05.offerOrder[mid]
-+	for i, q := range l {
-+		if q == p {
-+			gs.v05.offerOrder[mid] = append(l[:i:i], l[i+1:]...)
-+			break
-+		}
-+	}
-+	if len(gs.v05.offerOrder[mid]) == 0 {
-+		delete(gs.v05.offerOrder, mid)
-+	}
-+}
-+
-+// announcers is everyone connected who offered mid: the ordered list, then every other peer whose
-+// per-group offers name mid's index, in peer-id order. Router goroutine.
-+func (gs *GossipSubRouter) announcers(mid string) (out []peer.ID, listed int) {
-+	in := make(map[peer.ID]bool)
-+	for _, p := range gs.v05.offerOrder[mid] {
-+		if _, connected := gs.peers[p]; connected && !in[p] {
-+			in[p] = true
-+			out = append(out, p)
-+		}
-+	}
-+	listed = len(out)
-+	root, index, ok := gs.groupIndex(mid)
-+	if !ok {
-+		return out, listed
-+	}
-+	var more []peer.ID
-+	for p, byRoot := range gs.v05.offered {
-+		if in[p] {
-+			continue
-+		}
-+		if _, connected := gs.peers[p]; !connected {
-+			continue
-+		}
-+		if g := byRoot[root]; g != nil && g.bits.Has(index) {
-+			more = append(more, p)
-+		}
-+	}
-+	sort.Slice(more, func(i, j int) bool { return more[i] < more[j] })
-+	return append(out, more...), listed
-+}
-+
-+// offerTopicOf is the topic mid was offered under.
-+func (gs *GossipSubRouter) offerTopicOf(mid string, p peer.ID) string {
-+	if t, ok := gs.offerTopic[mid]; ok {
-+		return t
-+	}
-+	if root, _, ok := gs.groupIndex(mid); ok {
-+		if g := gs.v05.offered[p][root]; g != nil {
-+			return g.topic
-+		}
-+	}
-+	return ""
-+}
-+
-+// pickAnnouncer is the earliest announcer in cands not yet asked for mid, else the least recently
-+// asked; cands keeps announcement order.
-+func (gs *GossipSubRouter) pickAnnouncer(mid string, cands []peer.ID) (peer.ID, bool) {
-+	tried := gs.offerTried[mid]
-+	pick, found := peer.ID(""), false
-+	var oldest time.Time
-+	for _, p := range cands {
-+		t, was := tried[p]
-+		if !was {
-+			return p, true
-+		}
-+		if !found || t.Before(oldest) {
-+			pick, found, oldest = p, true, t
-+		}
-+	}
-+	return pick, found
-+}
-+
-+// retryV05 is retryOfferedPull under B′: every announcer, in announcement order, and the last
-+// resort when every one of them is parked. Router goroutine.
-+func (gs *GossipSubRouter) retryV05(mid string) {
-+	if gs.expiredID(mid) {
-+		return
-+	}
-+	anns, listed := gs.announcers(mid)
-+	var cands []peer.ID
-+	for _, p := range anns {
-+		if gs.peerParkedFor(p, mid) {
-+			continue
-+		}
-+		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopicOf(mid, p), mid) {
-+			continue
-+		}
-+		cands = append(cands, p)
-+	}
-+	if len(cands) == 0 {
-+		gs.lastResort(mid)
-+		return
-+	}
-+	pick, found := gs.pickAnnouncer(mid, cands)
-+	if !found || !gs.iwantAllowed(mid, pick) {
-+		return
-+	}
-+	if gs.offerRetryCtr != nil {
-+		gs.offerRetryCtr.Add(1)
-+	}
-+	gs.sendAsk(pick, mid, anns, listed)
-+}
-+
-+// sendAsk sends one ask of mid to p, recorded as every ask is; reports whether the queue took it.
-+func (gs *GossipSubRouter) sendAsk(p peer.ID, mid string, anns []peer.ID, listed int) bool {
-+	for i, q := range anns {
-+		if q == p && i >= listed {
-+			gs.v05.ctr.BeyondList.Add(1)
-+			break
-+		}
-+	}
-+	gs.iasked[p]++
-+	gs.gossipTracer.AddPromise(p, []string{mid})
-+	gs.noteIWantSent(p, []string{mid})
-+	if gs.requestGate != nil {
-+		gs.requestGate.Committed(p, []string{mid})
-+	}
-+	return gs.sendRPC(p, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{mid}}}, nil, nil, nil), false)
-+}
-+
-+// lastResort arms, once per chunk, the ask of a parked announcer, when every announcer of mid is
-+// parked and one has not yet been asked this way. The wait doubles with each such ask of the
-+// chunk: PROMISE, 2 × PROMISE, 4 × PROMISE, ... Router goroutine.
-+func (gs *GossipSubRouter) lastResort(mid string) {
-+	if !gs.v05LastResort() {
-+		return
-+	}
-+	k := gs.chunkKey(mid)
-+	if gs.v05.lrArmedKeys[k] || gs.expiredID(mid) {
-+		return
-+	}
-+	anns, _ := gs.announcers(mid)
-+	if len(anns) == 0 {
-+		return
-+	}
-+	done := gs.v05.askedParked[k]
-+	allDone := true
-+	for _, p := range anns {
-+		if !gs.peerParkedFor(p, mid) {
-+			return // someone can be asked the ordinary way
-+		}
-+		if _, asked := done[p]; !asked {
-+			allDone = false
-+		}
-+	}
-+	if allDone {
-+		return
-+	}
-+	gs.v05.lrArmedKeys[k] = true
-+	gs.v05.ctr.LastResortsArmed.Add(1)
-+	wait := gs.parkPromise << min(len(done), 16)
-+	time.AfterFunc(wait, func() {
-+		select {
-+		case gs.p.eval <- func() { gs.askParked(mid) }:
-+		case <-gs.p.ctx.Done():
-+		}
-+	})
-+}
-+
-+// askParked is the last resort's ask: an announcer unparked meanwhile if there is one, else a
-+// parked one not yet asked this way; counted against the parked announcer once the queue has
-+// taken the ask. Router goroutine.
-+func (gs *GossipSubRouter) askParked(mid string) {
-+	k := gs.chunkKey(mid)
-+	delete(gs.v05.lrArmedKeys, k)
-+	if gs.haveSeen(mid) || gs.expiredID(mid) {
-+		return
-+	}
-+	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
-+		return // someone was asked meanwhile
-+	}
-+	anns, listed := gs.announcers(mid)
-+	allowed := anns[:0:0]
-+	for _, p := range anns {
-+		if gs.requestGate != nil && !gs.requestGate.Allow(p, gs.offerTopicOf(mid, p), mid) {
-+			continue // stop-pull, or a gate that cannot authenticate the group yet
-+		}
-+		allowed = append(allowed, p)
-+	}
-+	var cands []peer.ID
-+	for _, p := range allowed {
-+		if !gs.peerParkedFor(p, mid) {
-+			cands = append(cands, p)
-+		}
-+	}
-+	if len(cands) == 0 {
-+		for _, p := range allowed {
-+			if _, asked := gs.v05.askedParked[k][p]; !asked {
-+				cands = append(cands, p)
-+			}
-+		}
-+	}
-+	if len(cands) == 0 {
-+		return
-+	}
-+	pick, found := gs.pickAnnouncer(mid, cands)
-+	if !found || !gs.iwantAllowed(mid, pick) {
-+		return
-+	}
-+	gs.v05.ctr.LastResortAsks.Add(1)
-+	if gs.sendAsk(pick, mid, anns, listed) && gs.peerParkedFor(pick, mid) {
-+		if gs.v05.askedParked[k] == nil {
-+			gs.v05.askedParked[k] = make(map[peer.ID]time.Time)
-+		}
-+		gs.v05.askedParked[k][pick] = time.Now()
-+		gs.v05.ctr.ParkedAsked.Add(1)
-+	}
-+}
-+
-+// v05ClearList drops mid's ordered announcer list, with the rest of the offer table's entry for it.
-+func (gs *GossipSubRouter) v05ClearList(mid string) {
-+	if gs.v05LastResort() {
-+		delete(gs.v05.offerOrder, mid)
-+	}
-+}
-+
-+// v05ChunkDelivered drops B′'s per-chunk state once a copy of the chunk arrived, whichever form named
-+// it. The per-chunk count of last-resort asks lives on otherwise, as `tried` does: a list of one form
-+// expiring, or a connection closing, does not reset it (each entry ages by its own time, and a
-+// closed connection takes only its own).
-+func (gs *GossipSubRouter) v05ChunkDelivered(mid string) {
-+	if !gs.v05LastResort() {
-+		return
-+	}
-+	k := gs.chunkKey(mid)
-+	delete(gs.v05.askedParked, k)
-+	delete(gs.v05.lrArmedKeys, k)
-+}
-+
-+// sweepV05 ages B′'s offers out 30 s after the announcer's last offer of the group, and the
-+// last-resort counts as tried ages. Router goroutine, from the heartbeat's sweep.
-+func (gs *GossipSubRouter) sweepV05() {
-+	if !gs.v05LastResort() {
-+		return
-+	}
-+	for p, byRoot := range gs.v05.offered {
-+		for root, g := range byRoot {
-+			if time.Since(g.last) >= offerTTL {
-+				delete(byRoot, root)
-+			}
-+		}
-+		if len(byRoot) == 0 {
-+			delete(gs.v05.offered, p)
-+		}
-+	}
-+	for k, peers := range gs.v05.askedParked {
-+		for p, at := range peers {
-+			if time.Since(at) >= offerTTL {
-+				delete(peers, p)
-+			}
-+		}
-+		if len(peers) == 0 {
-+			delete(gs.v05.askedParked, k)
-+		}
-+	}
-+}
-+
-+// --- The connection: promises and pull tables close with it ---
-+
-+// v05PeerGone closes p's promises and drops its offers, tried asks and last-resort counts.
-+// Router goroutine, from OnClosedOutboundStream.
-+func (gs *GossipSubRouter) v05PeerGone(p peer.ID) {
-+	if gs.v05 == nil {
-+		return
-+	}
-+	if gs.v05.LastResort {
-+		delete(gs.v05.offered, p)
-+		for k, peers := range gs.v05.askedParked {
-+			delete(peers, p)
-+			if len(peers) == 0 {
-+				delete(gs.v05.askedParked, k)
-+			}
-+		}
-+	}
-+	if !gs.v05.CloseWithConn {
-+		return
-+	}
-+	for mid, peers := range gs.iwantPromised {
-+		if _, open := peers[p]; open {
-+			delete(peers, p)
-+			gs.v05.ctr.ClosedPromises.Add(1)
-+			if len(peers) == 0 {
-+				delete(gs.iwantPromised, mid)
-+			}
-+		}
-+	}
-+	for mid, peers := range gs.offerTable {
-+		if _, ok := peers[p]; ok {
-+			delete(peers, p)
-+			if gs.v05LastResort() {
-+				gs.dropOrder(mid, p)
-+			}
-+			if len(peers) == 0 {
-+				gs.clearOffers(mid)
-+			}
-+		}
-+	}
-+	delete(gs.offerByPeer, p)
-+	for _, tried := range gs.offerTried {
-+		delete(tried, p)
-+	}
-+}
-+
-+// --- C′: the offer table is the ledger ---
-+
-+// replayLedger asks, as a retry would, for every index offered on a live connection and not held:
-+// the announcements the gate declined while it could not authenticate their group. Ids outside any
-+// group are in the offer table alone. The gate decides again per announcer, so a group still
-+// without its block stays where it is. Router goroutine, from the application's Replay.
-+func (gs *GossipSubRouter) replayLedger() {
-+	seen := make(map[string]bool)
-+	var mids []string
-+	add := func(mid string) {
-+		if !seen[mid] && !gs.haveSeen(mid) {
-+			seen[mid] = true
-+			mids = append(mids, mid)
-+		}
-+	}
-+	for p, byRoot := range gs.v05.offered {
-+		if _, connected := gs.peers[p]; !connected {
-+			continue
-+		}
-+		for root, g := range byRoot {
-+			for i, b := range g.bits.b {
-+				for bit := uint32(0); bit < 8; bit++ {
-+					if b&(1<<bit) == 0 {
-+						continue
-+					}
-+					index := uint32(i)*8 + bit // lint:ignore uintcast -- i < haveMaxBytes.
-+					if known := gs.have.mids[root]; known != nil && known.ids[index] != "" {
-+						add(known.ids[index])
-+					} else {
-+						add(encodeWant(root, index))
-+					}
-+				}
-+			}
-+		}
-+	}
-+	for mid := range gs.offerTable {
-+		if _, _, grouped := gs.groupIndex(mid); !grouped {
-+			add(mid)
-+		}
-+	}
-+	sort.Strings(mids)
-+	gs.shuffleStrings(mids)
-+	for _, mid := range mids {
-+		if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
-+			continue // asked meanwhile
-+		}
-+		gs.v05.ctr.LedgerAsks.Add(1)
-+		gs.retryV05(mid)
-+	}
-+}
-+
-+// --- D′: expiry ---
-+
-+// expireGroup leaves root's tombstone and drops its pull state and its queued sends. Router
-+// goroutine, from the heartbeat, as the group's holdings age out.
-+func (gs *GossipSubRouter) expireGroup(root string) {
-+	h := gs.have
-+	h.tomb[root] = h.holdTTL
-+	h.own.kill(root)
-+	gs.v05.ctr.Expired.Add(1)
-+	inGroup := func(mid string) bool {
-+		r, _, ok := gs.groupIndex(mid)
-+		return ok && r == root
-+	}
-+	for mid := range gs.offerTable {
-+		if inGroup(mid) {
-+			gs.clearOffers(mid)
-+		}
-+	}
-+	for mid := range gs.offerTried {
-+		if inGroup(mid) {
-+			delete(gs.offerTried, mid)
-+		}
-+	}
-+	for mid := range gs.iwantAsked {
-+		if inGroup(mid) {
-+			delete(gs.iwantAsked, mid)
-+			if gs.iwantCount != nil {
-+				delete(gs.iwantCount, mid)
-+			}
-+		}
-+	}
-+	for mid := range gs.iwantPromised {
-+		if inGroup(mid) {
-+			delete(gs.iwantPromised, mid) // nobody is parked for a group that died
-+		}
-+	}
-+	if gs.v05.LastResort {
-+		for _, byRoot := range gs.v05.offered {
-+			delete(byRoot, root)
-+		}
-+		for k := range gs.v05.lrArmedKeys {
-+			if strings.HasPrefix(k, root) {
-+				delete(gs.v05.lrArmedKeys, k)
-+			}
-+		}
-+		for k := range gs.v05.askedParked {
-+			if strings.HasPrefix(k, root) {
-+				delete(gs.v05.askedParked, k)
-+			}
-+		}
-+	}
-+	if gs.p == nil {
-+		return
-+	}
-+	ofMsg := func(m *pb.Message) bool { return inGroup(gs.p.idGen.RawID(m)) }
-+	ofID := func(id string) bool {
-+		if r, _, ok := decodeHave(id); ok {
-+			return r == root
-+		}
-+		return inGroup(id)
-+	}
-+	for _, q := range gs.p.peers {
-+		gs.v05.ctr.ExpiredDiscards.Add(int64(q.discardGroup(root, ofMsg, ofID)))
-+	}
-+}
-+
-+// errIsQueueFull reports whether a push failed because the queue was full.
-+func errIsQueueFull(err error) bool { return errors.Is(err, ErrQueueFull) }
-diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/specv05_test.go fork/specv05_test.go
---- base/specv05_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/specv05_test.go	2026-10-22 13:36:32.093884815 +0200
-@@ -0,0 +1,922 @@
-+package pubsub
-+
-+import (
-+	"context"
-+	"fmt"
-+	"strings"
-+	"sync"
-+	"sync/atomic"
-+	"testing"
-+	"testing/synctest"
-+	"time"
-+
-+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-+	"github.com/libp2p/go-libp2p-pubsub/timecache"
-+	"github.com/libp2p/go-libp2p/core/host"
-+	"github.com/libp2p/go-libp2p/core/peer"
-+	"github.com/libp2p/go-libp2p/core/protocol"
-+	"github.com/libp2p/go-libp2p/x/simlibp2p"
-+	"github.com/marcopolo/simnet"
-+)
-+
-+// The v0.5 rules (specv05.go) on real routers over simulated links. Each test is a witness the
-+// model check of v0.4 found, rebuilt on the fork: with the rule off it shows the failure, with the
-+// rule on it does not. Frames are test ids (testMid) padded past the IDONTWANT threshold, so a
-+// receiver's HAVE goes to its mesh as in the measured cells.
-+
-+// v05Hosts is n hosts on links of mbps each way with a one-way latency.
-+func v05Hosts(t *testing.T, n int, mbps int, latency time.Duration) []host.Host {
-+	net, meta, err := simlibp2p.SimpleLibp2pNetwork(
-+		[]simlibp2p.NodeLinkSettingsAndCount{{
-+			LinkSettings: simnet.NodeBiDiLinkSettings{
-+				Downlink: simnet.LinkSettings{BitsPerSecond: mbps * simlibp2p.OneMbps},
-+				Uplink:   simnet.LinkSettings{BitsPerSecond: mbps * simlibp2p.OneMbps},
-+			},
-+			Count: n,
-+		}},
-+		simnet.StaticLatency(latency),
-+		simlibp2p.NetworkSettings{},
-+	)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	net.Start()
-+	t.Cleanup(func() {
-+		for _, h := range meta.Nodes {
-+			h.Close()
-+		}
-+		net.Close()
-+	})
-+	return meta.Nodes
-+}
-+
-+const v05IDLen = 40 // len(testMid(root, i))
-+
-+// v05Frame is frame i of root: its test id, padded past the IDONTWANT threshold.
-+func v05Frame(root string, i byte) []byte {
-+	return append([]byte(testMid(root, i)), make([]byte, 2048)...)
-+}
-+
-+// v05Base is the tier-4 request and HAVE options the rules build on: phase forwarding at R = 2,
-+// both HAVE bitmaps, the dispatch-time cancel, the ask discipline, the park at k = 1 per group,
-+// the offer table. Gossip is off, so no heartbeat announcement rescues a stall. The dispatch
-+// ledger rides along, as in the harness's tier-4 cells: it creates each peer's dispatch state at
-+// the first send, without which the writer's projection and window start only at the peer's first
-+// HAVE.
-+func v05Base(parks *atomic.Int64) []Option {
-+	params := DefaultGossipSubParams()
-+	params.Dlazy = 0
-+	params.GossipFactor = 0
-+	return []Option{
-+		WithGossipSubParams(params),
-+		WithMessageSignaturePolicy(StrictNoSign), WithNoAuthor(),
-+		WithMessageIdFn(func(m *pb.Message) string { return string(m.Data[:v05IDLen]) }),
-+		WithPhaseForwarding(func(string) bool { return true }, 2),
-+		WithHaveBitmaps(testIndex), WithHaveAnnounceBitmaps(), WithHaveDispatch(true, false), WithHaveLedger(),
-+		WithIWantDiscipline(200 * time.Millisecond),
-+		WithIHaveCommitmentPark(1, 400*time.Millisecond, 30*time.Second, nil, parks),
-+		WithIHaveParkPerGroup(nil),
-+		WithOfferTable(nil),
-+	}
-+}
-+
-+// v05Collect counts the distinct frames each subscription delivers, per root.
-+type v05Collect struct {
-+	mu  sync.Mutex
-+	got []map[string]map[byte]bool
-+}
-+
-+func newV05Collect(ctx context.Context, t *testing.T, topics []*Topic) *v05Collect {
-+	c := &v05Collect{got: make([]map[string]map[byte]bool, len(topics))}
-+	for i, tp := range topics {
-+		c.got[i] = make(map[string]map[byte]bool)
-+		sub, err := tp.Subscribe()
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		go func(i int) {
-+			for {
-+				m, err := sub.Next(ctx)
-+				if err != nil {
-+					return
-+				}
-+				root, idx, ok := testIndex(string(m.Data[:v05IDLen]))
-+				if !ok {
-+					continue
-+				}
-+				c.mu.Lock()
-+				if c.got[i][root] == nil {
-+					c.got[i][root] = make(map[byte]bool)
-+				}
-+				c.got[i][root][byte(idx)] = true
-+				c.mu.Unlock()
-+			}
-+		}(i)
-+	}
-+	return c
-+}
-+
-+func (c *v05Collect) count(i int, root string) int {
-+	c.mu.Lock()
-+	defer c.mu.Unlock()
-+	return len(c.got[i][root])
-+}
-+
-+func v05Join(t *testing.T, psubs []*PubSub) []*Topic {
-+	var topics []*Topic
-+	for _, ps := range psubs {
-+		tp, err := ps.Join("t")
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		topics = append(topics, tp)
-+	}
-+	return topics
-+}
-+
-+// TestSpecV05OfferSkipped is F1: a push projection skips leaves no offer behind. Two nodes on a
-+// 25 ms link; the source publishes a group of 8 frames, any 4 of which complete it. Its writer pops
-+// the first two frames, after which the projection (fan-in 2) takes the receiver to 4 and skips
-+// the rest; the receiver was a push target, so nobody announced them, and it stays at 2. Under A′
-+// the skipped pushes are offered instead, the receiver asks, and it completes.
-+func TestSpecV05OfferSkipped(t *testing.T) {
-+	root := strings.Repeat("a", 32)
-+	run := func(t *testing.T, on bool) (got int, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, 25*time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				opts := append(v05Base(nil), WithHaveDispatchProjection(4, 2))
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{OfferSkipped: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			c := newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			var batch MessageBatch
-+			for i := byte(0); i < 8; i++ {
-+				if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&batch); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(3 * time.Second)
-+			got = c.count(1, root)
-+		})
-+		return got, ctr
-+	}
-+	off, _ := run(t, false)
-+	on, ctr := run(t, true)
-+	t.Logf("frames at the receiver: %d as measured, %d with A′ (unpushed %d, offers owed %d, sent %d)",
-+		off, on, ctr.Unpushed.Load(), ctr.OffersOwed.Load(), ctr.OwedSent.Load())
-+	if off >= 4 {
-+		t.Fatalf("known answer: without A′ the receiver should stay short of 4, got %d", off)
-+	}
-+	if on < 4 || ctr.OwedSent.Load() == 0 {
-+		t.Fatalf("with A′ the receiver should complete through offers, got %d frames, %d offered", on, ctr.OwedSent.Load())
-+	}
-+}
-+
-+// TestSpecV05OwedAtFullQueue: what a full queue refuses is owed. The source's queue to the
-+// receiver holds two entries and the source publishes a group of 8 at once: the pushes past the
-+// queue are refused, and as measured the receiver gets only what fit, since nobody announced the
-+// rest to a push target. Under A′ each refused push is owed as an offer, which rides the next write;
-+// the receiver asks, and any answer the full queue refuses is requeued once there is room.
-+func TestSpecV05OwedAtFullQueue(t *testing.T) {
-+	root := strings.Repeat("f", 32)
-+	run := func(t *testing.T, on bool) (got int, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, 25*time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				opts := v05Base(nil)
-+				if i == 0 {
-+					opts = append(opts, WithPeerOutboundQueueSize(2))
-+				}
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{OfferSkipped: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			c := newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			var batch MessageBatch
-+			for i := byte(0); i < 8; i++ {
-+				if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&batch); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(3 * time.Second)
-+			got = c.count(1, root)
-+		})
-+		return got, ctr
-+	}
-+	off, _ := run(t, false)
-+	on, ctr := run(t, true)
-+	t.Logf("frames at the receiver: %d as measured, %d with A′ (unpushed %d, offers owed %d, sent %d, answers owed %d)",
-+		off, on, ctr.Unpushed.Load(), ctr.OffersOwed.Load(), ctr.OwedSent.Load(), ctr.AnswersOwed.Load())
-+	if off >= 8 {
-+		t.Fatalf("known answer: the full queue should cost the receiver frames as measured, got %d of 8", off)
-+	}
-+	if on != 8 || ctr.Unpushed.Load() == 0 || ctr.OwedSent.Load() == 0 {
-+		t.Fatalf("with A′ the receiver should get all 8 through the owed offers, got %d", on)
-+	}
-+}
-+
-+// TestSpecV05OwedOnTheQueue is the writer's side of A′: owed offers ride the next RPC out as one
-+// IHAVE bitmap per group, less what the peer has told us it holds and the frame the RPC carries,
-+// or leave alone; an owed answer is queued once there is room, as an answer.
-+func TestSpecV05OwedOnTheQueue(t *testing.T) {
-+	root := strings.Repeat("g", 32)
-+	index := func(m *pb.Message) (string, uint32, bool) { return testIndex(string(m.Data[:v05IDLen])) }
-+	topic := "t"
-+	frame := func(i byte) *pb.Message { return &pb.Message{Data: v05Frame(root, i), Topic: &topic} }
-+	bits := func(is ...uint32) *haveBits {
-+		var b haveBits
-+		for _, i := range is {
-+			b.Set(i)
-+		}
-+		return &b
-+	}
-+	offered := func(rpc *RPC) []uint32 {
-+		var out []uint32
-+		for _, ih := range rpc.GetControl().GetIhave() {
-+			for _, id := range ih.GetMessageIDs() {
-+				r, enc, ok := decodeHave(id)
-+				if !ok || r != root {
-+					t.Fatalf("not a HAVE bitmap of the root: %q", id)
-+				}
-+				var b haveBits
-+				out = append(out, b.Or(enc)...)
-+			}
-+		}
-+		return out
-+	}
-+	ctx := context.Background()
-+
-+	q := newRpcQueue(1)
-+	q.enableHave(index, true, false)
-+	var sent atomic.Int64
-+	q.owedSent = &sent
-+	if err := q.Push(&RPC{RPC: pb.RPC{Publish: []*pb.Message{frame(0)}}}, false); err != nil {
-+		t.Fatal(err)
-+	}
-+	if err := q.Push(&RPC{RPC: pb.RPC{Publish: []*pb.Message{frame(9)}}}, false); err != ErrQueueFull {
-+		t.Fatalf("a second entry must be refused, got %v", err)
-+	}
-+	q.owe(topic, root, bits(0, 1, 2, 3))
-+	q.haveTheirs(root, bits(2).Bytes())
-+	q.oweAnswer(frame(5))
-+
-+	out, err := q.Pop(ctx)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(out.Publish) != 1 || fmt.Sprint(offered(out)) != "[1 3]" {
-+		t.Fatalf("the frame should carry the owed offers less its own index and the peer's HAVE: %d frames, offers %v", len(out.Publish), offered(out))
-+	}
-+	if sent.Load() != 2 {
-+		t.Fatalf("two owed indices left, counted %d", sent.Load())
-+	}
-+	ans, err := q.Pop(ctx)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(ans.Publish) != 1 || !ans.solicited || string(ans.Publish[0].Data[:v05IDLen]) != testMid(root, 5) {
-+		t.Fatalf("the owed answer should follow as an answer: %+v", ans)
-+	}
-+	q.owe(topic, root, bits(7))
-+	alone, err := q.Pop(ctx)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(alone.Publish) != 0 || fmt.Sprint(offered(alone)) != "[7]" {
-+		t.Fatalf("an owed offer with nothing queued should leave alone: %+v", alone)
-+	}
-+}
-+
-+// TestSpecV05WriterEdges: an owed answer wakes a writer asleep on an empty queue, and is owed once
-+// per chunk; a window grant whose frame was discarded goes back; under E an IWANT class loss is drawn
-+// at the writer and its asks still count as written.
-+func TestSpecV05WriterEdges(t *testing.T) {
-+	root := strings.Repeat("w", 32)
-+	topic := "t"
-+	index := func(m *pb.Message) (string, uint32, bool) {
-+		if len(m.Data) < v05IDLen {
-+			return "", 0, false
-+		}
-+		return testIndex(string(m.Data[:v05IDLen]))
-+	}
-+	frame := func(i byte) *pb.Message { return &pb.Message{Data: v05Frame(root, i), Topic: &topic} }
-+
-+	t.Run("an owed answer is owed once per chunk", func(t *testing.T) {
-+		q := newRpcQueue(4)
-+		q.enableHave(index, true, false)
-+		q.oweAnswer(frame(1))
-+		q.oweAnswer(frame(1)) // the same chunk again, before any pop
-+		q.oweAnswer(frame(2))
-+		other := &pb.Message{Data: []byte("plain"), Topic: &topic}
-+		q.oweAnswer(other)
-+		q.oweAnswer(&pb.Message{Data: []byte("plain"), Topic: &topic}) // equal payload, another message
-+		if len(q.owedAnswers) != 4 {
-+			t.Fatalf("chunks 1 and 2 once each, both ungrouped messages: %d owed", len(q.owedAnswers))
-+		}
-+	})
-+
-+	t.Run("an owed answer wakes a sleeping writer", func(t *testing.T) {
-+		synctestTest(t, func(t *testing.T) {
-+			q := newRpcQueue(4)
-+			q.enableHave(index, true, false)
-+			var got *RPC
-+			done := make(chan struct{})
-+			go func() {
-+				got, _ = q.Pop(context.Background())
-+				close(done)
-+			}()
-+			synctest.Wait() // the writer is asleep on the empty queue
-+			q.oweAnswer(frame(1))
-+			<-done
-+			if got == nil || len(got.Publish) != 1 || !got.solicited {
-+				t.Fatalf("the owed answer should leave as an answer: %+v", got)
-+			}
-+		})
-+	})
-+
-+	t.Run("a grant whose frame was discarded goes back", func(t *testing.T) {
-+		synctestTest(t, func(t *testing.T) {
-+			q := newRpcQueue(4)
-+			q.enableHave(index, true, false)
-+			q.hose = &hoseWindow{cfg: HoseConfig{Init: 1, Min: 1, Max: 1, Kp: 1, Timeout: time.Second}, w: 1}
-+			if granted, err := q.hose.acquireClass(context.Background(), q.urgentCh, 0); !granted || err != nil {
-+				t.Fatal("the one slot should be granted")
-+			}
-+			q.hoseHolding = true // granted for a frame that a discard then removed
-+			done := make(chan struct{})
-+			go func() {
-+				_, _ = q.Pop(context.Background())
-+				close(done)
-+			}()
-+			synctest.Wait() // the writer is asleep on the empty queue
-+			q.hose.mu.Lock()
-+			inflight := q.hose.inflight
-+			q.hose.mu.Unlock()
-+			q.Close()
-+			<-done
-+			if inflight != 0 {
-+				t.Fatalf("the unused grant should be back, %d in flight", inflight)
-+			}
-+		})
-+	})
-+
-+	t.Run("under E an IWANT loss is drawn at the writer", func(t *testing.T) {
-+		q := newRpcQueue(4)
-+		var reported []string
-+		q.onAsks = func(mids []string, _ time.Time) { reported = append(reported, mids...) }
-+		q.askLoss = func(ids []string) (kept, lost []string) {
-+			for _, id := range ids {
-+				if id == "lost" {
-+					lost = append(lost, id)
-+				} else {
-+					kept = append(kept, id)
-+				}
-+			}
-+			return kept, lost
-+		}
-+		if err := q.Push(rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{"lost", "kept"}}}, nil, nil, nil), false); err != nil {
-+			t.Fatal(err)
-+		}
-+		if err := q.Push(rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{"lost"}}}, nil, nil, nil), false); err != nil {
-+			t.Fatal(err)
-+		}
-+		if err := q.Push(rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{"last"}}}, nil, nil, nil), false); err != nil {
-+			t.Fatal(err)
-+		}
-+		out, err := q.Pop(ctx0())
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		if ids := out.GetControl().GetIwant()[0].GetMessageIDs(); len(ids) != 1 || ids[0] != "kept" {
-+			t.Fatalf("the lost ask should not be written: %q", ids)
-+		}
-+		if len(reported) != 0 {
-+			t.Fatalf("asks are reported at the write, not at the pop: %v", reported)
-+		}
-+		q.noteAsksWritten(out) // the writer writes it
-+		// The second RPC carried only a lost ask: the writer gets a marker with nothing to write,
-+		// whose asks are reported at the write like any other (after any send delay).
-+		out, err = q.Pop(ctx0())
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		if !out.lostOnly || out.GetControl() != nil || len(out.Publish) != 0 {
-+			t.Fatalf("an all-lost RPC should come as a marker with nothing to write: %+v", out)
-+		}
-+		q.noteAsksWritten(out)
-+		out, err = q.Pop(ctx0())
-+		if err != nil {
-+			t.Fatal(err)
-+		}
-+		if ids := out.GetControl().GetIwant()[0].GetMessageIDs(); len(ids) != 1 || ids[0] != "last" {
-+			t.Fatalf("the writer should go on: %q", ids)
-+		}
-+		q.noteAsksWritten(out)
-+		if fmt.Sprint(reported) != "[lost kept lost last]" {
-+			t.Fatalf("every ask written counts, the lost ones too: %v", reported)
-+		}
-+	})
-+}
-+
-+func ctx0() context.Context { return context.Background() }
-+
-+// TestSpecV05IWantLossAtWriter: the real IWANT class loss on the asker. As measured it drops asks
-+// at admission, before the queue and the window; under E it is drawn at the writer, and every lost
-+// ask counts as written: it opens its promise like a delivered one.
-+func TestSpecV05IWantLossAtWriter(t *testing.T) {
-+	root := strings.Repeat("l", 32)
-+	run := func(t *testing.T, on bool) (dropped int64, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		var lossDropped atomic.Int64
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				var opts []Option
-+				if i == 0 {
-+					opts = append(v05Base(nil), WithPhaseSourcePushQuota(1))
-+				} else {
-+					opts = append(v05Base(nil), WithRPCClassLoss("iwant", 50, 7, &lossDropped))
-+				}
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			var batch MessageBatch
-+			for i := byte(0); i < 32; i++ {
-+				if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&batch); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(3 * time.Second)
-+		})
-+		return lossDropped.Load(), ctr
-+	}
-+	offDropped, offCtr := run(t, false)
-+	onDropped, onCtr := run(t, true)
-+	t.Logf("asks lost: %d as measured (at admission, %d counted as written); %d with E (at the writer, %d counted as written, %d promises at the write)",
-+		offDropped, offCtr.AsksLost.Load(), onDropped, onCtr.AsksLost.Load(), onCtr.PromisesAtWrite.Load())
-+	if offDropped == 0 || offCtr.AsksLost.Load() != 0 {
-+		t.Fatal("known answer: as measured the loss drops asks at admission and nothing counts them as written")
-+	}
-+	// The loss is drawn per (id, peer), so a retry of a lost ask to the same peer is lost again while
-+	// the first one's promise is open, and that promise keeps its deadline: promises are fewer than
-+	// lost asks, and every lost ask was counted as written.
-+	if onDropped == 0 || onCtr.AsksLost.Load() != onDropped || onCtr.PromisesAtWrite.Load() == 0 {
-+		t.Fatalf("with E every lost ask is drawn at the writer and counted as written: lost %d, counted %d, promises %d",
-+			onDropped, onCtr.AsksLost.Load(), onCtr.PromisesAtWrite.Load())
-+	}
-+}
-+
-+// v05RejectTracer records rejections.
-+type v05RejectTracer struct {
-+	mockRawTracer
-+	rejected []string
-+}
-+
-+func (r *v05RejectTracer) RejectMessage(_ *Message, reason string) {
-+	r.rejected = append(r.rejected, reason)
-+}
-+
-+// TestSpecV05RejectAfterValidation: a chunk whose group died while it was being validated is
-+// ignored when its validation finishes, and the tracers see its end (no stale per-message state).
-+func TestSpecV05RejectAfterValidation(t *testing.T) {
-+	tr := &v05RejectTracer{}
-+	delivered := false
-+	p := &PubSub{
-+		admitMsg: func(*Message) bool { return false },
-+		tracer:   &pubsubTracer{raw: []RawTracer{tr}, pid: "self"},
-+		idGen:    newMsgIdGenerator(),
-+	}
-+	p.idGen.Default = func(m *pb.Message) string { return string(m.Data) }
-+	topic := "t"
-+	msg := &Message{Message: &pb.Message{Data: []byte("chunk"), Topic: &topic}, ReceivedFrom: "peer"}
-+	func() {
-+		defer func() {
-+			if recover() != nil {
-+				delivered = true // got past the check, into delivery (which this bare PubSub cannot do)
-+			}
-+		}()
-+		p.publishMessage(msg)
-+	}()
-+	if delivered || len(tr.rejected) != 1 || tr.rejected[0] != RejectValidationIgnored {
-+		t.Fatalf("a dead group's chunk should end as an ignored rejection: delivered %v, rejections %v", delivered, tr.rejected)
-+	}
-+}
-+
-+// TestSpecV05LastResort is F2: a slow answer parks a node's only provider. The provider publishes
-+// a group one frame every 300 ms, pushes the receiver its first (push quota 1) and offers the rest,
-+// and answers every ask 600 ms late. The receiver's first promises break and park the provider for
-+// the group, so it ignores the later offers and stays short; under B′ the last resort asks the
-+// parked provider once more, and the receiver completes.
-+func TestSpecV05LastResort(t *testing.T) {
-+	root := strings.Repeat("b", 32)
-+	run := func(t *testing.T, on bool) (got int, parked int64, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		var parks atomic.Int64
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				var opts []Option
-+				if i == 0 {
-+					opts = append(v05Base(nil), WithPhaseSourcePushQuota(1), WithIWantWithholding(600*time.Millisecond, nil))
-+				} else {
-+					opts = v05Base(&parks)
-+				}
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{LastResort: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			c := newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			for i := byte(0); i < 8; i++ {
-+				if err := topics[0].Publish(ctx, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+				time.Sleep(300 * time.Millisecond)
-+			}
-+			time.Sleep(5 * time.Second)
-+			got = c.count(1, root)
-+		})
-+		return got, parks.Load(), ctr
-+	}
-+	off, offParks, _ := run(t, false)
-+	on, onParks, ctr := run(t, true)
-+	t.Logf("frames at the receiver: %d as measured (%d parks), %d with B′ (%d parks; last resorts armed %d, asks %d, to parked %d)",
-+		off, offParks, on, onParks, ctr.LastResortsArmed.Load(), ctr.LastResortAsks.Load(), ctr.ParkedAsked.Load())
-+	if off >= 4 || offParks == 0 {
-+		t.Fatalf("known answer: without B′ the parked provider should leave the receiver short of 4, got %d frames, %d parks", off, offParks)
-+	}
-+	if on < 4 || ctr.ParkedAsked.Load() == 0 {
-+		t.Fatalf("with B′ the receiver should complete through the last resort, got %d frames, %d parked asks", on, ctr.ParkedAsked.Load())
-+	}
-+}
-+
-+// TestSpecV05PromiseAtWrite is F5: a peer parked for an ask it never received. The asker's own
-+// pushes hold its one-slot window, which the muted peer never acknowledges, so its ask waits
-+// behind them until the slot times out at 1.5 s. Decided at once, the promise breaks at 400 ms
-+// and parks the peer that is about to answer; started at the write (E), it is kept.
-+func TestSpecV05PromiseAtWrite(t *testing.T) {
-+	asker, source := strings.Repeat("c", 32), strings.Repeat("d", 32)
-+	run := func(t *testing.T, on bool) (got int, parked int64, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		var parks atomic.Int64
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				var opts []Option
-+				if i == 0 { // the asker
-+					opts = append(v05Base(&parks), WithHoseWindow(HoseConfig{Target: 20 * time.Millisecond, Kp: 1,
-+						Init: 1, Min: 1, Max: 1, Timeout: 1500 * time.Millisecond, FrameSlots: true}))
-+				} else { // the muted source: never acknowledges the asker's frames
-+					opts = append(v05Base(nil), WithPhaseSourcePushQuota(1), WithControlMute(nil))
-+				}
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			c := newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			// The asker's pushes first: frame 0 takes the slot, frame 1 waits behind it.
-+			var mine MessageBatch
-+			for i := byte(0); i < 2; i++ {
-+				if err := topics[0].AddToBatch(ctx, &mine, v05Frame(asker, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&mine); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(10 * time.Millisecond)
-+			// Then the source offers the asker its group: the asks queue behind the asker's frame 1.
-+			var theirs MessageBatch
-+			for i := byte(0); i < 8; i++ {
-+				if err := topics[1].AddToBatch(ctx, &theirs, v05Frame(source, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[1].PublishBatch(&theirs); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(4 * time.Second)
-+			got = c.count(0, source)
-+		})
-+		return got, parks.Load(), ctr
-+	}
-+	off, offParks, _ := run(t, false)
-+	on, onParks, ctr := run(t, true)
-+	t.Logf("as measured: %d frames, %d parks; with E: %d frames, %d parks (promises opened at the write %d)",
-+		off, offParks, on, onParks, ctr.PromisesAtWrite.Load())
-+	if offParks == 0 {
-+		t.Fatal("known answer: a promise from the decision should break while the ask waits, and park the source")
-+	}
-+	if onParks != 0 || ctr.PromisesAtWrite.Load() == 0 {
-+		t.Fatalf("with E no park for an ask that had not left: %d parks, %d promises at the write", onParks, ctr.PromisesAtWrite.Load())
-+	}
-+	if on != 8 {
-+		t.Fatalf("with E the asker should still get the source's 8 frames, got %d", on)
-+	}
-+}
-+
-+// TestSpecV05Expiry is D′ on a router's own state: when a group's holdings age out, its tombstone
-+// stays, its pull state goes, and nothing asks for it again. A group dies only GROUP_TTL after its
-+// last chunk, past the gossip window, so a network test would have nothing to show; the router's
-+// state shows it directly.
-+func TestSpecV05Expiry(t *testing.T) {
-+	root, other := strings.Repeat("x", 32), strings.Repeat("y", 32)
-+	p := peer.ID("peer")
-+	topic := "t"
-+	gs := testHaveRouter()
-+	gs.have.ihaveOn = true
-+	gs.peers = map[peer.ID]protocol.ID{p: GossipSubID_v12}
-+	gs.mesh = map[string]map[peer.ID]struct{}{topic: {p: {}}}
-+	gs.iwantWindow = 200 * time.Millisecond
-+	gs.iwantAsked = make(map[string]time.Time)
-+	gs.iwantPromised = make(map[string]map[peer.ID]time.Time)
-+	gs.parkGroups = make(map[peer.ID]map[string]*parkEntry)
-+	gs.offerTable = make(map[string]map[peer.ID]time.Time)
-+	gs.offerTried = make(map[string]map[peer.ID]time.Time)
-+	gs.offerTopic = make(map[string]string)
-+	gs.offerByPeer = make(map[peer.ID]int)
-+	q := newRpcQueue(16)
-+	gs.p = &PubSub{seenMessages: timecache.NewTimeCache(time.Minute), idGen: newMsgIdGenerator(),
-+		peers: map[peer.ID]*rpcQueue{p: q}}
-+	gs.p.idGen.Default = func(m *pb.Message) string { return string(m.Data[:v05IDLen]) }
-+	ctr := &SpecV05Counters{}
-+	host := &PubSub{rt: gs, idGen: gs.p.idGen}
-+	if err := WithSpecV05(SpecV05{LastResort: true, Expiry: true}, ctr)(host); err != nil {
-+		t.Fatal(err)
-+	}
-+	q.enableHave(func(m *pb.Message) (string, uint32, bool) { return testIndex(string(m.Data[:v05IDLen])) }, true, false)
-+	q.enableStaleAsks(gs.have.ownHeldID)
-+
-+	// We hold index 0 of root and were offered 1 and 2; one ask is in flight and its promise open.
-+	gs.haveNoteArrival(testMid(root, 0))
-+	gs.haveNoteArrival(testMid(other, 0))
-+	cands := []string{}
-+	iwant := map[string]string{}
-+	gs.considerAnnounced(p, topic, encodeWant(root, 1), iwant, &cands)
-+	gs.considerAnnounced(p, topic, encodeWant(root, 2), iwant, &cands)
-+	if len(cands) != 2 {
-+		t.Fatalf("before expiry both offers are candidates, got %v", cands)
-+	}
-+	gs.iwantAsked[encodeWant(root, 1)] = time.Now()
-+	gs.iwantPromised[encodeWant(root, 1)] = map[peer.ID]time.Time{p: time.Now()}
-+	// Queued to the peer: a frame of root, an offer of root and one of other, an ask of root.
-+	frame := &pb.Message{Data: v05Frame(root, 3), Topic: &topic}
-+	var b haveBits
-+	b.Set(3)
-+	mixed := rpcWithControl([]*pb.Message{frame}, []*pb.ControlIHave{{TopicID: &topic,
-+		MessageIDs: []string{encodeHave(root, &b), encodeHave(other, &b)}}}, []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 4)}}}, nil, nil, nil)
-+	mixed.size = 1
-+	if err := q.Push(mixed, false); err != nil {
-+		t.Fatal(err)
-+	}
-+	q.owe(topic, root, &b)
-+
-+	// The heartbeats age root out (the other group was refreshed meanwhile).
-+	for i := 0; i < gs.have.holdTTL; i++ {
-+		gs.haveNoteArrival(testMid(other, byte(i+1)))
-+		gs.haveHeartbeat()
-+	}
-+	if !gs.expired(root) || gs.expired(other) {
-+		t.Fatalf("root should be past its lifetime and other not: %v %v", gs.expired(root), gs.expired(other))
-+	}
-+	if len(gs.offerTable) != 0 || len(gs.iwantAsked) != 0 || len(gs.iwantPromised) != 0 || len(gs.v05.offered[p]) != 0 {
-+		t.Fatalf("root's pull state should be gone: offers %d asked %d promised %d offered %d",
-+			len(gs.offerTable), len(gs.iwantAsked), len(gs.iwantPromised), len(gs.v05.offered[p]))
-+	}
-+	// Nothing asks for it again: a late offer, a retry, the last resort.
-+	cands = cands[:0]
-+	gs.considerAnnounced(p, topic, encodeWant(root, 5), map[string]string{}, &cands)
-+	if len(cands) != 0 || len(gs.offerTable) != 0 {
-+		t.Fatalf("a late offer of a dead group must be ignored: %v", cands)
-+	}
-+	// A late copy is not admitted at ingress (no Preprocess, validation or delivery); a live
-+	// group's is.
-+	if host.admitMsg(&Message{Message: &pb.Message{Data: v05Frame(root, 6), Topic: &topic}}) {
-+		t.Fatal("a chunk of a dead group must not be admitted")
-+	}
-+	if !host.admitMsg(&Message{Message: &pb.Message{Data: v05Frame(other, 6), Topic: &topic}}) {
-+		t.Fatal("a chunk of a live group must be admitted")
-+	}
-+	// Nor would it bring the group back, were it to get past.
-+	gs.haveNoteArrival(testMid(root, 6))
-+	if _, back := gs.have.mine[root]; back {
-+		t.Fatal("a late copy must not bring the group back")
-+	}
-+	// The queue kept only what is not root's: the other group's offer; the owed offer is gone.
-+	out, err := q.Pop(context.Background())
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if len(out.Publish) != 0 || len(out.GetControl().GetIwant()) != 0 || len(out.GetControl().GetIhave()) != 1 {
-+		t.Fatalf("only the other group's offer should leave: %+v", out)
-+	}
-+	if r, _, _ := decodeHave(out.GetControl().GetIhave()[0].GetMessageIDs()[0]); r != other {
-+		t.Fatalf("the offer left is not the other group's")
-+	}
-+	if q.QueuedBytes() != 0 || len(q.owed) != 0 {
-+		t.Fatalf("queue accounting: %d bytes left, %d owed groups", q.QueuedBytes(), len(q.owed))
-+	}
-+	// A writer drops an ask for the dead group, queued after it died, at dispatch.
-+	if err := q.Push(rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 7), encodeWant(other, 9)}}}, nil, nil, nil), false); err != nil {
-+		t.Fatal(err)
-+	}
-+	ask, err := q.Pop(context.Background())
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+	if ids := ask.GetControl().GetIwant()[0].GetMessageIDs(); len(ids) != 1 || ids[0] != encodeWant(other, 9) {
-+		t.Fatalf("only the live group's ask should leave: %q", ids)
-+	}
-+	// The retry and the last resort ask nothing for it; a HAVE for it is ignored.
-+	gs.retryV05(encodeWant(root, 7))
-+	gs.lastResort(encodeWant(root, 7))
-+	gs.askParked(encodeWant(root, 7))
-+	if q.queue.Len() != 0 || len(gs.iwantAsked) != 0 || len(gs.v05.lrArmedKeys) != 0 {
-+		t.Fatalf("nothing may be asked for a dead group: queued %d, asked %d, armed %d", q.queue.Len(), len(gs.iwantAsked), len(gs.v05.lrArmedKeys))
-+	}
-+	var late haveBits
-+	late.Set(8)
-+	if !gs.haveAbsorb(p, encodeHave(root, &late)) || gs.have.peers[p][root] != nil {
-+		t.Fatal("a HAVE for a dead group must be ignored")
-+	}
-+	if ctr.Expired.Load() != 1 || ctr.ExpiredDiscards.Load() != 3 { // the queued ask after the expiry is the writer's
-+		t.Fatalf("counters: expired %d, discards %d (want 1, 3: the frame, its offer, its ask)", ctr.Expired.Load(), ctr.ExpiredDiscards.Load())
-+	}
-+	// The tombstone itself goes after another holdTTL.
-+	for i := 0; i < gs.have.holdTTL; i++ {
-+		gs.haveHeartbeat()
-+	}
-+	if gs.expired(root) {
-+		t.Fatal("the tombstone should be gone after another holdTTL")
-+	}
-+}
-+
-+// v05BlockGate declines every ask until its block installs (open), as an application gate that
-+// cannot authenticate a group before its block.
-+type v05BlockGate struct{ open atomic.Bool }
-+
-+func (g *v05BlockGate) Allow(peer.ID, string, string) bool { return g.open.Load() }
-+func (g *v05BlockGate) Committed(peer.ID, []string)        {}
-+
-+// TestSpecV05LedgerFromOffers is C′'s ledger: what the gate declined before the block is asked for
-+// when the block installs. The source pushes the receiver one frame (push quota 1) and offers the
-+// other seven while the receiver's gate declines them; the block then installs and the application
-+// replays. As measured the replay reads the deferral ledger, here of two ids, and the receiver ends
-+// with three frames; under C′ it reads the offer table, which kept every offer.
-+func TestSpecV05LedgerFromOffers(t *testing.T) {
-+	root := strings.Repeat("h", 32)
-+	run := func(t *testing.T, on bool) (got int, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, time.Millisecond)
-+			gate := &v05BlockGate{}
-+			deferral := NewRequestDeferral(2)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				opts := v05Base(nil)
-+				if i == 0 {
-+					opts = append(opts, WithPhaseSourcePushQuota(1))
-+				} else {
-+					opts = append(opts, WithRequestGate(gate, deferral))
-+				}
-+				if on {
-+					opts = append(opts, WithSpecV05(SpecV05{LastResort: true, LedgerFromOffers: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			c := newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			var batch MessageBatch
-+			for i := byte(0); i < 8; i++ {
-+				if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&batch); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(time.Second)
-+			if n := c.count(1, root); n != 1 {
-+				t.Fatalf("before the block the receiver should hold only the pushed frame, got %d", n)
-+			}
-+			gate.open.Store(true)
-+			deferral.Replay()
-+			time.Sleep(2 * time.Second)
-+			got = c.count(1, root)
-+		})
-+		return got, ctr
-+	}
-+	off, _ := run(t, false)
-+	on, ctr := run(t, true)
-+	t.Logf("frames at the receiver after the replay: %d as measured, %d with C′ (ledger asks %d)", off, on, ctr.LedgerAsks.Load())
-+	if off != 3 {
-+		t.Fatalf("known answer: as measured the replay recovers the two ids the ledger kept, 3 frames in all, got %d", off)
-+	}
-+	if on != 8 {
-+		t.Fatalf("with C′ the replay should recover every offered frame, got %d", on)
-+	}
-+}
-+
-+// TestSpecV05CloseWithConn: a promise open when its connection closes goes with it, and parks
-+// nobody. The receiver asks a provider that never answers, and the connection closes before the
-+// promise falls due.
-+func TestSpecV05CloseWithConn(t *testing.T) {
-+	root := strings.Repeat("e", 32)
-+	run := func(t *testing.T, on bool) (parked int64, ctr *SpecV05Counters) {
-+		ctr = &SpecV05Counters{}
-+		var parks atomic.Int64
-+		synctestTest(t, func(t *testing.T) {
-+			ctx, cancel := context.WithCancel(context.Background())
-+			defer cancel()
-+			hosts := v05Hosts(t, 2, 20, time.Millisecond)
-+			psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-+				var opts []Option
-+				if i == 0 {
-+					opts = append(v05Base(nil), WithPhaseSourcePushQuota(1), WithIWantWithholding(0, nil))
-+				} else {
-+					opts = v05Base(&parks)
-+				}
-+				if on {
-+					// E on as well: the writer's late reports must not reopen what the close closed.
-+					opts = append(opts, WithSpecV05(SpecV05{CloseWithConn: true, PromiseAtWrite: true}, ctr))
-+				}
-+				return opts
-+			})
-+			topics := v05Join(t, psubs)
-+			newV05Collect(ctx, t, topics)
-+			connectAll(t, hosts)
-+			time.Sleep(2 * time.Second)
-+			var batch MessageBatch
-+			for i := byte(0); i < 4; i++ {
-+				if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
-+					t.Fatal(err)
-+				}
-+			}
-+			if err := psubs[0].PublishBatch(&batch); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(100 * time.Millisecond)
-+			if err := hosts[1].Network().ClosePeer(hosts[0].ID()); err != nil {
-+				t.Fatal(err)
-+			}
-+			time.Sleep(2 * time.Second)
-+		})
-+		return parks.Load(), ctr
-+	}
-+	offParks, _ := run(t, false)
-+	onParks, ctr := run(t, true)
-+	t.Logf("parks: %d as measured, %d with the connection rule (promises closed with it %d)", offParks, onParks, ctr.ClosedPromises.Load())
-+	if offParks == 0 {
-+		t.Fatal("known answer: the open promises should fall due after the close and park the provider")
-+	}
-+	if onParks != 0 || ctr.ClosedPromises.Load() == 0 {
-+		t.Fatalf("with the rule the promises close with the connection: %d parks, %d closed", onParks, ctr.ClosedPromises.Load())
-+	}
-+}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/tailbounds.go fork/tailbounds.go
 --- base/tailbounds.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/tailbounds.go	2026-10-22 13:36:32.092831756 +0200
++++ fork/tailbounds.go	2026-10-04 18:17:17.133771201 +0200
 @@ -0,0 +1,176 @@
 +package pubsub
 +
@@ -17530,8 +14958,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/tailbounds.go fork/tailboun
 +	}
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/testextension.go fork/testextension.go
---- base/testextension.go	2026-10-22 13:36:32.075492092 +0200
-+++ fork/testextension.go	2026-10-22 13:36:32.092831756 +0200
+--- base/testextension.go	2026-10-04 18:17:17.115771301 +0200
++++ fork/testextension.go	2026-10-04 18:17:17.133771201 +0200
 @@ -6,7 +6,7 @@
  )
  
@@ -17543,15 +14971,12 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/testextension.go fork/teste
  
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 --- base/upload.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/upload.go	2026-10-22 13:36:32.093884815 +0200
-@@ -0,0 +1,230 @@
++++ fork/upload.go	2026-10-04 18:17:17.134771196 +0200
+@@ -0,0 +1,116 @@
 +package pubsub
 +
 +import (
 +	"sync"
-+	"time"
-+
-+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 +
 +	"github.com/libp2p/go-libp2p/core/peer"
 +	"google.golang.org/protobuf/proto"
@@ -17572,10 +14997,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +	MaxPushFrames, MaxAnswerFrames                int   // the most frames of the class in one write
 +	IHaveBytes, IWantBytes, IDontWantBytes        int64 // IDONTWANT carries the HAVE bitmaps and hose acks
 +	GraftPruneBytes, OtherBytes, Writes, AllBytes int64
-+	// The ids written in each control kind, and those that are HAVE bitmaps (a holding, an
-+	// acknowledgement, a decode claim) or asks by index (WANT ids): the per-rule counts the
-+	// harness sets beside the spec's toy (xcheck_test.go).
-+	IHaveIDs, IHaveBitmaps, IWantIDs, IWantAsks, IDontWantIDs, IDontWantBitmaps int64
 +}
 +
 +type uploadCounter struct {
@@ -17583,32 +15004,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +	s  UploadStat
 +	// pushTo is the pushed frames written to each peer, so a harness can tell who drew the pushes.
 +	pushTo map[peer.ID]int64
-+	// pushPerFrame is how many writes pushed each frame (by message id), unasked: the push budget
-+	// a harness checks against the spec's (xcheck_test.go). Filled only when note has an id function.
-+	pushPerFrame map[string]int32
-+	// When writes left, for a harness's timeline of a node's sends (the source's): the writes that
-+	// carried IHAVE ids, pushed frames and answers, each list capped at uploadTimesCap.
-+	ihaveAt, pushAt, answerAt []time.Time
-+	// asksIn and asksInMesh count the ask ids this node received (handleIWant), all and from its
-+	// mesh peers.
-+	asksIn, asksInMesh int64
-+}
-+
-+const uploadTimesCap = 1 << 14
-+
-+func appendCapped(ts []time.Time, t time.Time) []time.Time {
-+	if len(ts) >= uploadTimesCap {
-+		return ts
-+	}
-+	return append(ts, t)
-+}
-+
-+// noteAsksIn adds n ask ids received, inMesh of them from mesh peers. Router goroutine.
-+func (u *uploadCounter) noteAsksIn(n, inMesh int64) {
-+	u.mu.Lock()
-+	defer u.mu.Unlock()
-+	u.asksIn += n
-+	u.asksInMesh += inMesh
 +}
 +
 +// fieldSize is a length-delimited field of n bytes with a one-byte tag.
@@ -17621,45 +15016,21 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +}
 +
 +func (u *uploadCounter) note(rpc *RPC, written int, to peer.ID) {
-+	u.noteWithID(rpc, written, to, nil)
-+}
-+
-+// noteWithID is note with the node's message-id function, which keys the per-frame push counts.
-+func (u *uploadCounter) noteWithID(rpc *RPC, written int, to peer.ID, id func(*pb.Message) string) {
 +	var frames, fbytes int64
 +	for _, m := range rpc.Publish {
 +		frames++
 +		fbytes += fieldSize(proto.Size(m))
 +	}
 +	var ihave, iwant, idw, gp int64
-+	var ihaveIDs, ihaveBits, iwantIDs, iwantAsks, idwIDs, idwBits int64
 +	if c := rpc.Control; c != nil {
 +		for _, x := range c.Ihave {
 +			ihave += fieldSize(proto.Size(x))
-+			for _, mid := range x.GetMessageIDs() {
-+				ihaveIDs++
-+				if _, _, ok := decodeHave(mid); ok {
-+					ihaveBits++
-+				}
-+			}
 +		}
 +		for _, x := range c.Iwant {
 +			iwant += fieldSize(proto.Size(x))
-+			for _, mid := range x.GetMessageIDs() {
-+				iwantIDs++
-+				if _, _, ok := decodeWant(mid); ok {
-+					iwantAsks++
-+				}
-+			}
 +		}
 +		for _, x := range c.Idontwant {
 +			idw += fieldSize(proto.Size(x))
-+			for _, mid := range x.GetMessageIDs() {
-+				idwIDs++
-+				if _, _, ok := decodeHave(mid); ok {
-+					idwBits++
-+				}
-+			}
 +		}
 +		for _, x := range c.Graft {
 +			gp += fieldSize(proto.Size(x))
@@ -17668,19 +15039,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +			gp += fieldSize(proto.Size(x))
 +		}
 +	}
-+	now := time.Now()
 +	u.mu.Lock()
 +	defer u.mu.Unlock()
-+	if ihaveIDs > 0 {
-+		u.ihaveAt = appendCapped(u.ihaveAt, now)
-+	}
-+	if frames > 0 {
-+		if rpc.solicited {
-+			u.answerAt = appendCapped(u.answerAt, now)
-+		} else {
-+			u.pushAt = appendCapped(u.pushAt, now)
-+		}
-+	}
 +	s := &u.s
 +	s.Writes++
 +	s.AllBytes += int64(written)
@@ -17695,22 +15055,8 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +				u.pushTo = make(map[peer.ID]int64)
 +			}
 +			u.pushTo[to] += frames
-+			if id != nil {
-+				if u.pushPerFrame == nil {
-+					u.pushPerFrame = make(map[string]int32)
-+				}
-+				for _, m := range rpc.Publish {
-+					u.pushPerFrame[id(m)]++
-+				}
-+			}
 +		}
 +	}
-+	s.IHaveIDs += ihaveIDs
-+	s.IHaveBitmaps += ihaveBits
-+	s.IWantIDs += iwantIDs
-+	s.IWantAsks += iwantAsks
-+	s.IDontWantIDs += idwIDs
-+	s.IDontWantBitmaps += idwBits
 +	s.IHaveBytes += ihave
 +	s.IWantBytes += iwant
 +	s.IDontWantBytes += idw
@@ -17736,49 +15082,17 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload.go fork/upload.go
 +	return out
 +}
 +
-+// UploadPushPerFrame is, per frame id, how many writes pushed it unasked since the last
-+// ResetUploadStats.
-+func (p *PubSub) UploadPushPerFrame() map[string]int32 {
-+	p.upload.mu.Lock()
-+	defer p.upload.mu.Unlock()
-+	out := make(map[string]int32, len(p.upload.pushPerFrame))
-+	for k, v := range p.upload.pushPerFrame {
-+		out[k] = v
-+	}
-+	return out
-+}
-+
-+// UploadTimes is when the node's writes carrying IHAVE ids, pushed frames and answers left,
-+// since the last ResetUploadStats (each list capped).
-+func (p *PubSub) UploadTimes() (ihave, push, answer []time.Time) {
-+	p.upload.mu.Lock()
-+	defer p.upload.mu.Unlock()
-+	return append([]time.Time(nil), p.upload.ihaveAt...), append([]time.Time(nil), p.upload.pushAt...),
-+		append([]time.Time(nil), p.upload.answerAt...)
-+}
-+
-+// AsksReceived is the ask ids the node received since the last ResetUploadStats, all and from
-+// its mesh peers.
-+func (p *PubSub) AsksReceived() (all, fromMesh int64) {
-+	p.upload.mu.Lock()
-+	defer p.upload.mu.Unlock()
-+	return p.upload.asksIn, p.upload.asksInMesh
-+}
-+
 +// ResetUploadStats starts the count afresh (per message of a multi-message cell).
 +func (p *PubSub) ResetUploadStats() {
 +	p.upload.mu.Lock()
 +	defer p.upload.mu.Unlock()
 +	p.upload.s = UploadStat{}
 +	p.upload.pushTo = nil
-+	p.upload.pushPerFrame = nil
-+	p.upload.ihaveAt, p.upload.pushAt, p.upload.answerAt = nil, nil, nil
-+	p.upload.asksIn, p.upload.asksInMesh = 0, 0
 +}
 diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload_test.go fork/upload_test.go
 --- base/upload_test.go	1970-01-01 01:00:00.000000000 +0100
-+++ fork/upload_test.go	2026-10-22 13:36:32.093884815 +0200
-@@ -0,0 +1,101 @@
++++ fork/upload_test.go	2026-10-04 18:17:17.134771196 +0200
+@@ -0,0 +1,69 @@
 +package pubsub
 +
 +import (
@@ -17786,7 +15100,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload_test.go fork/upload_
 +	"testing"
 +
 +	pb "github.com/libp2p/go-libp2p-pubsub/pb"
-+	"github.com/libp2p/go-libp2p/core/peer"
 +	"google.golang.org/protobuf/proto"
 +)
 +
@@ -17819,37 +15132,6 @@ diff -ruN -x BUILD.bazel -x sign.go -x '*.orig' base/upload_test.go fork/upload_
 +		sum := s.PushBytes + s.AnswerBytes + s.IHaveBytes + s.IWantBytes + s.IDontWantBytes + s.GraftPruneBytes + s.OtherBytes
 +		if s.AllBytes != int64(written) || sum != s.AllBytes || s.OtherBytes < 6 {
 +			t.Fatalf("all %d sum %d other %d, want %d, equal, and at least the prefixes and control tags", s.AllBytes, sum, s.OtherBytes, written)
-+		}
-+	})
-+	t.Run("control ids are counted by kind, HAVE bitmaps and asks by index apart", func(t *testing.T) {
-+		var u uploadCounter
-+		var bits haveBits
-+		bits.Set(0)
-+		bits.Set(3)
-+		have := encodeHave(root, &bits)
-+		want := encodeWant(root, 5)
-+		ctl := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{
-+			Ihave:     []*pb.ControlIHave{{MessageIDs: []string{have, "plain"}}},
-+			Iwant:     []*pb.ControlIWant{{MessageIDs: []string{want, want, "plain"}}},
-+			Idontwant: []*pb.ControlIDontWant{{MessageIDs: []string{have}}},
-+		}}}
-+		u.note(ctl, proto.Size(&ctl.RPC), "to")
-+		s := u.s
-+		if s.IHaveIDs != 2 || s.IHaveBitmaps != 1 || s.IWantIDs != 3 || s.IWantAsks != 2 || s.IDontWantIDs != 1 || s.IDontWantBitmaps != 1 {
-+			t.Fatalf("ids %+v, want IHAVE 2 (1 bitmap), IWANT 3 (2 asks), IDONTWANT 1 (1 bitmap)", s)
-+		}
-+	})
-+	t.Run("pushes are counted per frame when the writer has an id function, answers never", func(t *testing.T) {
-+		var u uploadCounter
-+		id := func(m *pb.Message) string { return string(m.Data) }
-+		for _, to := range []string{"p1", "p2"} {
-+			u.noteWithID(testDataRPC(root, 2), 10, peer.ID(to), id)
-+		}
-+		ans := &RPC{RPC: pb.RPC{Publish: []*pb.Message{{Data: []byte(testMid(root, 2))}}}, solicited: true}
-+		u.noteWithID(ans, 10, "p3", id)
-+		u.note(testDataRPC(root, 2), 10, "p4") // no id function: counted as a push, not per frame
-+		if len(u.pushPerFrame) != 1 || u.pushPerFrame[testMid(root, 2)] != 2 || u.s.PushFrames != 3 || u.s.AnswerFrames != 1 {
-+			t.Fatalf("per frame %v, push frames %d, answers %d; want the frame pushed twice, 3 push frames, 1 answer", u.pushPerFrame, u.s.PushFrames, u.s.AnswerFrames)
 +		}
 +	})
 +	t.Run("a filtered copy stays an answer", func(t *testing.T) {

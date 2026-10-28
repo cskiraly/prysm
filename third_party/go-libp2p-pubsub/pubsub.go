@@ -98,13 +98,6 @@ type PubSub struct {
 	dispatchCredits *dispatchCredits
 	// hose, when set, is the node-wide window over frames in flight (WithHoseWindow).
 	hose *hoseWindow
-	// queueHooks, when set, installs the writer's side of the v0.5 rules on each new peer queue
-	// (WithSpecV05).
-	queueHooks func(*rpcQueue)
-	// admitMsg, when set, decides whether a received message enters at all: at ingress, before
-	// Preprocess and validation, and again when validation finishes (WithSpecV05's D′: a chunk of a
-	// group past its lifetime is ignored). processLoop goroutine.
-	admitMsg func(*Message) bool
 	// upload counts the bytes this node has written to its streams, by class (upload.go).
 	upload uploadCounter
 	// writersBlocked counts the writer goroutines inside a stream write: the hose estimate's
@@ -354,11 +347,6 @@ type RPC struct {
 	// solicited marks an IWANT answer: the peer asked for these frames after any bitmap it
 	// sent, so the dispatch-time cancel and projection leave them alone (havebitmap.go).
 	solicited bool
-	// asks is every ask id the writer writes with this RPC, lost ones included, for v0.5's E
-	// (specv05.go): set by the writer as it pops the RPC, read at the write. lostOnly marks an RPC
-	// whose asks a class loss took entirely: reported at the write, then nothing is written.
-	asks     []string
-	lostOnly bool
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -1168,9 +1156,6 @@ func (p *PubSub) handlePendingPeers() {
 		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 		rpcQueue.credits = p.dispatchCredits
 		rpcQueue.hose, rpcQueue.peer = p.hose, pid
-		if p.queueHooks != nil {
-			p.queueHooks(rpcQueue)
-		}
 		p.peers[pid] = rpcQueue
 		go p.handleNewPeer(p.ctx, pid, rpcQueue)
 	}
@@ -1235,9 +1220,6 @@ func (p *PubSub) handleDeadPeers() {
 			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 			rpcQueue.credits = p.dispatchCredits
 			rpcQueue.hose, rpcQueue.peer = p.hose, pid
-			if p.queueHooks != nil {
-				p.queueHooks(rpcQueue)
-			}
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
 		}
@@ -1754,9 +1736,6 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			}
 
 			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
-			if p.admitMsg != nil && !p.admitMsg(msg) {
-				continue
-			}
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}
@@ -1875,12 +1854,6 @@ func (p *PubSub) checkSigningPolicy(msg *Message) error {
 }
 
 func (p *PubSub) publishMessage(msg *Message) {
-	if !msg.Local && p.admitMsg != nil && !p.admitMsg(msg) {
-		// Its group died while it was being validated: ignored, and the tracers that saw it enter
-		// validation see it end there.
-		p.tracer.RejectMessage(msg, RejectValidationIgnored)
-		return
-	}
 	if !p.markDelivered(p.idGen.ID(msg)) {
 		return
 	}

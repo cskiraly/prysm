@@ -1201,9 +1201,6 @@ func (gs *GossipSubRouter) applyClassLoss(rpc *RPC, dst peer.ID) *RPC {
 	if gs.lossClass == lossClassNone || rpc == nil {
 		return rpc
 	}
-	if gs.lossClass == lossClassIWant && gs.v05PromiseAtWrite() {
-		return rpc // under v0.5's E the asks' loss is drawn at the writer (specv05.go, askLoss)
-	}
 	dropped := int64(0)
 	out := rpc
 	switch gs.lossClass {
@@ -1488,7 +1485,7 @@ func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
 		}
 		gs.offerTried[mid][from] = time.Now()
 	}
-	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
+	if gs.iwantPromised != nil {
 		if gs.iwantPromised[mid] == nil {
 			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
 		}
@@ -1500,7 +1497,7 @@ func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
 		m, f := mid, from
 		time.AfterFunc(gs.parkPromise, func() {
 			select {
-			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
 			case <-gs.p.ctx.Done():
 			}
 		})
@@ -1949,7 +1946,6 @@ func (gs *GossipSubRouter) clearIWantBudgetFor(mid string) {
 		gs.redrivePulls()
 	}
 	gs.clearOffers(mid)
-	gs.v05ChunkDelivered(mid)
 }
 
 // iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
@@ -2008,7 +2004,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 			}
 		})
 	}
-	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
+	if gs.iwantPromised != nil {
 		// Two-timer design: the promise is per (id, peer) and survives the discipline's
 		// move-on, so a fast window re-asks elsewhere while the slow/withholding peer's
 		// own deadline (parkPromise, which may exceed the window) still runs to judgment.
@@ -2027,7 +2023,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 		m, f := mid, from
 		time.AfterFunc(gs.parkPromise, func() {
 			select {
-			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
 			case <-gs.p.ctx.Done():
 			}
 		})
@@ -2039,15 +2035,13 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 // cleared (delivery of the id, from anyone) or re-made (a newer ask to the same peer) is not
 // charged; an open one breaks: the asked peer is charged and possibly parked. The discipline
 // slot is refunded only when this ask is still the current one (a shorter window has usually
-// moved on already — then there is nothing left to refund). promisedAt identifies the promise;
-// decidedAt is when the ask was decided, which differs from it when the promise starts at the
-// write (v0.5's E).
-func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, promisedAt, decidedAt time.Time) {
+// moved on already — then there is nothing left to refund).
+func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Time) {
 	if gs.iwantPromised == nil {
 		return
 	}
 	peers := gs.iwantPromised[mid]
-	if at, open := peers[from]; !open || !at.Equal(promisedAt) {
+	if at, open := peers[from]; !open || !at.Equal(askedAt) {
 		return
 	}
 	if gs.haveHolds(mid) {
@@ -2058,7 +2052,7 @@ func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, promisedAt, deci
 		}
 	}
 	gs.notePromiseBreak(mid, from)
-	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(decidedAt) {
+	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(askedAt) {
 		delete(gs.iwantAsked, mid)
 		if gs.iwantCount != nil {
 			delete(gs.iwantCount, mid)
@@ -2136,7 +2130,6 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	// for a fresh offer that may never come (relays announce once).
 	gs.redrivePulls()
 	gs.sweepOffers()
-	gs.sweepV05()
 	gs.sweepGroupParks()
 }
 
@@ -2598,9 +2591,6 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 	}
 	if _, known := peers[p]; !known {
 		gs.offerByPeer[p]++
-		if gs.v05LastResort() {
-			gs.noteOrder(mid, p)
-		}
 	}
 	peers[p] = time.Now()
 }
@@ -2618,7 +2608,6 @@ func (gs *GossipSubRouter) clearOffers(mid string) {
 	delete(gs.offerTable, mid)
 	delete(gs.offerTried, mid)
 	delete(gs.offerTopic, mid)
-	gs.v05ClearList(mid)
 }
 
 // sweepOffers ages out stale offers; called from the heartbeat sweep.
@@ -2632,9 +2621,6 @@ func (gs *GossipSubRouter) sweepOffers() {
 				delete(peers, p)
 				if gs.offerByPeer[p] > 0 {
 					gs.offerByPeer[p]--
-				}
-				if gs.v05LastResort() {
-					gs.dropOrder(mid, p)
 				}
 			}
 		}
@@ -2655,15 +2641,8 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 		gs.clearOffers(mid)
 		return
 	}
-	if gs.expiredID(mid) {
-		return // the group passed its lifetime (v0.5's D′)
-	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		return // an ask is in flight; its own retry timer will fire
-	}
-	if gs.v05LastResort() {
-		gs.retryV05(mid) // every announcer in announcement order, and the last resort
-		return
 	}
 	offers := gs.offerTable[mid]
 	if len(offers) == 0 {
@@ -2979,8 +2958,8 @@ const maxDeferredAnnouncers = 4
 // noteDeclined records that p offered mid on topic and the gate said no. Called from the selection
 // path, where the peer and topic are both in hand.
 func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
-	if gs.deferred == nil || (gs.v05 != nil && gs.v05.LedgerFromOffers) {
-		return // under v0.5's C′ the offer table is the ledger
+	if gs.deferred == nil {
+		return
 	}
 	e, ok := gs.deferred[mid]
 	if !ok {
@@ -3008,10 +2987,6 @@ func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
 // outstanding-request discipline and the promise tracker all apply exactly as they would to a fresh
 // announcement. A replay that bypassed them would be a second, unaccounted request channel.
 func (gs *GossipSubRouter) replayDeferred() {
-	if gs.v05 != nil && gs.v05.LedgerFromOffers && gs.requestGate != nil {
-		gs.replayLedger()
-		return
-	}
 	if gs.deferred == nil || gs.requestGate == nil {
 		return
 	}

@@ -79,36 +79,13 @@ func (gs *GossipSubRouter) withholdIWantServe(p peer.ID, mids []string, msgs []*
 		gs.withheldServes.Add(int64(len(held)))
 	}
 	if gs.withholdDelay > 0 {
-		asked := gs.p.peers[p] // the connection the ask came on
 		time.AfterFunc(gs.withholdDelay, func() {
 			select {
 			case gs.p.eval <- func() {
-				cur, ok := gs.p.peers[p]
-				if !ok {
+				if _, ok := gs.p.peers[p]; !ok {
 					return
 				}
-				late := held
-				if gs.v05 != nil {
-					// Under v0.5 the late serve goes on the connection it was asked on, and only for
-					// groups still alive; off v0.5 it leaves as the measured arms sent it.
-					if cur != asked {
-						return
-					}
-					late = nil
-					for _, m := range held {
-						if !gs.expiredID(gs.p.idGen.RawID(m)) {
-							late = append(late, m)
-						}
-					}
-					if len(late) == 0 {
-						return
-					}
-				}
-				// The late serve is an answer: under v0.5's A′ a full queue owes it as one, and the
-				// writer never projects it away. Off v0.5 it leaves as the measured arms sent it.
-				gs.sendingSolicited = gs.v05OfferSkipped()
-				gs.sendRPC(p, rpcWithControl(late, nil, nil, nil, nil, nil), false)
-				gs.sendingSolicited = false
+				gs.sendRPC(p, rpcWithControl(held, nil, nil, nil, nil, nil), false)
 			}:
 			case <-gs.p.ctx.Done():
 			}
