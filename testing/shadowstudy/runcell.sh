@@ -42,6 +42,10 @@ case $COND in
 esac
 QDISC=${QDISC:-fifo}
 cell="${arm}_${seed}_${tr}_${pay}_n${N}"
+# The connection degree is part of the cell; 70 (the posts' default) leaves the name as it was.
+[ "${DEGREE:-70}" = 70 ] || cell="${cell}_d${DEGREE}"
+[ -z "${V05:-}" ] || cell="${cell}_v05${V05//,/}"
+[ -z "${SRCHAVE:-}" ] || cell="${cell}_sh${SRCHAVE//[:,]/}"
 [ "$NET" = home ] || cell="${cell}_${NET}"
 [ "$COND" = cold ] || cell="${cell}_${COND}"
 [ -z "$EDGES" ] || cell="${cell}_${EDGES}"
@@ -64,12 +68,12 @@ fi
 # socket buffer sizes, since quic-go's own request overwrites Shadow's configured defaults.
 passthrough=""
 for k in SEGMENT_DIFFUSION SHADOW_UDP_SNDBUF SHADOW_UDP_RCVBUF; do
-  [ -z "$(eval echo "\$$k")" ] || passthrough="$passthrough $k=$(eval echo "\$$k")"
+  [ -z "$(eval echo "\${$k:-}")" ] || passthrough="$passthrough $k=$(eval echo "\$$k")"
 done
 printf '%s\n' $COMMON $EXTRA SHADOW_VARIANT=$VARIANT $passthrough > "$OUT/$cell/cell.env"
 gen() {
   python3 "$TOOLS/gen_shadow.py" --topology "$topo" --out "$OUT/$cell" --binary "$BIN" --transport "$tr" \
-    --env-file "$OUT/$cell/cell.env" --seed "$seed" --publish-delay "${PUBLISH_DELAY:-60}" --hold "${HOLD:-8}" \
+    --env-file "$OUT/$cell/cell.env" --seed "$seed" --publish-delay "${PUBLISH_DELAY:-60}" --hold "${HOLD:-${HOLD_DEFAULT:-8}}" \
     --parallelism "${PARALLELISM:-0}" --qdisc "$QDISC" ${EDGES:+--edges $EDGES} ${GENFLAGS:-} "$@"
 }
 gen || exit 3
@@ -78,6 +82,15 @@ if [ $rc -eq 124 ]; then
   echo "retrying $cell with shadow seed $((seed + 1000))"
   gen --shadow-seed $((seed + 1000)) || exit 3
   STALL_S=${STALL_S:-600} "$TOOLS/shadowrun.sh" "$OUT/$cell"; rc=$?
+fi
+if [ -n "$MULTI" ]; then
+  # A multi-message cell: one SHADOWMSG line per node and message, folded per message.
+  python3 "$STUDY/msgextract.py" --shadow-data "$OUT/$cell/data" --tools "$TOOLS" --n "$N" --arm "$arm" --seed "$seed" \
+    --transport "$tr" --pay "$pay" --payload-bytes "$P" --deadline 3 --out "$RES/$cell.json" --shadow-rc "$rc" \
+    --stderr "$OUT/$cell/shadow.stderr" --label "$cell" --binary "$BIN" --shadow "$SHADOW" --extra "net=$NET" \
+    --extra "cond=$COND" --extra "alias=$ALIAS" --extra "degree=${DEGREE:-70}" \
+    --commit "$(head -n 1 "$BIN.commit" 2>/dev/null || echo unknown)" | tee "$OUT/$cell/summary.txt"
+  exit "${PIPESTATUS[0]}"
 fi
 python3 "$TOOLS/extract.py" --data "$OUT/$cell/data" --n "$N" --arm "$arm" --seed "$seed" --transport "$tr" --pay "$pay" \
   --payload-bytes "$P" --deadline 3 --out "$RES/$cell.json" --shadow-rc "$rc" --stderr "$OUT/$cell/shadow.stderr" \

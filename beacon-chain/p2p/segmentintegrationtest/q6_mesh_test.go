@@ -38,6 +38,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	simlibp2p "github.com/libp2p/go-libp2p/x/simlibp2p"
 )
@@ -93,22 +94,13 @@ func TestQ6RealisticMesh(t *testing.T) {
 		for _, rate := range rates {
 			for _, n := range sizes {
 				for _, armName := range cell.arms {
-					var v variant
-					switch armName {
-					case "ecrs":
-						v = newEcrsVariant(t, cell, rate, oneWay)
-					case "fulldas":
-						v = newFullDASVariant(t, cell, rate, oneWay, n)
-					default:
-						v = cell.variant(t, armName, rate, oneWay, n)
-					}
 					runDiffusion(t, diffusionParams{
 						n:        n,
 						rate:     rate,
 						latency:  oneWay,
 						deadline: failureDeadline(t),
 						seed:     meshGraphSeed(t),
-					}, v)
+					}, cell.variant(t, armName, rate, oneWay, n))
 				}
 			}
 		}
@@ -208,6 +200,8 @@ type q6Variant struct {
 	hose    *hoseKnobs
 	rebuilt *rebuiltKnobs
 	nw      *simNetwork
+	// ownHost is the Shadow node's host, set before its router exists; nil in-process.
+	ownHost host.Host
 	// uplinks is each node's uplink in bits per second as meshLinks built it; geo the cell's
 	// latency model, recorded at setup (topodump_test.go).
 	uplinks []int
@@ -421,6 +415,17 @@ func (v *q6Variant) deferral(i int) *pubsub.RequestDeferral {
 
 func (v *q6Variant) name() string { return v.armName }
 
+// hostOf is node i's host: the in-process network's, or, in a Shadow node's process, its own.
+func (v *q6Variant) hostOf(i int) host.Host {
+	if v.nw == nil {
+		return v.ownHost
+	}
+	return nodeHost(v.nw, i)
+}
+
+// setOwnHost gives a Shadow node's variant the one host it runs on (shadow_node_test.go).
+func (v *q6Variant) setOwnHost(h host.Host) { v.ownHost = h }
+
 // groupNeed is one group's completion count: the arm's, or one half's in a pair cell.
 func (v *q6Variant) groupNeed() int {
 	if v.pair != nil {
@@ -431,6 +436,22 @@ func (v *q6Variant) groupNeed() int {
 
 func (v *q6Variant) wireForm() wireForm {
 	return wireForm{msgs: len(v.arm.msgs), need: v.groupNeed(), unit: v.unit, total: v.arm.total, idBytes: idWidth(v.arm.msgs[0])}
+}
+
+// pushDegree is node i's push degree as pubsubOpts gives it to the phase router, the bound the
+// cross-check holds each relay's pushes of one frame to (xcheck_test.go); 0 off the phase arm.
+func (v *q6Variant) pushDegree(i int) int {
+	if v.armName != "phase" {
+		return 0
+	}
+	r := v.phaseR
+	if v.regime.active {
+		r = v.regime.degree(i)
+	}
+	if v.fast != nil && i != 0 && v.fast[i] {
+		r = v.fastR
+	}
+	return r
 }
 
 func (v *q6Variant) pubsubOpts(t *testing.T, i int) []pubsub.Option {
@@ -528,7 +549,7 @@ func (v *q6Variant) pubsubOpts(t *testing.T, i int) []pubsub.Option {
 	if v.stagger != nil {
 		opts = append(opts, v.stagger.opt(i))
 	}
-	opts = append(opts, v.hose.opts(i, func() *simNetwork { return v.nw })...)
+	opts = append(opts, v.hose.opts(i, func() host.Host { return v.hostOf(i) })...)
 	if os.Getenv("SEGMENT_ASK_TRACE") != "" {
 		a := newAskTracer()
 		v.gateMu.Lock()
@@ -653,7 +674,9 @@ func (v *q6Variant) nextMessage(t *testing.T, m, pub int) {
 		v.pair.set(t, v, v.arm, m)
 	}
 	v.pub = pub
-	v.pubID = v.nw.Hosts[pub].ID()
+	if v.nw != nil { // a Shadow node has no network object; its per-network instruments stay off
+		v.pubID = v.nw.Hosts[pub].ID()
+	}
 	v.gateMu.Lock()
 	for _, g := range v.gates {
 		g.nextMessage(group)
@@ -665,7 +688,9 @@ func (v *q6Variant) nextMessage(t *testing.T, m, pub int) {
 	}
 	v.guard.reset(pub)
 	v.disclose.Reset()
-	v.offBase = hoseNewWindow(v.nw)
+	if v.nw != nil {
+		v.offBase = hoseNewWindow(v.nw)
+	}
 	for _, a := range v.askTracers {
 		a.setMessage(v.arm)
 	}
@@ -1123,7 +1148,7 @@ func (v *q6Variant) watchNode(ctx context.Context, idx int, ps *pubsub.PubSub, s
 					peerFirst = now
 					peerOWD = make(map[peer.ID]time.Duration)
 					for _, p := range ps.ListPeers(sub.Topic()) {
-						if r := quicMinRTT(v.nw, idx, p); r > 0 {
+						if r := quicMinRTT(v.hostOf(idx), p); r > 0 {
 							peerOWD[p] = r / 2
 						}
 					}

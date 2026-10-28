@@ -49,6 +49,18 @@ type horizonSnapshot struct {
 	pubID   peer.ID
 	pubMesh map[peer.ID]bool
 	ids     []peer.ID
+	// The cross-check with the specification's toy (xcheck_test.go): per node its reading, the
+	// push degree each node's frames are checked against, and the pull discipline's window.
+	xc        []xcNode
+	degree    func(int) int
+	askWindow time.Duration
+	// revoked, asksHeld and staleAsks are pubsub.HaveRevoked, AsksForHeldDropped and
+	// StaleAsksDropped at the horizon, zeroed at the publish: network-wide.
+	revoked, asksHeld, staleAsks int64
+	// startAt is the publish instant, for the source's timeline; askFirst and askRetry are the asks
+	// to the publisher that were their asker's first ask for the id, and later ones.
+	startAt            time.Time
+	askFirst, askRetry int
 }
 
 // horizonBase is what the routers had counted before a message was published.
@@ -119,7 +131,7 @@ func (b *horizonBase) since(i int, l *pubsub.RequestLedger, out map[peer.ID]pubs
 }
 
 func newHorizonSnapshot(t *testing.T, n int, at time.Duration, pub int, base *horizonBase) *horizonSnapshot {
-	h := &horizonSnapshot{at: at, rx: make([]int, n), ctrl: make([]int, n), dups: make([]int, n),
+	h := &horizonSnapshot{at: at, startAt: time.Now(), rx: make([]int, n), ctrl: make([]int, n), dups: make([]int, n),
 		dupStats: make([]nodeDups, n),
 		ledgers:  make([]*pubsub.RequestLedger, n), outbound: make([]map[peer.ID]pubsub.OutboundStat, n),
 		linkDropped: make([]int, n), linkEnqueued: make([]int, n), pub: pub, base: base}
@@ -147,6 +159,7 @@ func (h *horizonSnapshot) take(nw *simNetwork, tracers []*recordingTracer) {
 		h.ledgers[i], h.outbound[i] = h.base.since(i, nw.Pubsubs[i].RequestLedger(), nw.Pubsubs[i].OutboundStats())
 	}
 	h.takeDups(nw, tracers)
+	h.xcTake(nw, tracers)
 	h.pubID = nw.Hosts[h.pub].ID()
 	for _, hst := range nw.Hosts {
 		h.ids = append(h.ids, hst.ID())
@@ -414,8 +427,14 @@ func (h *horizonSnapshot) lines(compAt []time.Duration, rxAtComp []int) []string
 			quantile(topShare, 0.5), quantile(answerers, 0.5)))
 		// outbound
 		out = append(out, "outbound"+tag+": "+h.outboundLine(set))
+		if l := h.xcheckLine(set); l != "" {
+			out = append(out, "xcheck"+tag+": "+l)
+		}
 	}
 	out = append(out, fmt.Sprintf("outbound@%dms [publisher]: %s", ms, h.outboundLine([]int{h.pub})))
+	if l := h.xcheckLine([]int{h.pub}); l != "" {
+		out = append(out, fmt.Sprintf("xcheck@%dms [publisher]: %s", ms, l))
+	}
 	out = append(out, fmt.Sprintf("source-pulls@%dms: %s", ms, h.sourcePullsLine()))
 	return out
 }
@@ -483,7 +502,13 @@ type nodeDups struct {
 	// is arrival less pop; signalGap is pop less first delivery for the signal class — the speed
 	// a have-signal would need.
 	joined, failed, blind, signal, pull int
-	haveDelay, flight, signalGap        []time.Duration
+	// failedStrict is the failed duplicates whose HAVE reached the sender strictly before the
+	// pop; the rest of failed share the pop's virtual instant, a goroutine-order race.
+	failedStrict                 int
+	haveDelay, flight, signalGap []time.Duration
+	// lateGap is pop less HAVE arrival for the failedStrict class: how long the sender had the
+	// HAVE before it popped the frame anyway.
+	lateGap []time.Duration
 }
 
 // takeDups reads every tracer's duplicate log against its first deliveries, and each duplicate
@@ -579,6 +604,10 @@ func (h *horizonSnapshot) takeDups(nw *simNetwork, tracers []*recordingTracer) {
 			switch {
 			case !le.HaveAt.IsZero() && !le.HaveAt.After(le.PopAt):
 				nd.failed++
+				if le.HaveAt.Before(le.PopAt) {
+					nd.failedStrict++
+					nd.lateGap = append(nd.lateGap, le.PopAt.Sub(le.HaveAt))
+				}
 			case le.PopAt.Before(first):
 				nd.blind++
 			default:

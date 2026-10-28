@@ -899,8 +899,8 @@ func TestPopsBeforeRules(t *testing.T) {
 
 // TestSolicitedFramesAtDispatch is D7 idea 2's second unit known answer. A solicited frame the
 // peer has since announced is stale and cancels like any other; a solicited frame the peer asked
-// for after a full (no-claim) bitmap is written once the ask revoked its bit; and a solicited
-// frame is never projected away.
+// for after a full claim is written once the ask revoked its claimed bit; an ask never revokes what
+// the peer said it holds; and a solicited frame is never projected away.
 func TestSolicitedFramesAtDispatch(t *testing.T) {
 	root := strings.Repeat("g", 32)
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
@@ -922,7 +922,7 @@ func TestSolicitedFramesAtDispatch(t *testing.T) {
 	t.Run("an ask revokes the claimed bit", func(t *testing.T) {
 		q := newRpcQueue(16)
 		q.enableHave(testQueueIndex, true, false)
-		q.haveTheirs(root, fullHaveBits(128).Bytes())
+		q.haveClaim(root, fullHaveBits(128).Bytes())
 		q.haveRevoke(root, 6)
 		pushed := testDataRPC(root, 5)
 		if err := q.Push(pushed, false); err != nil {
@@ -944,6 +944,20 @@ func TestSolicitedFramesAtDispatch(t *testing.T) {
 			t.Fatalf("cancelled = %d, want 1", got)
 		}
 	})
+	t.Run("an ask never revokes a HAVE", func(t *testing.T) {
+		q := newRpcQueue(16)
+		q.enableHave(testQueueIndex, true, false)
+		q.haveTheirs(root, fullHaveBits(128).Bytes())
+		q.haveRevoke(root, 6)
+		answer := testDataRPC(root, 6)
+		answer.solicited = true
+		if err := q.Push(answer, false); err != nil {
+			t.Fatal(err)
+		}
+		if rpc, err := q.Pop(ctx); err == nil {
+			t.Fatalf("the peer holds frame 6 by its HAVE, which no ask revokes, so the answer cancels; popped %v", rpc)
+		}
+	})
 	t.Run("never projected away", func(t *testing.T) {
 		q := newRpcQueue(16)
 		q.enableHave(testQueueIndex, true, false)
@@ -951,9 +965,7 @@ func TestSolicitedFramesAtDispatch(t *testing.T) {
 		var theirs haveBits
 		theirs.Set(0)
 		theirs.Set(1)
-		theirs.Set(2)
 		q.haveTheirs(root, theirs.Bytes())
-		q.haveRevoke(root, 2)
 		answer := testDataRPC(root, 2)
 		answer.solicited = true
 		if err := q.Push(answer, false); err != nil {
@@ -1935,4 +1947,67 @@ func TestOriginHaveModes(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestStaleAsksAtDispatch is the spec's §7.2 known answer for asks: a queued ask for a frame we
+// have received since leaves no more, an ask for one we still lack does, and an RPC left with
+// nothing to say is not written.
+func TestStaleAsksAtDispatch(t *testing.T) {
+	root := strings.Repeat("s", 32)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	held := map[string]bool{encodeWant(root, 1): true}
+	q := newRpcQueue(16)
+	q.enableHave(testQueueIndex, true, false)
+	q.enableStaleAsks(func(mid string) bool { return held[mid] })
+	ask := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Iwant: []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 1), encodeWant(root, 2)}}}}}}
+	only := &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Iwant: []*pb.ControlIWant{{MessageIDs: []string{encodeWant(root, 1)}}}}}}
+	before := StaleAsksDropped.Load()
+	for _, r := range []*RPC{ask, only} {
+		if err := q.Push(r, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rpc, err := q.Pop(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := rpc.Control.GetIwant()[0].GetMessageIDs(); len(ids) != 1 || ids[0] != encodeWant(root, 2) {
+		t.Fatalf("the ask for frame 1, held by now, drops and frame 2's stays: got %v", ids)
+	}
+	if len(ask.Control.Iwant[0].MessageIDs) != 2 {
+		t.Fatal("the queued RPC was mutated")
+	}
+	if rpc, err := q.Pop(ctx); err == nil {
+		t.Fatalf("an RPC whose only ask is stale is not written, popped %v", rpc)
+	}
+	if got := StaleAsksDropped.Load() - before; got != 2 {
+		t.Fatalf("stale asks dropped = %d, want 2", got)
+	}
+}
+
+// TestOwnViewAndPeerHolds: the writers' mirror of what we hold follows arrivals, a full claim and
+// expiry, and havePeerHolds reads a peer's HAVE.
+func TestOwnViewAndPeerHolds(t *testing.T) {
+	root := strings.Repeat("o", 32)
+	h := newHaveState(func(mid string) (string, uint32, bool) { return testIndex(mid) })
+	h.own.set(root, 3)
+	if !h.ownHeldID(encodeWant(root, 3)) || h.ownHeldID(encodeWant(root, 4)) {
+		t.Fatal("own view: index 3 held, 4 not")
+	}
+	h.own.or(root, fullHaveBits(8).Bytes())
+	if !h.ownHeldID(encodeWant(root, 7)) {
+		t.Fatal("own view: a full claim holds index 7")
+	}
+	h.own.forget(root)
+	if h.ownHeldID(encodeWant(root, 3)) {
+		t.Fatal("own view: a forgotten root holds nothing")
+	}
+	gs := &GossipSubRouter{have: h}
+	var b haveBits
+	b.Set(5)
+	h.peers["p"] = map[string]*haveEntry{root: {bits: b}}
+	if !gs.havePeerHolds("p", root, 5) || gs.havePeerHolds("p", root, 6) || gs.havePeerHolds("q", root, 5) {
+		t.Fatal("havePeerHolds: p holds 5 only, q nothing")
+	}
 }

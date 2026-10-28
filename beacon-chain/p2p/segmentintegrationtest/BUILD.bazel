@@ -1,14 +1,5 @@
 load("@prysm//tools/go:def.bzl", "go_test")
 
-# The shadow cross-check imports eth-networking-lab through go.mod's local replace, which has no
-# Bazel repository; it builds with go test only.
-# gazelle:exclude shadow_node_test.go
-# gazelle:exclude shadow_reference_test.go
-# gazelle:exclude shadow_star_test.go
-# The vendored ethp2p (the ecrs arm) builds from its checked-in .pb.go files: its .proto files
-# name ethp2p's own import path, not this tree's.
-# gazelle:proto disable
-
 go_test(
     name = "go_default_test",
     size = "small",
@@ -17,8 +8,6 @@ go_test(
         "delaysplit_test.go",
         "diffusioncurve_test.go",
         "driver_test.go",
-        "ecrs_test.go",
-        "fulldas_test.go",
         "gossippace_test.go",
         "horizon_test.go",
         "hose_test.go",
@@ -35,13 +24,14 @@ go_test(
         "q6cell_test.go",
         "quicwindow_default_test.go",
         "rawblob_test.go",
-        "repeated_test.go",
         "replay_test.go",
+        "repeated_test.go",
         "routes_test.go",
         "segmentadmit_test.go",
         "segmentflood_test.go",
         "segmentgate_test.go",
         "segmentid_test.go",
+        "specv05_test.go",
         "spytrace_test.go",
         "stagger_test.go",
         "stem_test.go",
@@ -57,15 +47,13 @@ go_test(
         "variants_test.go",
         "wireform_test.go",
         "wiresize_test.go",
+        "xcheck_test.go",
     ],
     deps = [
         "//beacon-chain/p2p:go_default_library",
         "//beacon-chain/p2p/encoder:go_default_library",
         "//beacon-chain/p2p/scheduleddiffusion:go_default_library",
         "//beacon-chain/p2p/segmentbroadcaster:go_default_library",
-        "//beacon-chain/p2p/segmentintegrationtest/ecbridge:go_default_library",
-        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast:go_default_library",
-        "//beacon-chain/p2p/segmentintegrationtest/ethp2p/broadcast/rs:go_default_library",
         "//beacon-chain/verification/segmentauth:go_default_library",
         "//config/params:go_default_library",
         "//consensus-types/primitives:go_default_library",
@@ -75,7 +63,7 @@ go_test(
         "//testing/gossipsim:go_default_library",
         "//testing/require:go_default_library",
         "@com_github_golang_snappy//:go_default_library",
-        "@com_github_klauspost_reedsolomon//:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
         "@com_github_libp2p_go_libp2p//core/network:go_default_library",
         "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
         "@com_github_libp2p_go_libp2p//core/protocol:go_default_library",
@@ -83,7 +71,6 @@ go_test(
         "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
         "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
         "@com_github_marcopolo_simnet//:go_default_library",
-        "@com_github_multiformats_go_multistream//:go_default_library",
         "@com_github_quic_go_quic_go//:go_default_library",
         "@com_github_sirupsen_logrus//:go_default_library",
     ],

@@ -429,7 +429,7 @@ func (s *stemState) draw(t *testing.T, nw *simNetwork, from int, base []int, inM
 	if stem < len(s.uplinks) {
 		d.up = s.uplinks[stem]
 	}
-	d.oneWay = quicMinRTT(nw, from, nw.Hosts[stem].ID()) / 2
+	d.oneWay = quicMinRTT(nodeHost(nw, from), nw.Hosts[stem].ID()) / 2
 	return stem, d, redrawn
 }
 
@@ -807,7 +807,7 @@ func (s *stemState) lines(v *q6Variant, st diffusionStats) ([]string, error) {
 				mode += fmt.Sprintf(", forwards each frame to node %d", hops[h.n].node)
 			}
 		}
-		oneWay := quicMinRTT(v.nw, from, stemID) / 2
+		oneWay := quicMinRTT(nodeHost(v.nw, from), stemID) / 2
 		floor := time.Duration(float64(h.sent*8) / float64(v.rate) * float64(time.Second))
 		out = append(out, fmt.Sprintf("%s (%s): %s %d -> node %d, in its mesh at report %s; hand-off %d of %d frames, %d B written (%d B of frames; not in the publisher's upload line); stream open %s, last write %s; first frame at the stem %s, last %s, the stem's publish %s, last publish %s, decodable %s; one-way %v (QUIC min RTT / 2), serialisation of the hand-off at %d Mbps %v",
 			label, mode, sender, from, h.node, inMesh, h.frames, need, h.sent, h.bytes, ms(h.opened), ms(h.written), ms(h.first), ms(h.last),

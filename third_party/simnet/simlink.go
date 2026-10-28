@@ -62,6 +62,13 @@ func NewSimlink(
 		linkSettings.Downlink.MTU = defaultMTU
 	}
 
+	// SIMNET_FLOW_BUCKETS=N overrides both directions' flow bucket count (local change). One bucket
+	// makes FQ-CoDel a single CoDel queue served in arrival order; with SIMNET_CODEL_TARGET_MS far
+	// above any sojourn it is Shadow's FIFO, so the queue discipline, the other modelling difference
+	// between the two simulators, can be switched in the harness too. Unset, nothing changes.
+	if n := envInt("SIMNET_FLOW_BUCKETS", 0); n > 0 {
+		linkSettings.Uplink.FlowBucketCount, linkSettings.Downlink.FlowBucketCount = n, n
+	}
 	if linkSettings.Uplink.FlowBucketCount == 0 {
 		linkSettings.Uplink.FlowBucketCount = DefaultFlowBucketCount
 	}
@@ -192,4 +199,13 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(v * float64(time.Millisecond))
+}
+
+// envInt reads a positive count from the environment, falling back when unset or unusable.
+func envInt(name string, fallback int) int {
+	v, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }

@@ -10,7 +10,9 @@ STUDY=${STUDY:-$(cd "$(dirname "$0")" && pwd)}
 LAB=${LAB:-$(cd "$STUDY/../../.." && pwd)/eth-networking-lab}
 RES=${RES:-$STUDY/../results}
 sub=${1:?substrate}; arm=${2:?arm}; seed=${3:?seed}; tr=${4:?transport}; N=${5:?n}; pay=${6:?pay}; net=${7:-home}; cond=${8:-cold}
-suffix=""; [ "$net" = home ] || suffix="_$net"; [ "$cond" = cold ] || suffix="${suffix}_$cond"
+suffix=""; [ "${DEGREE:-70}" = 70 ] || suffix="_d${DEGREE}"
+[ -z "${V05:-}" ] || suffix="${suffix}_v05${V05//,/}"; [ -z "${SRCHAVE:-}" ] || suffix="${suffix}_sh${SRCHAVE//[:,]/}"
+[ "$net" = home ] || suffix="${suffix}_$net"; [ "$cond" = cold ] || suffix="${suffix}_$cond"
 # The queue discipline is part of a Shadow cell's identity -- runcell.sh puts it in the record's
 # name -- so it has to be part of the label the skip is decided on. Without it a lane run under a
 # second discipline finds the first one's records, calls every cell done, and exits having run
@@ -32,11 +34,19 @@ case $sub in
     NET=$net COND=$cond RES=$RES "$STUDY/runcell.sh" "$arm" "$seed" "$tr" "$N" "$pay" 2>&1 | grep -v "^wrote" | cut -c1-400 ;;
   harness)
     NET=$net COND=$cond RES=$RES "$STUDY/harnesscell.sh" "$arm" "$seed" "$N" "$pay"
-    read -r P ALIAS < <(NET=$net COND=$cond arm=$arm seed=$seed N=$N pay=$pay bash -c "source '$STUDY/arms.sh'; echo \$P \$ALIAS")
+    read -r P ALIAS MULTI < <(NET=$net COND=$cond arm=$arm seed=$seed N=$N pay=$pay bash -c "source '$STUDY/arms.sh'; echo \$P \$ALIAS \$MULTI")
     BIN=${BIN:-$STUDY/../bin/segshadow.test}
+    if [ -n "${MULTI:-}" ]; then
+      # A multi-message cell: the driver's per-message lines, folded as the Shadow side folds its own.
+      python3 "$STUDY/msgextract.py" --harness-log "$RES/$label.log" --tools "$LAB/shadowsim/tools" --n "$N" \
+        --arm "$arm" --seed "$seed" --transport quic --pay "$pay" --payload-bytes "$P" --label "$label" \
+        --extra "alias=$ALIAS" --extra "cond=$cond" --extra "degree=${DEGREE:-70}" \
+        --commit "$(head -n 1 "$BIN.commit" 2>/dev/null || echo unknown)" --out "$RES/$label.json" > /dev/null
+    else
     python3 "$LAB/shadowsim/tools/harnessrecord.py" --log "$RES/$label.log" --arm "$arm" --seed "$seed" --n "$N" \
       --pay "$pay" --payload-bytes "$P" --label "$label" --extra "alias=$ALIAS" --extra "cond=$cond" \
       --extra "commit=$(head -n 1 "$BIN.commit" 2>/dev/null || echo unknown)" --out "$RES/$label.json" > /dev/null
+    fi
     python3 - "$RES/$label.json" "$net" <<'EOF'
 import json, sys
 p, net = sys.argv[1], sys.argv[2]

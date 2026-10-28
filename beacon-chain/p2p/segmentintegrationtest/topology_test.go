@@ -618,6 +618,16 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		})
 	}
 
+	// SEGMENT_V05: the v0.5 rules (specv05_test.go), last, after the options they build on.
+	v05Rules, v05On := specV05FromEnv(t)
+	v05Reset()
+	if v05On {
+		if rr.active {
+			t.Fatal("SEGMENT_V05 needs the request policy on every node; the regime rule gives it to some")
+		}
+		t.Logf("spec v0.5 rules: %+v", v05Rules)
+	}
+
 	perNode := func(i int) []pubsub.Option {
 		out := []pubsub.Option{pubsub.WithIHaveRPCObservation(announceStats)}
 		if coalesceControl {
@@ -672,6 +682,9 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		}
 		if sendDelaySet[i] && sendDelay > 0 {
 			out = append(out, pubsub.WithSendDelay(sendDelay))
+		}
+		if v05On {
+			out = append(out, pubsub.WithSpecV05(v05Rules, &v05Ctr))
 		}
 		return out
 	}
@@ -732,40 +745,6 @@ func envMbps(name string, def int) int {
 	return k * simlibp2p.OneMbps
 }
 
-// meshClassLinks is meshLinks' validator class and node 0's link: SEGMENT_UP_MBPS and
-// SEGMENT_DOWN_MBPS, or SEGMENT_MESH_MBPS symmetric, for the validators; node 0 is the publisher, a
-// datacenter builder under SEGMENT_BUILDER_UP_MBPS, else a plain (home) node.
-func meshClassLinks(t *testing.T, defaultRate int) (validator, node0 simnet.NodeBiDiLinkSettings) {
-	t.Helper()
-	sym := func(bps int) simnet.NodeBiDiLinkSettings {
-		return simnet.NodeBiDiLinkSettings{
-			Downlink: simnet.LinkSettings{BitsPerSecond: bps},
-			Uplink:   simnet.LinkSettings{BitsPerSecond: bps},
-		}
-	}
-	up := envMbps("SEGMENT_UP_MBPS", 0)
-	down := envMbps("SEGMENT_DOWN_MBPS", 0)
-	if up > 0 || down > 0 {
-		if up == 0 {
-			up = envMbps("SEGMENT_MESH_MBPS", defaultRate)
-		}
-		if down == 0 {
-			down = 10 * up
-		}
-		validator = simnet.NodeBiDiLinkSettings{
-			Downlink: simnet.LinkSettings{BitsPerSecond: down},
-			Uplink:   simnet.LinkSettings{BitsPerSecond: up},
-		}
-	} else {
-		validator = sym(envMbps("SEGMENT_MESH_MBPS", defaultRate))
-	}
-	node0 = validator
-	if b := envMbps("SEGMENT_BUILDER_UP_MBPS", 0); b > 0 {
-		node0 = sym(b)
-	}
-	return validator, node0
-}
-
 // meshLinks resolves the per-node access link from the standard bandwidth knobs. If either
 // SEGMENT_UP_MBPS or SEGMENT_DOWN_MBPS is set the link is asymmetric (an unset side falls back
 // to the symmetric rate for the uplink and a generous 10x for the downlink); otherwise the link
@@ -794,7 +773,30 @@ func meshLinks(t *testing.T, n, defaultRate int) []simlibp2p.NodeLinkSettingsAnd
 			Uplink:   simnet.LinkSettings{BitsPerSecond: bps},
 		}
 	}
-	validator, node0 := meshClassLinks(t, defaultRate)
+
+	var validator simnet.NodeBiDiLinkSettings
+	up := envMbps("SEGMENT_UP_MBPS", 0)
+	down := envMbps("SEGMENT_DOWN_MBPS", 0)
+	if up > 0 || down > 0 {
+		if up == 0 {
+			up = envMbps("SEGMENT_MESH_MBPS", defaultRate)
+		}
+		if down == 0 {
+			down = 10 * up
+		}
+		validator = simnet.NodeBiDiLinkSettings{
+			Downlink: simnet.LinkSettings{BitsPerSecond: down},
+			Uplink:   simnet.LinkSettings{BitsPerSecond: up},
+		}
+	} else {
+		validator = sym(envMbps("SEGMENT_MESH_MBPS", defaultRate))
+	}
+
+	// node 0 is the publisher: a datacenter builder if configured, else a plain (home) node.
+	node0 := validator
+	if b := envMbps("SEGMENT_BUILDER_UP_MBPS", 0); b > 0 {
+		node0 = sym(b)
+	}
 
 	// The heterogeneity sweep replaces the class blocks with a drawn population, one entry per
 	// node. The builder keeps its own link: mixing the first hop into the population's spread

@@ -62,7 +62,6 @@
   },
   "maligned": {
     "exclude_files": {
-      "beacon-chain/p2p/segmentintegrationtest/ethp2p/.*": "Vendored ethp2p (the ecrs arm's engine), kept as upstream wrote it",
       "external/.*": "Third party code",
       "rules_go_work-.*": "Third party code",
       "config/params/config.go": "This config struct needs to be organized for now",
@@ -73,7 +72,6 @@
   },
   "errcheck": {
     "exclude_files": {
-      "beacon-chain/p2p/segmentintegrationtest/ethp2p/.*": "Vendored ethp2p (the ecrs arm's engine), kept as upstream wrote it",
       "external/.*": "Third party code",
       "rules_go_work-.*": "Third party code",
       "shared/mock/.*\\.go": "Mocks are OK",
@@ -173,7 +171,6 @@
   },
   "uintcast": {
     "exclude_files": {
-      "beacon-chain/p2p/segmentintegrationtest/ethp2p/.*": "Vendored ethp2p (the ecrs arm's engine), kept as upstream wrote it",
       "external/.*": "Third party code",
       "rules_go_work-.*": "Third party code",
       ".*_test\\.go": "Tests are ok"

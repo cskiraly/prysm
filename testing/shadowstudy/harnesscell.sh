@@ -14,6 +14,9 @@ COND=${COND:-cold}
 source "$STUDY/arms.sh"
 [ -z "$EDGES" ] || { echo "harnesscell.sh runs mesh cells only"; exit 2; }
 cell="${arm}_${seed}_harness_${pay}_n${N}"
+[ "${DEGREE:-70}" = 70 ] || cell="${cell}_d${DEGREE}"
+[ -z "${V05:-}" ] || cell="${cell}_v05${V05//,/}"
+[ -z "${SRCHAVE:-}" ] || cell="${cell}_sh${SRCHAVE//[:,]/}"
 [ "$NET" = home ] || cell="${cell}_${NET}"
 [ "$COND" = cold ] || cell="${cell}_${COND}"
 mkdir -p "$RES"

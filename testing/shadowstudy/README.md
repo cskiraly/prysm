@@ -34,6 +34,13 @@ study's half:
 - `runcell.sh ARM SEED [TRANSPORT] [N] [PAY]` (Shadow: export, generate, run under the watchdog,
   extract) and `harnesscell.sh ARM SEED [N] [PAY]` (the in-process driver on the same cell).
 - `cells500.txt`: the published 500-node cell, ten seeds, four arms, QUIC then TCP.
+- Multi-message cells (`SEGMENT_MESSAGES`, arms with `MULTI` set, such as `t4_16k`, tier 4 as the
+  SEACAST post's Figure 4 ran it): every node switches to message m's payload at its publish
+  instant and prints one `SHADOWMSG {json}` line per message (`shadow_messages_test.go`), with link
+  rx counted at its QUIC connections. `msgextract.py` folds either substrate's cell into one record
+  per cell (per message, then cold and the warm median over messages 2..M), for the Shadow side from
+  those lines and for the harness side from the driver's log. A degree other than 70 (`DEGREE=16`
+  for Figure 4) suffixes the cell's label with `_d<degree>`.
 
 ```sh
 # the whole lane, one cell at a time, resumable
@@ -67,6 +74,9 @@ and logs go to `testing/results/` (`RES`), Shadow's working directories to `test
 ./cell.sh shadow wholend 7 quic 500 p1m
 ./cell.sh shadow aadaptcf 7 tcp 500 p1m
 ./cell.sh harness atuned 7 quic 500 p1m
+# tier 4 at Figure 4's 16 connections, six payloads, on each substrate
+DEGREE=16 ./cell.sh shadow t4_16k 7 quic 500 p1m
+DEGREE=16 ./cell.sh harness t4_16k 7 quic 500 p1m
 ```
 
 Determinism: the same cell twice in one session gives byte-identical records; across sessions

@@ -2,9 +2,10 @@
 # definitions for the arms the cross-check reproduces, so a cell's SEGMENT_* environment is the
 # published cell's on both substrates.
 # Inputs: arm seed N pay, NET (home|dc20|dcb20|upN), COND (cold, warm320k, cwndN: the transport condition,
-# see below); outputs: P KA FC COMMON EXTRA EDGES VARIANT ALIAS
+# see below); outputs: P KA FC COMMON EXTRA EDGES VARIANT ALIAS MULTI HOLD_DEFAULT
 # (VARIANT: a = variant A on TestQ6RealisticMesh, b = TestVariantBDiffusion, c = TestVariantCDiffusion;
-# ALIAS: the name the published fleet used for the arm, for pairing with its records).
+# ALIAS: the name the published fleet used for the arm, for pairing with its records; MULTI: set
+# for a multi-message arm, whose records msgextract.py writes; HOLD_DEFAULT: its Shadow hold, s).
 #
 # An arm is a policy at a unit. The name carries both (atuned_32k: A-tuned's rules on 32 KiB
 # segments) and the definition sets every wire-affecting knob -- the unit, the parity, the id
@@ -46,6 +47,7 @@ FINAL="SEGMENT_IWANT_DISCIPLINE_MS=200 SEGMENT_OFFER_TABLE=1 SEGMENT_IHAVE_PARK=
 AR=2; [ $P -le 1048576 ] && AR=3; [ $P -le 262144 ] && AR=4
 EDGES=${EDGES:-}
 VARIANT=a
+MULTI=""; HOLD_DEFAULT=""
 # Variant B's tuned rules, verbatim from runfu.sh (BFIXED).
 BFIXED="SEGMENT_POLICIES=phase SEGMENT_REPLICATION=2 SEGMENT_CLAIM_PER_PEER=4 SEGMENT_STRIKE_CAP=1 SEGMENT_STRIKE_TTL_MS=30000 SEGMENT_ADAPTIVE_TIMEOUT=1 SEGMENT_PARTIAL_COMPRESS=1"
 ALIAS=$arm
@@ -76,7 +78,24 @@ case $arm in
   bcodedfc1_32k) ALIAS=bcodedfc1; VARIANT=b; EXTRA="$BFIXED SEGMENT_SIZE_BYTES=32768 SEGMENT_PARITY=$KA SEGMENT_PUSH_CHUNK=1" ;;
   c_32k)        ALIAS=c32; VARIANT=c; EXTRA="SEGMENT_SIZE_BYTES=32768 SEGMENT_C_PHASE_R=2 $FINAL" ;;
   crs_32k)      ALIAS=c32rs; VARIANT=c; EXTRA="SEGMENT_SIZE_BYTES=32768 SEGMENT_C_PHASE_R=2 SEGMENT_PARITY=$KA $FINAL" ;;
+  # Tier 4 (SEACAST) as the SEACAST post's Figure 4 ran it (the t4b string through the compare
+  # session's cellx.sh: tier 3's compress-first code at r = 2 plus HAVE bitmaps, cancel at dispatch,
+  # rarest first, the completion HAVE, the projection, group-scoped parks, the source's pushes over
+  # every connection, paced gossip, the static hose window, sel=fewest with its guard and tolerant
+  # draw, r = 6 on fast uplinks, unsigned messages), M = MSGS payloads 12 s apart (6). Run it at
+  # DEGREE=16 for Figure 4's cells. A multi-message arm: MULTI=1 sends both substrates' records
+  # through msgextract.py, and the Shadow hold covers every message (HOLD_DEFAULT).
+  t4_16k)       ALIAS=t4b; MSGS=${MSGS:-6}; MULTI=1; HOLD_DEFAULT=$(( (MSGS - 1) * 12 + 8 ))
+                EXTRA="SEGMENT_ARMS=phase SEGMENT_A_PHASE_R=2 SEGMENT_COMPRESS_FIRST=1 SEGMENT_FIXED_COUNT=$((P/16384)) SEGMENT_PARITY=$((P/16384)) SEGMENT_STRUCTURED_IDS=1 SEGMENT_STOP_PULL=1 $FINAL"
+                EXTRA="$EXTRA SEGMENT_MESSAGES=$MSGS SEGMENT_HAVE_BITMAP=both SEGMENT_HAVE_DISPATCH=cancel SEGMENT_HAVE_RAREST=1 SEGMENT_HAVE_COMPLETE=1 SEGMENT_HAVE_PROJECT=2"
+                EXTRA="$EXTRA SEGMENT_IHAVE_PARK_SCOPE=group SEGMENT_A_PHASE_SRC_CONNS=1 SEGMENT_GOSSIP_PACE=16 SEGMENT_HOSE=on SEGMENT_HOSE_STATIC=1 SEGMENT_HOSE_FRAME_SLOTS=1"
+                EXTRA="$EXTRA SEGMENT_PHASE_SEL=fewest SEGMENT_NO_SIGN=1 SEGMENT_DECODE_CLEARS_PROMISES=1 SEGMENT_PHASE_SEL_TOLERANT=lowerhalf SEGMENT_PHASE_SEL_GUARD_MS=200 SEGMENT_A_PHASE_R_FAST=6" ;;
   # Known answer: whole message over one link (N=2): completion ~ wire bytes / 50 Mbps + latency.
   line)         EXTRA="SEGMENT_ARMS=whole"; EDGES=line ;;
   *) echo "unknown arm $arm"; exit 2 ;;
 esac
+# Cell-level protocol knobs on any arm, named in the cell's label by the scripts (_v05<rules>,
+# _sh<mode>): V05 = SEGMENT_V05 (the v0.5 rules: all, or a subset of e,a,b,c,d,conn), SRCHAVE =
+# SEGMENT_SRC_HAVE (the source's HAVE mode, paced for P4).
+[ -z "${V05:-}" ] || EXTRA="$EXTRA SEGMENT_V05=$V05"
+[ -z "${SRCHAVE:-}" ] || EXTRA="$EXTRA SEGMENT_SRC_HAVE=$SRCHAVE"
