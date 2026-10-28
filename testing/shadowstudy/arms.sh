@@ -90,6 +90,14 @@ case $arm in
                 EXTRA="$EXTRA SEGMENT_MESSAGES=$MSGS SEGMENT_HAVE_BITMAP=both SEGMENT_HAVE_DISPATCH=cancel SEGMENT_HAVE_RAREST=1 SEGMENT_HAVE_COMPLETE=1 SEGMENT_HAVE_PROJECT=2"
                 EXTRA="$EXTRA SEGMENT_IHAVE_PARK_SCOPE=group SEGMENT_A_PHASE_SRC_CONNS=1 SEGMENT_GOSSIP_PACE=16 SEGMENT_HOSE=on SEGMENT_HOSE_STATIC=1 SEGMENT_HOSE_FRAME_SLOTS=1"
                 EXTRA="$EXTRA SEGMENT_PHASE_SEL=fewest SEGMENT_NO_SIGN=1 SEGMENT_DECODE_CLEARS_PROMISES=1 SEGMENT_PHASE_SEL_TOLERANT=lowerhalf SEGMENT_PHASE_SEL_GUARD_MS=200 SEGMENT_A_PHASE_R_FAST=6" ;;
+  # Today's gossipsub as the SEACAST post's Figure 4 ran it (the stack post's stock whole-message arm
+  # through the compare session's cellx.sh wholend: the compressed payload as one message, stock
+  # IDONTWANT, every announcer asked; no unit, so SEGMENT_STRICT off as there), M = MSGS payloads 12 s
+  # apart (6). Its last node completes after the 3 s deadline, so the Shadow node snapshots its
+  # counters to 10 s (SHADOW_SNAP_MS) and each message keeps a 12 s window, the last one included.
+  wholend_m6)   ALIAS=wholend; MSGS=${MSGS:-6}; MULTI=1; HOLD_DEFAULT=$(( MSGS * 12 ))
+                COMMON=${COMMON/SEGMENT_STRICT=1 /}
+                EXTRA="SEGMENT_ARMS=whole SEGMENT_MESSAGES=$MSGS SHADOW_SNAP_MS=10000" ;;
   # Known answer: whole message over one link (N=2): completion ~ wire bytes / 50 Mbps + latency.
   line)         EXTRA="SEGMENT_ARMS=whole"; EDGES=line ;;
   *) echo "unknown arm $arm"; exit 2 ;;

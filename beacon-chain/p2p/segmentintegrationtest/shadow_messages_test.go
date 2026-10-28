@@ -8,7 +8,8 @@ package segmentintegrationtest
 // driver resets them, and the bytes the node's QUIC connections received (link rx: UDP payloads with
 // every QUIC header, every protocol on the host, the quantity of the driver's link rx/node).
 // Snapshots every msgSnapshotInterval up to the deadline let the extractor cut the counters where
-// the driver does, at the last node's completion (testing/shadowstudy/msgextract.py).
+// the driver does, at the last node's completion (testing/shadowstudy/msgextract.py). An arm whose
+// last node completes after the deadline (the whole message) sets SHADOW_SNAP_MS to snapshot longer.
 //
 // SHADOW_HOLD_MS keeps its meaning: the node counts until the first publish plus the hold, so a cell
 // of M messages needs a hold beyond (M-1) gaps plus the deadline. Message m's window ends at the next
@@ -19,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -32,6 +34,22 @@ const msgStatPrefix = "SHADOWMSG "
 
 // msgSnapshotInterval is how often the counters are sampled after each publish, up to the deadline.
 const msgSnapshotInterval = 25 * time.Millisecond
+
+// msgSnapshotHorizon is how long after each publish the counters are sampled: the deadline, or
+// SHADOW_SNAP_MS when that is later, so the extractor's cut at the last completion still lands on a
+// snapshot when that completion comes after the deadline. A message's window still ends it.
+func msgSnapshotHorizon(t *testing.T) time.Duration {
+	t.Helper()
+	h := failureDeadline(t)
+	if v := os.Getenv("SHADOW_SNAP_MS"); v != "" {
+		ms, err := strconv.Atoi(v)
+		if err != nil || ms <= 0 {
+			t.Fatalf("bad SHADOW_SNAP_MS %q", v)
+		}
+		h = max(h, time.Duration(ms)*time.Millisecond)
+	}
+	return h
+}
 
 // msgCounters is one node's counters for the message in flight, T seconds after its publish.
 type msgCounters struct {
@@ -119,6 +137,7 @@ func shadowMultiRefuse(t *testing.T, plan messagePlan, sc shadowCell) {
 func shadowMessages(t *testing.T, e shadowsim.Schedule, plan messagePlan, sc shadowCell, run shadowRun, h host.Host, tracer *recordingTracer, start time.Time) {
 	t.Helper()
 	deadline := failureDeadline(t)
+	horizon := msgSnapshotHorizon(t)
 	m := len(plan.pubs)
 	holdEnd := e.PublishAt.Add(e.Hold)
 	if last := e.PublishAt.Add(time.Duration(m-1) * plan.gap); !holdEnd.After(last.Add(deadline)) {
@@ -176,7 +195,7 @@ func shadowMessages(t *testing.T, e shadowsim.Schedule, plan messagePlan, sc sha
 		}
 		for j := 1; ; j++ {
 			snapAt := at.Add(time.Duration(j) * msgSnapshotInterval)
-			if snapAt.After(at.Add(deadline)) || snapAt.After(end) {
+			if snapAt.After(at.Add(horizon)) || snapAt.After(end) {
 				break
 			}
 			shadowsim.SleepUntil(snapAt)

@@ -45,6 +45,12 @@ def at_cut(st, cut):
     return st["end"]
 
 
+def past_snapshots(st, cut):
+    """Whether a finite cut falls after a node's last snapshot, so at_cut gives its window's end."""
+    snaps = st.get("snapshots") or []
+    return cut != INF and (not snaps or snaps[-1]["t"] < cut)
+
+
 # The v0.5 rules' counters (SEGMENT_V05), in the order the driver's "v0.5 this message" line
 # prints them; a Shadow node reports its own under these keys.
 V05_KEYS = ("promises_at_write", "asks_lost", "unpushed", "offers_owed", "owed_sent", "answers_owed",
@@ -94,6 +100,9 @@ def shadow_messages(data_dir, n, deadline, ex):
             "p99_s": ex.quantile(times, pop, 0.99),
             "rate_k": sum(1 for t in times if t <= deadline),
             "cut_s": None if cut == INF else cut,
+            # Nodes whose counters came from the window's end because the cut fell after their
+            # snapshots (an arm completing past SHADOW_SNAP_MS); 0 when the cut landed on a snapshot.
+            "cut_past_snapshots": sum(1 for s in stats.values() if past_snapshots(s, cut)),
             "dups": sum(c["dups"] for c in cutv.values()),
             "idw_tx": sum(c["idw_sent"] for c in cutv.values()),
             "drops": sum(c["drops"] for c in cutv.values()),
@@ -120,17 +129,30 @@ def shadow_messages(data_dir, n, deadline, ex):
     return out, health
 
 
-# The driver's per-message result line (q6_mesh_test.go's report) and the link rx line after it.
-RESULT = re.compile(r"n=\s*(\d+)\s+\S+\s+(\d+)/(\d+)\s+virtual\s+(\d+|cens)ms.*?p50 (\d+|cens)ms p90 (\d+|cens)ms "
-                    r"p99 (\d+|cens)ms rate@\S+ (\d+)/(\d+)\s+dups\s+(\d+)\s+IDONTWANT tx\s+(\d+).*?publisherTx\s+(\d+)B"
-                    r"\s+rx/node\s+(\d+)B\s+ctrl rx/node\s+(\d+)B.*?mesh min (\d+), median (\d+), max (\d+)")
+# The driver's per-message result line (q6_mesh_test.go's report) and the link rx line after it. Its
+# times are Go durations rounded to the millisecond (955ms, 4.112s, 1m2.345s), a censored quantile
+# "cens".
+DUR = r"(cens|(?:\d+h)?(?:\d+m)?[0-9.]+(?:ms|s))"
+RESULT = re.compile(r"n=\s*(\d+)\s+\S+\s+(\d+)/(\d+)\s+virtual\s+" + DUR + r".*?p50 " + DUR + r" p90 " + DUR + r" "
+                    r"p99 " + DUR + r" rate@\S+ (\d+)/(\d+)\s+dups\s+(\d+)\s+IDONTWANT tx\s+(\d+).*?publisherTx\s+(\d+)B"
+                    r"\s+rx/node\s+(\d+)B\s+ctrl rx/node\s+(\d+)B.*?mesh (?:min (\d+), median (\d+), max (\d+)|none)")
+GODUR = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?([0-9.]+)(ms|s)")
 LINKRX = re.compile(r"link rx/node (\d+)B")
 SOCKRX = re.compile(r"socket rx/node (\d+)B")
 
 
+def dur_s(v):
+    """One of the result line's times in seconds; None when censored."""
+    if v == "cens":
+        return None
+    h, m, x, unit = GODUR.fullmatch(v).groups()
+    return int(h or 0) * 3600 + int(m or 0) * 60 + float(x) / (1000 if unit == "ms" else 1)
+
+
 def harness_messages(log):
     """Per-message summaries from the in-process driver's log, in message order."""
-    ms = lambda v: None if v == "cens" else int(v) / 1000  # noqa: E731
+    ms = dur_s
+    num = lambda v: None if v is None else int(v)  # noqa: E731 -- the mesh summary; none on an ecrs cell's first message
     out, last = [], None
     for line in open(log, errors="replace"):
         r = RESULT.search(line)
@@ -141,7 +163,7 @@ def harness_messages(log):
                     "dups": int(g[9]), "idw_tx": int(g[10]), "publisher_bytes": int(g[11]),
                     "rx_node_bytes": int(g[12]), "ctrl_rx_node_bytes": int(g[13]), "link_rx_node_bytes": None,
                     "socket_rx_node_bytes": None,
-                    "mesh_min": int(g[14]), "mesh_median": int(g[15]), "mesh_max": int(g[16]), "v05": None}
+                    "mesh_min": num(g[14]), "mesh_median": num(g[15]), "mesh_max": num(g[16]), "v05": None}
             out.append(last)
             continue
         sr = SOCKRX.search(line)
