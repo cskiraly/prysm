@@ -28,6 +28,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -100,6 +101,11 @@ func (mb *mockBroadcaster) BroadcastForEpoch(_ context.Context, _ proto.Message,
 }
 
 func (mb *mockBroadcaster) BroadcastBLSChanges(_ context.Context, _ []*ethpb.SignedBLSToExecutionChange) {
+}
+
+func (mb *mockBroadcaster) BroadcastSegments(_ context.Context, _ []*segments.SegmentMessage) error {
+	mb.broadcastCalled = true
+	return nil
 }
 
 var _ p2p.Broadcaster = (*mockBroadcaster)(nil)
