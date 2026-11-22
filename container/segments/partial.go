@@ -340,9 +340,10 @@ func UnmarshalPartsMetadata(b []byte) (*PartsMetadata, error) {
 	required := count
 	fixed := partsMetadataFixedLen
 	if b[0] == PartialVersionCoded {
-		// A coded group is bounded by the codec's field, not by MaxSegments, and a coded
-		// encoding where nothing is coded is refused so the encoding stays canonical.
-		if count > MaxCodedSegments {
+		// A coded group is bounded by its code, not by MaxSegments, and a coded encoding
+		// where nothing is coded is refused so the encoding stays canonical. The metadata does
+		// not name the code, so the bound here is the larger of the two codes'.
+		if count > MaxLeopardSegments {
 			return nil, fmt.Errorf("%w: coded count %d", ErrTooManySegments, count)
 		}
 		if len(b) < partsMetadataCodedFixedLen {

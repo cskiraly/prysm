@@ -1201,6 +1201,9 @@ func (gs *GossipSubRouter) applyClassLoss(rpc *RPC, dst peer.ID) *RPC {
 	if gs.lossClass == lossClassNone || rpc == nil {
 		return rpc
 	}
+	if gs.lossClass == lossClassIWant && gs.v05PromiseAtWrite() {
+		return rpc // under v0.5's E the asks' loss is drawn at the writer (specv05.go, askLoss)
+	}
 	dropped := int64(0)
 	out := rpc
 	switch gs.lossClass {
@@ -1485,7 +1488,7 @@ func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
 		}
 		gs.offerTried[mid][from] = time.Now()
 	}
-	if gs.iwantPromised != nil {
+	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
 		if gs.iwantPromised[mid] == nil {
 			gs.iwantPromised[mid] = make(map[peer.ID]time.Time)
 		}
@@ -1497,7 +1500,7 @@ func (gs *GossipSubRouter) noteAsk(mid string, from peer.ID) {
 		m, f := mid, from
 		time.AfterFunc(gs.parkPromise, func() {
 			select {
-			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
 			case <-gs.p.ctx.Done():
 			}
 		})
@@ -1946,6 +1949,7 @@ func (gs *GossipSubRouter) clearIWantBudgetFor(mid string) {
 		gs.redrivePulls()
 	}
 	gs.clearOffers(mid)
+	gs.v05ChunkDelivered(mid)
 }
 
 // iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
@@ -2004,7 +2008,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 			}
 		})
 	}
-	if gs.iwantPromised != nil {
+	if gs.iwantPromised != nil && !gs.v05PromiseAtWrite() { // under v0.5's E the writer opens it
 		// Two-timer design: the promise is per (id, peer) and survives the discipline's
 		// move-on, so a fast window re-asks elsewhere while the slow/withholding peer's
 		// own deadline (parkPromise, which may exceed the window) still runs to judgment.
@@ -2023,7 +2027,7 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 		m, f := mid, from
 		time.AfterFunc(gs.parkPromise, func() {
 			select {
-			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt) }:
+			case gs.p.eval <- func() { gs.promiseDue(m, f, askedAt, askedAt) }:
 			case <-gs.p.ctx.Done():
 			}
 		})
@@ -2035,13 +2039,15 @@ func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 // cleared (delivery of the id, from anyone) or re-made (a newer ask to the same peer) is not
 // charged; an open one breaks: the asked peer is charged and possibly parked. The discipline
 // slot is refunded only when this ask is still the current one (a shorter window has usually
-// moved on already — then there is nothing left to refund).
-func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Time) {
+// moved on already — then there is nothing left to refund). promisedAt identifies the promise;
+// decidedAt is when the ask was decided, which differs from it when the promise starts at the
+// write (v0.5's E).
+func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, promisedAt, decidedAt time.Time) {
 	if gs.iwantPromised == nil {
 		return
 	}
 	peers := gs.iwantPromised[mid]
-	if at, open := peers[from]; !open || !at.Equal(askedAt) {
+	if at, open := peers[from]; !open || !at.Equal(promisedAt) {
 		return
 	}
 	if gs.haveHolds(mid) {
@@ -2052,7 +2058,7 @@ func (gs *GossipSubRouter) promiseDue(mid string, from peer.ID, askedAt time.Tim
 		}
 	}
 	gs.notePromiseBreak(mid, from)
-	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(askedAt) {
+	if at, ok := gs.iwantAsked[mid]; ok && at.Equal(decidedAt) {
 		delete(gs.iwantAsked, mid)
 		if gs.iwantCount != nil {
 			delete(gs.iwantCount, mid)
@@ -2130,6 +2136,7 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 	// for a fresh offer that may never come (relays announce once).
 	gs.redrivePulls()
 	gs.sweepOffers()
+	gs.sweepV05()
 	gs.sweepGroupParks()
 }
 
@@ -2559,9 +2566,108 @@ func WithOfferTable(retries *atomic.Int64) Option {
 	}
 }
 
+// OfferOutcome is what the offer table did with an announcement of an id by a peer it had not
+// yet recorded for that id.
+type OfferOutcome int
+
+const (
+	// OfferRecorded: the announcer was recorded for the id.
+	OfferRecorded OfferOutcome = iota
+	// OfferRefusedPeerBound: not recorded, the peer is at its bound of undelivered ids
+	// (offerAtPeerBound).
+	OfferRefusedPeerBound
+	// OfferRefusedIDBound: not recorded, the id already has offerPerID announcers.
+	OfferRefusedIDBound
+)
+
+// WithOfferOutcomes reports what the offer table does with each announcement of an id by a peer
+// it has not recorded for that id: recorded, or refused at one of the table's two bounds. A
+// diagnostic: it changes nothing the table does. A pair is reported as recorded each time it is
+// recorded: once while the table holds it (an announcement that only refreshes it is not
+// reported), and again if it is announced after the table dropped it (its age, its peer or its
+// group gone). A refused pair stays unrecorded, so it is reported again each time the peer
+// announces the id again while the bound holds: the refusals count announcements, not pairs.
+// The hook runs on the router's event loop and must not block. Requires WithOfferTable.
+func WithOfferOutcomes(hook func(mid string, o OfferOutcome)) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("offer outcomes require a gossipsub router")
+		}
+		if gs.offerTable == nil {
+			return fmt.Errorf("offer outcomes require WithOfferTable first")
+		}
+		gs.offerOutcome = hook
+		return nil
+	}
+}
+
+// WithOfferPeerBound sets the offer table's per-peer bound, the number of undelivered ids one
+// peer may be recorded for, in place of offerPerPeer. Requires WithOfferTable.
+func WithOfferPeerBound(n int) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("offer peer bound requires a gossipsub router")
+		}
+		if gs.offerTable == nil {
+			return fmt.Errorf("offer peer bound requires WithOfferTable first")
+		}
+		if n <= 0 {
+			return fmt.Errorf("offer peer bound %d: want at least 1", n)
+		}
+		gs.offerPeerBound = n
+		return nil
+	}
+}
+
+// WithOfferPeerBoundByGroup makes the offer table's per-peer bound follow what a peer may
+// announce. A group of which a message passed validation here and whose holdings the node still
+// keeps is vouched for, and a peer that holds all of it announces all of it: the peer is recorded
+// for the ids of such a group up to offerPerPeerGroup, and those ids do not count against its
+// bound. The bound itself (offerPerPeer, or WithOfferPeerBound's) then covers only what nothing
+// vouches for: a peer's ids of other groups, and its ids of no group. Without this option one
+// count covers every id of a peer, so a peer announcing a group of more chunks than the bound is
+// refused for the rest.
+//
+// What one peer can make the node record is then the bound plus offerPerPeerGroup ids for each
+// vouched group: the vouching is as strong as the topic's validator, which decides what a group
+// is. A frame that fails validation, or is ignored, vouches for nothing. It does refresh the
+// group's holdings, which are noted at arrival: a peer that keeps sending such frames of a group
+// once vouched for keeps it vouched for past its lifetime. A router built for production would
+// give the vouching an age of its own, refreshed by validated messages alone.
+//
+// With a validator on the topic a group is vouched for when the verdict returns, not when the
+// frame arrives: announcements handled in between, the ones in the first frame's own RPC among
+// them, fall under the plain bound. Without a validator the two moments are one.
+//
+// It is meant to run with the expiry rule (SpecV05.Expiry), which drops a group's offers when its
+// holdings age out. Without that rule the group's recorded ids return to the bounded count at
+// that moment, and until they age out themselves (offerTTL) the peer's further ids that nothing
+// vouches for are refused.
+//
+// Requires WithOfferTable; without WithHaveBitmaps no group is vouched for, and the bound is the
+// plain one.
+func WithOfferPeerBoundByGroup() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("offer peer bound by group requires a gossipsub router")
+		}
+		if gs.offerTable == nil {
+			return fmt.Errorf("offer peer bound by group requires WithOfferTable first")
+		}
+		gs.offerBoundByGroup = true
+		gs.offerByPeerRoot = make(map[peer.ID]map[string]int)
+		gs.offerVouched = make(map[string]struct{})
+		return nil
+	}
+}
+
 // Per-peer and per-id bounds on the offer table. A peer beyond its budget stops being
 // recorded (in production that refusal is the scoreable anomaly — ~70 peers x 256 entries
-// is ~1 MB worst case); a single id keeps at most offerPerID announcers. Entries also age
+// is ~1 MB worst case; under WithOfferPeerBoundByGroup each vouched group adds up to
+// offerPerPeerGroup entries a peer); a single id keeps at most offerPerID announcers. Entries also age
 // out (offerTTL, swept from the heartbeat), so fabricated never-delivered ids cannot
 // accumulate: without the TTL a junk flood would eventually trip a global guard and
 // silently blind the table for honest offers — a policy attack, not a memory one.
@@ -2569,14 +2675,109 @@ const (
 	offerPerPeer = 256
 	offerPerID   = 16
 	offerTTL     = 30 * time.Second
+	// offerPerPeerGroup bounds a peer's recorded ids of one vouched group, under
+	// WithOfferPeerBoundByGroup: the indices a HAVE bitmap can name. The router does not know a
+	// group's chunk count, which is the bound a node that reads the descriptor would use. It
+	// counts ids, not indices: an index announced both as an ask by index and by its message id
+	// counts twice, so a peer can meet it in a group of more than half as many chunks.
+	offerPerPeerGroup = haveMaxBytes * 8
 )
+
+// OfferPerPeer and OfferPerPeerGroup are the offer table's default per-peer bound and its bound
+// per vouched group under WithOfferPeerBoundByGroup, for a caller that reports them.
+const (
+	OfferPerPeer      = offerPerPeer
+	OfferPerPeerGroup = offerPerPeerGroup
+)
+
+// offerAtPeerBound reports whether p is at its bound for one more id, mid.
+func (gs *GossipSubRouter) offerAtPeerBound(mid string, p peer.ID) bool {
+	bound := offerPerPeer
+	if gs.offerPeerBound > 0 {
+		bound = gs.offerPeerBound
+	}
+	if !gs.offerBoundByGroup {
+		return gs.offerByPeer[p] >= bound
+	}
+	byRoot := gs.offerByPeerRoot[p]
+	if root, _, ok := gs.groupIndex(mid); ok && gs.offerGroupVouched(root) {
+		return byRoot[root] >= offerPerPeerGroup
+	}
+	// Everything of p's that nothing vouches for. A group moves out of this count when its first
+	// message passes validation, and back when its holdings age out.
+	unvouched := gs.offerByPeer[p]
+	for root, n := range byRoot {
+		if gs.offerGroupVouched(root) {
+			unvouched -= n
+		}
+	}
+	return unvouched >= bound
+}
+
+// offerGroupVouched reports whether a message of the group root passed validation here and the
+// node still keeps the group's holdings. The holdings alone do not vouch: they are noted when a
+// frame arrives, before its validation, and stay if it fails.
+func (gs *GossipSubRouter) offerGroupVouched(root string) bool {
+	if _, ok := gs.offerVouched[root]; !ok {
+		return false
+	}
+	return gs.have != nil && gs.have.mine[root] != nil
+}
+
+// offerVouch notes, under WithOfferPeerBoundByGroup, that msg's group has a validated message:
+// the router is handed a message to forward only after validation accepted it, and its own
+// publishes by the same path. Router goroutine, from Publish and PublishBatch.
+func (gs *GossipSubRouter) offerVouch(msg *Message) {
+	if !gs.offerBoundByGroup {
+		return
+	}
+	if root, _, ok := gs.groupIndex(gs.p.idGen.ID(msg)); ok {
+		gs.offerVouched[root] = struct{}{}
+	}
+}
+
+// offerCount adds d (1 or -1) to p's count of recorded ids, and to its count for mid's group
+// under WithOfferPeerBoundByGroup. A count never goes below zero.
+func (gs *GossipSubRouter) offerCount(mid string, p peer.ID, d int) {
+	if d < 0 && gs.offerByPeer[p] <= 0 {
+		return
+	}
+	gs.offerByPeer[p] += d
+	if !gs.offerBoundByGroup {
+		return
+	}
+	root, _, ok := gs.groupIndex(mid)
+	if !ok {
+		return
+	}
+	byRoot := gs.offerByPeerRoot[p]
+	if d > 0 {
+		if byRoot == nil {
+			byRoot = make(map[string]int)
+			gs.offerByPeerRoot[p] = byRoot
+		}
+		byRoot[root]++
+		return
+	}
+	if byRoot[root] > 1 {
+		byRoot[root]--
+	} else {
+		delete(byRoot, root)
+		if len(byRoot) == 0 {
+			delete(gs.offerByPeerRoot, p)
+		}
+	}
+}
 
 // recordOffer notes that peer p announced mid; a fact, kept until delivery or expiry.
 func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 	if gs.offerTable == nil || gs.haveSeen(mid) {
 		return
 	}
-	if gs.offerByPeer[p] >= offerPerPeer {
+	if gs.offerAtPeerBound(mid, p) {
+		if _, known := gs.offerTable[mid][p]; !known {
+			gs.noteOfferOutcome(mid, OfferRefusedPeerBound)
+		}
 		return
 	}
 	peers := gs.offerTable[mid]
@@ -2586,13 +2787,25 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 		gs.offerTopic[mid] = topic
 	} else if len(peers) >= offerPerID {
 		if _, known := peers[p]; !known {
+			gs.noteOfferOutcome(mid, OfferRefusedIDBound)
 			return
 		}
 	}
 	if _, known := peers[p]; !known {
-		gs.offerByPeer[p]++
+		gs.offerCount(mid, p, 1)
+		if gs.v05LastResort() {
+			gs.noteOrder(mid, p)
+		}
+		gs.noteOfferOutcome(mid, OfferRecorded)
 	}
 	peers[p] = time.Now()
+}
+
+// noteOfferOutcome hands the diagnostic hook, if one is set, what became of a new pair.
+func (gs *GossipSubRouter) noteOfferOutcome(mid string, o OfferOutcome) {
+	if gs.offerOutcome != nil {
+		gs.offerOutcome(mid, o)
+	}
 }
 
 // clearOffers forgets a delivered id.
@@ -2601,13 +2814,12 @@ func (gs *GossipSubRouter) clearOffers(mid string) {
 		return
 	}
 	for p := range gs.offerTable[mid] {
-		if gs.offerByPeer[p] > 0 {
-			gs.offerByPeer[p]--
-		}
+		gs.offerCount(mid, p, -1)
 	}
 	delete(gs.offerTable, mid)
 	delete(gs.offerTried, mid)
 	delete(gs.offerTopic, mid)
+	gs.v05ClearList(mid)
 }
 
 // sweepOffers ages out stale offers; called from the heartbeat sweep.
@@ -2615,12 +2827,19 @@ func (gs *GossipSubRouter) sweepOffers() {
 	if gs.offerTable == nil {
 		return
 	}
+	// A vouched group whose holdings aged out is vouched for no longer.
+	for root := range gs.offerVouched {
+		if gs.have == nil || gs.have.mine[root] == nil {
+			delete(gs.offerVouched, root)
+		}
+	}
 	for mid, peers := range gs.offerTable {
 		for p, at := range peers {
 			if time.Since(at) >= offerTTL {
 				delete(peers, p)
-				if gs.offerByPeer[p] > 0 {
-					gs.offerByPeer[p]--
+				gs.offerCount(mid, p, -1)
+				if gs.v05LastResort() {
+					gs.dropOrder(mid, p)
 				}
 			}
 		}
@@ -2641,8 +2860,15 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) {
 		gs.clearOffers(mid)
 		return
 	}
+	if gs.expiredID(mid) {
+		return // the group passed its lifetime (v0.5's D′)
+	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		return // an ask is in flight; its own retry timer will fire
+	}
+	if gs.v05LastResort() {
+		gs.retryV05(mid) // every announcer in announcement order, and the last resort
+		return
 	}
 	offers := gs.offerTable[mid]
 	if len(offers) == 0 {
@@ -2958,8 +3184,8 @@ const maxDeferredAnnouncers = 4
 // noteDeclined records that p offered mid on topic and the gate said no. Called from the selection
 // path, where the peer and topic are both in hand.
 func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
-	if gs.deferred == nil {
-		return
+	if gs.deferred == nil || (gs.v05 != nil && gs.v05.LedgerFromOffers) {
+		return // under v0.5's C′ the offer table is the ledger
 	}
 	e, ok := gs.deferred[mid]
 	if !ok {
@@ -2987,6 +3213,10 @@ func (gs *GossipSubRouter) noteDeclined(p peer.ID, topic, mid string) {
 // outstanding-request discipline and the promise tracker all apply exactly as they would to a fresh
 // announcement. A replay that bypassed them would be a second, unaccounted request channel.
 func (gs *GossipSubRouter) replayDeferred() {
+	if gs.v05 != nil && gs.v05.LedgerFromOffers && gs.requestGate != nil {
+		gs.replayLedger()
+		return
+	}
 	if gs.deferred == nil || gs.requestGate == nil {
 		return
 	}

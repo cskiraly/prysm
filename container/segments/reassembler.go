@@ -156,7 +156,7 @@ func (r *Reassembler) Add(h Hasher, m *SegmentMessage) ([]byte, error) {
 	}
 	var msg []byte
 	var err error
-	if g.desc.Version == VersionCoded {
+	if g.desc.Coded() {
 		// Recovered segments are deliberately not stored back into the group: they carry no
 		// proofs, so they could never be served, and Held must only advertise what Segment
 		// can actually produce.

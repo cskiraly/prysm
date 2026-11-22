@@ -43,6 +43,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/k0kubun/go-ansi v0.0.0-20180517002512-3bf9e2903213
 	github.com/kisielk/errcheck v1.8.0
+	github.com/klauspost/reedsolomon v1.12.5
 	github.com/kr/pretty v0.3.1
 	github.com/kurtosis-tech/kurtosis/api/golang v1.20.0
 	github.com/libp2p/go-libp2p v0.48.0
@@ -182,7 +183,6 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
-	github.com/klauspost/reedsolomon v1.12.5 // indirect
 	github.com/koron/go-ssdp v0.0.6 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kurtosis-tech/kurtosis-portal/api/golang v0.0.0-20230818182330-1a86869414d2 // indirect

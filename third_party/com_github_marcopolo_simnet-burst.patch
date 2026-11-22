@@ -1,6 +1,6 @@
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel.go fork_simnet/codel.go
---- base_simnet/codel.go	2026-10-22 16:34:11.673757792 +0200
-+++ fork_simnet/codel.go	2026-10-22 16:34:11.681030159 +0200
+--- base_simnet/codel.go	2026-10-22 12:53:31.970508834 +0200
++++ fork_simnet/codel.go	2026-10-22 12:53:31.974002799 +0200
 @@ -2,6 +2,7 @@
  
  import (
@@ -83,8 +83,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel.go fork_simnet
  
  func (q *coDelQueue) doDequeue(now time.Time) (p packetWithTimestamp, okToDrop bool) {
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel_test.go fork_simnet/codel_test.go
---- base_simnet/codel_test.go	2026-10-22 16:34:11.673757792 +0200
-+++ fork_simnet/codel_test.go	2026-10-22 16:34:11.681030159 +0200
+--- base_simnet/codel_test.go	2026-10-22 12:53:31.970508834 +0200
++++ fork_simnet/codel_test.go	2026-10-22 12:53:31.974002799 +0200
 @@ -14,7 +14,7 @@
  			target   = 5 * time.Millisecond
  			interval = 100 * time.Millisecond
@@ -113,8 +113,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/codel_test.go fork_s
  		q.Enqueue(p)
  	}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/fq_codel.go fork_simnet/fq_codel.go
---- base_simnet/fq_codel.go	2026-10-22 16:34:11.673757792 +0200
-+++ fork_simnet/fq_codel.go	2026-10-22 16:34:11.681030159 +0200
+--- base_simnet/fq_codel.go	2026-10-22 12:53:31.970508834 +0200
++++ fork_simnet/fq_codel.go	2026-10-22 12:53:31.974002799 +0200
 @@ -25,6 +25,10 @@
  
  	hash maphash.Hash
@@ -157,8 +157,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/fq_codel.go fork_sim
  		q.newFlows.append(&listNode[*coDelQueueWithCredits]{v: fq})
  	}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_simnet/ratelink.go
---- base_simnet/ratelink.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/ratelink.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/ratelink.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/ratelink.go	2026-10-22 12:53:31.974552683 +0200
 @@ -14,16 +14,30 @@
  
  // Creates a new RateLimiter with the following parameters:
@@ -195,8 +195,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink.go fork_sim
  	}
  }
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go fork_simnet/ratelink_test.go
---- base_simnet/ratelink_test.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/ratelink_test.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/ratelink_test.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/ratelink_test.go	2026-10-22 12:53:31.974552683 +0200
 @@ -26,7 +26,7 @@
  		)
  
@@ -207,8 +207,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/ratelink_test.go for
  		chunk := make([]byte, mtu)
  
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork_simnet/simconn_test.go
---- base_simnet/simconn_test.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/simconn_test.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/simconn_test.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/simconn_test.go	2026-10-22 12:53:31.974552683 +0200
 @@ -214,6 +214,7 @@
  		DefaultFlowBucketCount,
  		1500,
@@ -218,8 +218,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simconn_test.go fork
  		closeSignal,
  	)
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simnet/simlink.go
---- base_simnet/simlink.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/simlink.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/simlink.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/simlink.go	2026-10-22 12:53:31.974552683 +0200
 @@ -1,6 +1,8 @@
  package simnet
  
@@ -265,21 +265,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  
  	if linkSettings.Uplink.MTU == 0 {
  		linkSettings.Uplink.MTU = defaultMTU
-@@ -48,6 +62,13 @@
- 		linkSettings.Downlink.MTU = defaultMTU
- 	}
- 
-+	// SIMNET_FLOW_BUCKETS=N overrides both directions' flow bucket count (local change). One bucket
-+	// makes FQ-CoDel a single CoDel queue served in arrival order; with SIMNET_CODEL_TARGET_MS far
-+	// above any sojourn it is Shadow's FIFO, so the queue discipline, the other modelling difference
-+	// between the two simulators, can be switched in the harness too. Unset, nothing changes.
-+	if n := envInt("SIMNET_FLOW_BUCKETS", 0); n > 0 {
-+		linkSettings.Uplink.FlowBucketCount, linkSettings.Downlink.FlowBucketCount = n, n
-+	}
- 	if linkSettings.Uplink.FlowBucketCount == 0 {
- 		linkSettings.Uplink.FlowBucketCount = DefaultFlowBucketCount
- 	}
-@@ -61,6 +82,7 @@
+@@ -61,6 +75,7 @@
  			linkSettings.Uplink.MTU,
  			linkSettings.Uplink.FlowBucketCount,
  			linkSettings.Uplink.MTU, linkSettings.Uplink.BitsPerSecond,
@@ -287,7 +273,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  			upPacketReceiver,
  			closeSignal,
  		),
-@@ -69,6 +91,7 @@
+@@ -69,6 +84,7 @@
  			linkSettings.Downlink.MTU,
  			linkSettings.Downlink.FlowBucketCount,
  			linkSettings.Downlink.MTU, linkSettings.Downlink.BitsPerSecond,
@@ -295,7 +281,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  			downPacketReceiver,
  			closeSignal,
  		),
-@@ -80,6 +103,17 @@
+@@ -80,6 +96,17 @@
  	l.down.Start(wg)
  }
  
@@ -313,7 +299,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  type linkDriver struct {
  	newPacket     chan *Packet
  	q             fqCoDel
-@@ -93,13 +127,14 @@
+@@ -93,13 +120,14 @@
  	quantum int,
  	flowCount int,
  	mtu int, bandwidth int,
@@ -329,7 +315,7 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
  	}
  }
  
-@@ -156,3 +191,21 @@
+@@ -156,3 +184,12 @@
  		}
  	})
  }
@@ -342,18 +328,9 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink.go fork_simn
 +	}
 +	return time.Duration(v * float64(time.Millisecond))
 +}
-+
-+// envInt reads a positive count from the environment, falling back when unset or unusable.
-+func envInt(name string, fallback int) int {
-+	v, err := strconv.Atoi(os.Getenv(name))
-+	if err != nil || v <= 0 {
-+		return fallback
-+	}
-+	return v
-+}
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork_simnet/simlink_test.go
---- base_simnet/simlink_test.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/simlink_test.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/simlink_test.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/simlink_test.go	2026-10-22 12:53:31.974552683 +0200
 @@ -46,6 +46,7 @@
  			128,
  			mtu,
@@ -363,8 +340,8 @@ diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simlink_test.go fork
  			closeSignal,
  		)
 diff -ruN -x '*.orig' -x BUILD.bazel -x .github base_simnet/simnet.go fork_simnet/simnet.go
---- base_simnet/simnet.go	2026-10-22 16:34:11.674216117 +0200
-+++ fork_simnet/simnet.go	2026-10-22 16:34:11.683186340 +0200
+--- base_simnet/simnet.go	2026-10-22 12:53:31.970802771 +0200
++++ fork_simnet/simnet.go	2026-10-22 12:53:31.974552683 +0200
 @@ -36,6 +36,7 @@
  	wg          sync.WaitGroup
  	router      VariableLatencyRouter

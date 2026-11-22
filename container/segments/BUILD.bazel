@@ -7,6 +7,7 @@ go_library(
         "codec.go",
         "gf256.go",
         "hasher.go",
+        "leopard.go",
         "partial.go",
         "reassembler.go",
         "rs.go",
@@ -19,6 +20,7 @@ go_library(
         "//crypto/hash:go_default_library",
         "//math:go_default_library",
         "@com_github_golang_snappy//:go_default_library",
+        "@com_github_klauspost_reedsolomon//:go_default_library",
     ],
 )
 
@@ -27,6 +29,9 @@ go_test(
     size = "small",
     srcs = [
         "codec_test.go",
+        "cpu_bench_test.go",
+        "leopard8_test.go",
+        "leopard_test.go",
         "overhead_test.go",
         "partial_test.go",
         "reassembler_test.go",
@@ -34,5 +39,8 @@ go_test(
         "segments_test.go",
     ],
     embed = [":go_default_library"],
-    deps = ["//testing/require:go_default_library"],
+    deps = [
+        "//testing/require:go_default_library",
+        "@com_github_klauspost_reedsolomon//:go_default_library",
+    ],
 )

@@ -104,7 +104,7 @@ func Split(msg []byte, segmentSize int) ([][]byte, error) {
 // Required returns the number of segments needed to reassemble the payload: every one of
 // them for Version 1, any Required of Count for a coded group.
 func (d *Descriptor) Required() uint32 {
-	if d.Version == VersionCoded {
+	if d.Coded() {
 		return uint32((d.TotalLength + uint64(d.SegmentSize) - 1) / uint64(d.SegmentSize))
 	}
 	return d.Count
@@ -112,8 +112,8 @@ func (d *Descriptor) Required() uint32 {
 
 // Validate checks that a descriptor is self-consistent and within bounds.
 func (d *Descriptor) Validate(h Hasher) error {
-	if d.Version != Version && d.Version != VersionCoded {
-		return fmt.Errorf("%w: version %d, want %d or %d", ErrDescriptorMismatch, d.Version, Version, VersionCoded)
+	if d.Version != Version && !d.Coded() {
+		return fmt.Errorf("%w: version %d, want %d to %d", ErrDescriptorMismatch, d.Version, Version, VersionCodedLeopard8)
 	}
 	if d.HashID != h.ID() {
 		return fmt.Errorf("%w: hash id %d, hasher %d", ErrDescriptorMismatch, d.HashID, h.ID())
@@ -132,11 +132,27 @@ func (d *Descriptor) Validate(h Hasher) error {
 	}
 	// The count must be exactly the count implied by the length and segment size, so a peer
 	// cannot pad the tree with extra leaves or truncate it. A coded group's count exceeds the
-	// implied count by its parity, bounded by the codec's field size instead.
+	// implied count by its parity, bounded by its code instead (maxCodedSegments).
 	want := (d.TotalLength + uint64(d.SegmentSize) - 1) / uint64(d.SegmentSize)
-	if d.Version == VersionCoded {
-		if uint64(d.Count) <= want || d.Count > MaxCodedSegments {
-			return fmt.Errorf("%w: coded count %d, implied %d, max %d", ErrDescriptorMismatch, d.Count, want, MaxCodedSegments)
+	if d.Coded() {
+		if limit := maxCodedSegments(d.Version); uint64(d.Count) <= want || uint64(d.Count) > uint64(limit) {
+			return fmt.Errorf("%w: coded count %d, implied %d, max %d", ErrDescriptorMismatch, d.Count, want, limit)
+		}
+		// A Leopard group has between one and MaxLeopardParityPerData parity segments a data
+		// segment, and over GF(2^8) at most MaxLeopard8Parity of them (leopard.go). want is below
+		// the count, which is at most MaxLeopardSegments here, so both conversions succeed.
+		if isLeopard(d.Version) {
+			k, errK := math.Int(want)
+			parity, errP := math.Int(uint64(d.Count) - want)
+			if errK != nil || errP != nil || !leopardShapeOK(d.Version, k, parity) {
+				return fmt.Errorf("%w: Leopard coded count %d for %d data segments", ErrDescriptorMismatch, d.Count, want)
+			}
+		}
+		if d.Version == VersionCodedLeopard {
+			// want < Count <= MaxLeopardSegments here, so the difference fits an int.
+			if work := leopardWorkBytes(int(uint64(d.Count)-want), d.SegmentSize); work > MaxLeopardWorkBytes { // lint:ignore uintcast -- at most MaxLeopardSegments.
+				return fmt.Errorf("%w: Leopard group needs %d bytes of workspace, max %d", ErrDescriptorMismatch, work, MaxLeopardWorkBytes)
+			}
 		}
 		return nil
 	}
@@ -149,7 +165,8 @@ func (d *Descriptor) Validate(h Hasher) error {
 // SegmentLength returns the expected byte length of the segment at index.
 //
 // Only the final systematic segment may be short; a coded group's parity segments are
-// always full length.
+// always full length, which under the GF(2^16) Leopard code is the segment size rounded up to
+// the code's block (leopardShardSize).
 func (d *Descriptor) SegmentLength(index int) (int, error) {
 	if index < 0 || uint32(index) >= d.Count {
 		return 0, fmt.Errorf("%w: %d not in [0,%d)", ErrIndexOutOfRange, index, d.Count)
@@ -163,6 +180,9 @@ func (d *Descriptor) SegmentLength(index int) (int, error) {
 			return 0, fmt.Errorf("%w: final segment length %d: %w", ErrDescriptorMismatch, last, err)
 		}
 		return n, nil
+	}
+	if d.Version == VersionCodedLeopard && uint32(index) >= d.Required() {
+		return d.shardSize(), nil
 	}
 	return int(d.SegmentSize), nil
 }

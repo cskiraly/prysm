@@ -123,6 +123,70 @@ func TestCodedRejectsInconsistentCodeword(t *testing.T) {
 	require.ErrorIs(t, err, ErrCodewordMismatch)
 }
 
+// The matrix code's check decides by the committed leaves alone. Two groups that an earlier
+// form of it, which recomputed only the segments a node lacked, accepted from some sets.
+func TestCodedCheckDecidesByTheLeaves(t *testing.T) {
+	h := testHasher(t)
+	t.Run("parity over a non-zero pad of the last data segment", func(t *testing.T) {
+		msg := msgOfLen(4*64 + 7)
+		segs, err := Split(msg, 64)
+		require.NoError(t, err)
+		k, p := len(segs), 4
+		d := &Descriptor{Version: VersionCoded, HashID: h.ID(), Count: uint32(k + p), SegmentSize: 64, TotalLength: uint64(len(msg))}
+		padded := paddedShards(d, segs)
+		padded[k-1][63] = 0xAA
+		par, err := rsParity(padded, p)
+		require.NoError(t, err)
+		leaves := append(append([][]byte{}, segs...), par...)
+		tree, err := BuildTree(h, leaves)
+		require.NoError(t, err)
+		d.Root = tree.Root()
+		// The second and third sets lack the last data segment: they were accepted.
+		for _, set := range [][]int{{0, 1, 2, 3, 4}, {0, 1, 2, 3, 5}, {0, 5, 6, 7, 8}, {4, 5, 6, 7, 8}} {
+			in := make([][]byte, k+p)
+			for _, i := range set {
+				in[i] = leaves[i]
+			}
+			_, err := RecoverAndVerify(d, h, in)
+			require.ErrorIs(t, err, ErrCodewordMismatch, fmt.Sprintf("set %v", set))
+		}
+	})
+	t.Run("a corrupt segment beyond the first K a node holds", func(t *testing.T) {
+		msgs, err := BuildCodedSegmentMessages(msgOfLen(4*64), 64, 4, h)
+		require.NoError(t, err)
+		leaves := make([][]byte, 8)
+		for i, m := range msgs {
+			leaves[i] = m.Data
+		}
+		bad := append([]byte{}, leaves[7]...)
+		bad[0] ^= 1
+		leaves[7] = bad
+		tree, err := BuildTree(h, leaves)
+		require.NoError(t, err)
+		d := *msgs[0].Descriptor
+		d.Root = tree.Root()
+		for _, set := range [][]int{{0, 1, 2, 3, 7}, {0, 1, 2, 3, 4, 5, 6, 7}, {0, 1, 2, 3}} {
+			in := make([][]byte, 8)
+			for _, i := range set {
+				in[i] = leaves[i]
+			}
+			_, err := RecoverAndVerify(&d, h, in)
+			require.ErrorIs(t, err, ErrCodewordMismatch, fmt.Sprintf("set %v", set))
+		}
+	})
+	t.Run("a segment of the wrong length is refused", func(t *testing.T) {
+		msgs, err := BuildCodedSegmentMessages(msgOfLen(4*64), 64, 4, h)
+		require.NoError(t, err)
+		in := make([][]byte, 8)
+		for i, m := range msgs {
+			in[i] = m.Data
+		}
+		in[6] = in[6][:63]
+		_, err = RecoverAndVerify(msgs[0].Descriptor, h, in)
+		require.ErrorIs(t, err, ErrSegmentLength)
+	})
+}
+
 func TestCodedDescriptorValidate(t *testing.T) {
 	h := testHasher(t)
 	msgs, err := BuildCodedSegmentMessages(msgOfLen(4*64), 64, 4, h)

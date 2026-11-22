@@ -331,6 +331,20 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			t.Logf("offer table: %d timer-driven retries", offerRetries.Load())
 		})
 	}
+	// SEGMENT_OFFER_REFUSALS counts what the offer table does with the announcements it is given:
+	// an instrument, it changes nothing a node does, and without it the cell logs what it logged
+	// before the knob existed.
+	offerOutcomes.reset()
+	if os.Getenv("SEGMENT_OFFER_REFUSALS") != "" {
+		if os.Getenv("SEGMENT_OFFER_TABLE") == "" {
+			t.Fatal("SEGMENT_OFFER_REFUSALS needs SEGMENT_OFFER_TABLE: without the table nothing is recorded or refused")
+		}
+		t.Cleanup(func() {
+			for _, line := range offerOutcomes.lines() {
+				t.Log(line)
+			}
+		})
+	}
 	// The discipline family (discipline, park, pull memory, offer table) is the request policy a
 	// regime rule chooses per node (regimeRuleFor): collected here and applied to every node
 	// unless the rule is on, in which case perNode gives it to the large-R nodes only.
@@ -384,11 +398,21 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 			}
 		}
 	}
+	if os.Getenv("SEGMENT_OFFER_PER_PEER") != "" && os.Getenv("SEGMENT_OFFER_TABLE") == "" {
+		t.Fatal("SEGMENT_OFFER_PER_PEER needs SEGMENT_OFFER_TABLE: without the table there is no bound to set")
+	}
 	if os.Getenv("SEGMENT_PULL_MEMORY") != "" {
 		reqOpts = append(reqOpts, pubsub.WithPullMemory(&pullRedrives))
 	}
 	if os.Getenv("SEGMENT_OFFER_TABLE") != "" {
 		reqOpts = append(reqOpts, pubsub.WithOfferTable(&offerRetries))
+		if opt, line := offerPeerBoundFromEnv(t); opt != nil {
+			reqOpts = append(reqOpts, opt)
+			t.Log(line)
+		}
+		if os.Getenv("SEGMENT_OFFER_REFUSALS") != "" {
+			reqOpts = append(reqOpts, pubsub.WithOfferOutcomes(offerOutcomes.note))
+		}
 	}
 	if !rr.active {
 		opts = append(opts, reqOpts...)
@@ -618,6 +642,16 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		})
 	}
 
+	// SEGMENT_V05: the v0.5 rules (specv05_test.go), last, after the options they build on.
+	v05Rules, v05On := specV05FromEnv(t)
+	v05Reset()
+	if v05On {
+		if rr.active {
+			t.Fatal("SEGMENT_V05 needs the request policy on every node; the regime rule gives it to some")
+		}
+		t.Logf("spec v0.5 rules: %+v", v05Rules)
+	}
+
 	perNode := func(i int) []pubsub.Option {
 		out := []pubsub.Option{pubsub.WithIHaveRPCObservation(announceStats)}
 		if coalesceControl {
@@ -672,6 +706,9 @@ func substrateOpts(t *testing.T, n int, links []simlibp2p.NodeLinkSettingsAndCou
 		}
 		if sendDelaySet[i] && sendDelay > 0 {
 			out = append(out, pubsub.WithSendDelay(sendDelay))
+		}
+		if v05On {
+			out = append(out, pubsub.WithSpecV05(v05Rules, &v05Ctr))
 		}
 		return out
 	}
@@ -1473,6 +1510,109 @@ var announceStats = &pubsub.IHaveRPCStats{}
 // parkBreaks and parks are the cell's commitment-enforcement counters, package-level so the
 // driver can read them per message; zeroed when a network is built.
 var parkBreaks, parks, offerRetries atomic.Int64
+
+// offerOutcomes is the cell's count of what every node's offer table did with the announcements
+// it was given (pubsub.WithOfferOutcomes), by the group the announced id belongs to. An id names
+// its group either as a structured message id or, when the announcement came as a HAVE bitmap,
+// as an ask by index (root and index); the runner's cells announce by bitmap. Groups are listed
+// in the order their first outcome was seen, which is the cell's publish order.
+var offerOutcomes offerOutcomeCounts
+
+type offerOutcomeCounts struct {
+	mu      sync.Mutex
+	byGroup map[string]*[3]int64 // group root -> counts, indexed by pubsub.OfferOutcome
+	order   []string             // group roots, first seen first
+	other   [3]int64             // ids that name no group
+}
+
+func (c *offerOutcomeCounts) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.byGroup, c.order, c.other = make(map[string]*[3]int64), nil, [3]int64{}
+}
+
+// note is the hook: it runs on a router's event loop, for every node of the cell.
+func (c *offerOutcomeCounts) note(mid string, o pubsub.OfferOutcome) {
+	if o < 0 || int(o) >= len(c.other) {
+		return
+	}
+	var root string
+	ok := false
+	if k, isSeg := segIDKey(mid); isSeg {
+		root, ok = string(k.group[:]), true
+	} else if r, _, isWant := pubsub.DecodeHaveWant(mid); isWant {
+		root, ok = r, true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !ok {
+		c.other[o]++
+		return
+	}
+	n := c.byGroup[root]
+	if n == nil {
+		n = new([3]int64)
+		c.byGroup[root] = n
+		c.order = append(c.order, root)
+	}
+	n[o]++
+}
+
+// offerPeerBoundFromEnv reads SEGMENT_OFFER_PER_PEER, the offer table's per-peer bound: how many
+// undelivered ids one peer may be recorded for in the ordered lists. Unset: the fork's 256, one
+// count over every id of the peer, and no line in the log. A number: that bound, counted the
+// same way. "group": the bound by group (pubsub.WithOfferPeerBoundByGroup), under which a peer is
+// recorded for the ids of a group of which the node holds a validated chunk, and the 256 covers
+// only its other ids. The line returned names what the harness asked the routers for; a cell's
+// reader can require it.
+func offerPeerBoundFromEnv(t *testing.T) (pubsub.Option, string) {
+	t.Helper()
+	v := os.Getenv("SEGMENT_OFFER_PER_PEER")
+	switch v {
+	case "":
+		return nil, ""
+	case "group":
+		// The fork's rule is meant to run with the expiry rule, which drops a group's offers with
+		// its holdings; without it the group's ids would return to the bounded count.
+		if rules, _ := specV05FromEnv(t); !rules.Expiry {
+			t.Fatal("SEGMENT_OFFER_PER_PEER=group needs the expiry rule (SEGMENT_V05 with d, or all)")
+		}
+		return pubsub.WithOfferPeerBoundByGroup(), fmt.Sprintf(
+			"offer table: per-peer bound by group (SEGMENT_OFFER_PER_PEER=group): up to %d ids of a group with a validated chunk held, %d across the peer's other ids",
+			pubsub.OfferPerPeerGroup, pubsub.OfferPerPeer)
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		t.Fatalf("bad SEGMENT_OFFER_PER_PEER %q: want a number of at least 1, or group", v)
+	}
+	return pubsub.WithOfferPeerBound(n), fmt.Sprintf("offer table: per-peer bound %d ids (SEGMENT_OFFER_PER_PEER=%d)", n, n)
+}
+
+// lines is the cell's report: the totals, then a line a group. A pair is recorded again when it
+// is announced after the table dropped it (its age, its peer or its group gone), so the first
+// figure counts recordings; a refused pair is refused at each announcement of it.
+func (c *offerOutcomeCounts) lines() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	total := c.other
+	for _, n := range c.byGroup {
+		for i := range total {
+			total[i] += n[i]
+		}
+	}
+	row := func(n [3]int64) string {
+		return fmt.Sprintf("%d recordings, %d announcements refused at the per-peer bound and %d at the per-id bound",
+			n[pubsub.OfferRecorded], n[pubsub.OfferRefusedPeerBound], n[pubsub.OfferRefusedIDBound])
+	}
+	out := []string{fmt.Sprintf("offer outcomes, every node of this process, %d groups: %s", len(c.order), row(total))}
+	for i, root := range c.order {
+		out = append(out, fmt.Sprintf("        offer outcomes, group %d (root %x): %s", i+1, root[:min(4, len(root))], row(*c.byGroup[root])))
+	}
+	if c.other != [3]int64{} {
+		out = append(out, fmt.Sprintf("        offer outcomes, ids outside any group: %s", row(c.other)))
+	}
+	return out
+}
 
 // meshGraphSeed is the seed every mesh experiment uses, 7 unless SEGMENT_SEED overrides it.
 // One seed per run is a known limitation; the override is what a

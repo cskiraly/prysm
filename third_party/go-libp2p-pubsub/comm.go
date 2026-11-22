@@ -255,6 +255,10 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 				return ctx.Err()
 			}
 		}
+		outgoing.noteAsksWritten(rpc) // v0.5's E: the promise starts now
+		if rpc.lostOnly {
+			return nil // its asks were lost on the wire: nothing to write
+		}
 		size := uint64(proto.Size(&rpc.RPC))
 
 		buf := pool.Get(varint.UvarintSize(size) + int(size))
@@ -283,7 +287,7 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			p.rpcLogger.Debug("failed to send message", "peer", s.Conn().RemotePeer(), "rpc", rpc, "err", err)
 			return err
 		}
-		p.upload.note(rpc, len(out), s.Conn().RemotePeer())
+		p.upload.noteWithID(rpc, len(out), s.Conn().RemotePeer(), p.idGen.RawID)
 		p.rpcLogger.Debug("sent", "peer", s.Conn().RemotePeer(), "rpc", rpc)
 		return nil
 	}

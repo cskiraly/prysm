@@ -93,19 +93,13 @@ func TestQ6RealisticMesh(t *testing.T) {
 		for _, rate := range rates {
 			for _, n := range sizes {
 				for _, armName := range cell.arms {
-					var v variant
-					if armName == "ecrs" {
-						v = newEcrsVariant(t, cell, rate, oneWay)
-					} else {
-						v = cell.variant(t, armName, rate, oneWay, n)
-					}
 					runDiffusion(t, diffusionParams{
 						n:        n,
 						rate:     rate,
 						latency:  oneWay,
 						deadline: failureDeadline(t),
 						seed:     meshGraphSeed(t),
-					}, v)
+					}, cell.variant(t, armName, rate, oneWay, n))
 				}
 			}
 		}
@@ -428,6 +422,22 @@ func (v *q6Variant) groupNeed() int {
 
 func (v *q6Variant) wireForm() wireForm {
 	return wireForm{msgs: len(v.arm.msgs), need: v.groupNeed(), unit: v.unit, total: v.arm.total, idBytes: idWidth(v.arm.msgs[0])}
+}
+
+// pushDegree is node i's push degree as pubsubOpts gives it to the phase router, the bound the
+// cross-check holds each relay's pushes of one frame to (xcheck_test.go); 0 off the phase arm.
+func (v *q6Variant) pushDegree(i int) int {
+	if v.armName != "phase" {
+		return 0
+	}
+	r := v.phaseR
+	if v.regime.active {
+		r = v.regime.degree(i)
+	}
+	if v.fast != nil && i != 0 && v.fast[i] {
+		r = v.fastR
+	}
+	return r
 }
 
 func (v *q6Variant) pubsubOpts(t *testing.T, i int) []pubsub.Option {

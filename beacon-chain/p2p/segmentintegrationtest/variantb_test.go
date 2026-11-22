@@ -113,7 +113,8 @@ func segmentMessagesFor(t *testing.T, sk bls.SecretKey, slot primitives.Slot, pa
 	require.NoError(t, err)
 	var msgs []*segments.SegmentMessage
 	if parity > 0 {
-		msgs, err = segments.BuildCodedSegmentMessages(payload, segmentSize, parity, h)
+		code, _ := rsCodeFromEnv(t)
+		msgs, err = segments.BuildCodedSegmentMessagesVersion(code, payload, segmentSize, parity, h)
 		require.NoError(t, err)
 	} else {
 		msgs, err = segments.BuildSegmentMessages(payload, segmentSize, h)
@@ -354,6 +355,18 @@ func bCellFromEnv(t *testing.T) bCell {
 			}
 			c.parities = append(c.parities, k)
 		}
+	}
+	// As in the Q6 cell: the knob is checked, a cell that sets it and codes nothing fails, and
+	// the line is printed only with the knob set.
+	if code, name := rsCodeFromEnv(t); os.Getenv("SEGMENT_RS_CODE") != "" {
+		coded := false
+		for _, p := range c.parities {
+			coded = coded || p > 0
+		}
+		if !coded {
+			t.Fatalf("SEGMENT_RS_CODE=%s needs a coded group (a SEGMENT_PARITY above zero)", name)
+		}
+		t.Logf("coded groups: Reed-Solomon code %s (descriptor version %d, at most %d chunks a group)", name, code, rsCodeMaxChunks(code))
 	}
 	if v := os.Getenv("SEGMENT_PAYLOAD_BYTES"); v != "" {
 		k, err := strconv.Atoi(v)

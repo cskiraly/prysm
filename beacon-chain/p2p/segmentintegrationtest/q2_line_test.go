@@ -145,12 +145,17 @@ func codedArm(t *testing.T, payload []byte, segmentSize, parity int, sk bls.Secr
 	t.Helper()
 	h, err := segments.HasherByID(segments.HashSHA256)
 	require.NoError(t, err)
-	msgs, err := segments.BuildCodedSegmentMessages(payload, segmentSize, parity, h)
+	code, codeName := rsCodeFromEnv(t)
+	msgs, err := segments.BuildCodedSegmentMessagesVersion(code, payload, segmentSize, parity, h)
 	require.NoError(t, err)
 
 	enc := encoder.SszNetworkEncoder{}
 	k := int(msgs[0].Descriptor.Required()) // lint:ignore uintcast -- bounded by MaxSegments via Validate.
-	out := wireArm{name: fmt.Sprintf("rs/K=%d/N=%d", k, len(msgs)), known: map[digest]int{}, need: k}
+	name := "rs"
+	if code != segments.VersionCoded {
+		name = "rs-" + codeName
+	}
+	out := wireArm{name: fmt.Sprintf("%s/K=%d/N=%d", name, k, len(msgs)), known: map[digest]int{}, need: k}
 	wire := make([]*ethpb.ExecutionPayloadSegment, len(msgs))
 	for i, m := range msgs {
 		raw, err := m.Marshal()

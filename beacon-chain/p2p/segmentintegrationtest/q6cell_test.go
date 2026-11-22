@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/golang/snappy"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -81,7 +82,7 @@ func q6CellFromEnv(t *testing.T) q6Cell {
 		for _, f := range strings.Split(v, ",") {
 			f = strings.TrimSpace(f)
 			switch f {
-			case "whole", "segmented", "phase", "ecrs":
+			case "whole", "segmented", "phase":
 				c.arms = append(c.arms, f)
 			default:
 				t.Fatalf("bad SEGMENT_ARMS entry %q", f)
@@ -396,6 +397,16 @@ func q6CellFromEnv(t *testing.T) q6Cell {
 		}
 		parity = par
 	}
+	// SEGMENT_RS_CODE is checked whether or not this cell codes anything, and a cell that sets it
+	// and builds no coded group fails: its tag would name a code it did not run. The line is
+	// printed only with the knob set: without it the cell is, and logs, what it was before the
+	// knob existed.
+	if code, name := rsCodeFromEnv(t); os.Getenv("SEGMENT_RS_CODE") != "" {
+		if parity == 0 {
+			t.Fatalf("SEGMENT_RS_CODE=%s needs a coded group (a segmented arm and SEGMENT_PARITY)", name)
+		}
+		t.Logf("coded groups: Reed-Solomon code %s (descriptor version %d, at most %d chunks a group)", name, code, rsCodeMaxChunks(code))
+	}
 	// build makes message m's wire forms and its segment size. Message 1 is the single-message
 	// cell's payload; each later message of a multi-message cell has its own content and slot,
 	// so the seen cache and the HAVE bitmaps treat it as new.
@@ -546,6 +557,34 @@ func (c q6Cell) variant(t *testing.T, armName string, rate int, oneWay time.Dura
 		v.pair.set(t, v, arm, 1)
 	}
 	return v
+}
+
+// rsCodeFromEnv reads SEGMENT_RS_CODE, the Reed-Solomon code of every coded group a cell builds:
+// unset or gf8 is the GF(2^8) matrix code (segments.VersionCoded, at most 256 chunks a group),
+// leo16 is Leopard-RS over GF(2^16) (segments.VersionCodedLeopard, at most 8192), leo8 Leopard-RS
+// over GF(2^8) (segments.VersionCodedLeopard8, at most 256, of them at most 128 parity). It
+// returns the descriptor version that names the code, and the knob's name for it.
+func rsCodeFromEnv(t *testing.T) (uint8, string) {
+	t.Helper()
+	switch v := os.Getenv("SEGMENT_RS_CODE"); v {
+	case "", "gf8":
+		return segments.VersionCoded, "gf8"
+	case "leo16":
+		return segments.VersionCodedLeopard, "leo16"
+	case "leo8":
+		return segments.VersionCodedLeopard8, "leo8"
+	default:
+		t.Fatalf("bad SEGMENT_RS_CODE %q (want gf8, leo8 or leo16)", v)
+		return 0, ""
+	}
+}
+
+// rsCodeMaxChunks is the bound on a coded group's chunk count under a code.
+func rsCodeMaxChunks(code uint8) int {
+	if code == segments.VersionCodedLeopard {
+		return segments.MaxLeopardSegments
+	}
+	return segments.MaxCodedSegments
 }
 
 // rebuiltKnobs is what a decoded node does with the frames it never received (the decoding
