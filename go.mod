@@ -313,6 +313,10 @@ replace github.com/json-iterator/go => github.com/prestonvanloon/go v1.1.7-0.201
 
 replace github.com/tyler-smith/go-bip39 => ./third_party/go-bip39
 
+// The SEACAST fork of go-libp2p-pubsub, on upstream v0.19.0. go build and go test follow this
+// replace; Bazel does not (deps.bzl), so this branch builds and tests with go.
+replace github.com/libp2p/go-libp2p-pubsub => ./third_party/go-libp2p-pubsub
+
 tool (
 	github.com/OffchainLabs/methodical-ssz/cmd/ssz
 	github.com/prysmaticlabs/protoc-gen-go-cast
