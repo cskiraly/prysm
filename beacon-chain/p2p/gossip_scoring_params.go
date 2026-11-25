@@ -108,6 +108,20 @@ func peerScoringParams(colocationWhitelist []*net.IPNet) (*pubsub.PeerScoreParam
 	return scoreParams, thresholds
 }
 
+// SegmentScoring returns the scoring the node runs with the segmented payload: the peer score
+// parameters and thresholds, without a colocation whitelist, and the parameters it sets on an
+// execution payload segment topic. The payload path's integration tests score with them.
+func SegmentScoring() (*pubsub.PeerScoreParams, *pubsub.PeerScoreThresholds, *pubsub.TopicScoreParams) {
+	peerParams, thresholds := peerScoringParams(nil)
+	return peerParams, thresholds, segmentTopicParams()
+}
+
+// segmentTopicParams are an execution payload segment topic's parameters.
+// TODO: Revisit scoring params for execution payload segment gossip.
+func segmentTopicParams() *pubsub.TopicScoreParams {
+	return defaultBlockTopicParams()
+}
+
 func (s *Service) topicScoreParams(topic string) (*pubsub.TopicScoreParams, error) {
 	switch {
 	case strings.Contains(topic, GossipBlockMessage):
@@ -150,6 +164,10 @@ func (s *Service) topicScoreParams(topic string) (*pubsub.TopicScoreParams, erro
 	case strings.Contains(topic, GossipPayloadAttestationMessageMessage):
 		// TODO: Revisit scoring params for payload attestation gossip.
 		return defaultBlockTopicParams(), nil
+	// This case must precede the envelope case below: "execution_payload_segment"
+	// contains "execution_payload", so the envelope arm would otherwise swallow it.
+	case strings.Contains(topic, GossipExecutionPayloadSegmentMessage):
+		return segmentTopicParams(), nil
 	case strings.Contains(topic, GossipExecutionPayloadEnvelopeMessage):
 		// TODO: Revisit scoring params for execution payload envelope gossip.
 		return defaultBlockTopicParams(), nil

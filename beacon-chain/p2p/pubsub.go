@@ -7,10 +7,13 @@ import (
 	"time"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	p2ptypes "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/cmd/beacon-chain/flags"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	pbrpc "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
+	"github.com/OffchainLabs/prysm/v7/time/slots"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	pubsubpb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -152,8 +155,9 @@ func (s *Service) peerInspector(peerMap map[peer.ID]*pubsub.PeerScoreSnapshot) {
 	}
 }
 
-// pubsubOptions creates a list of options to configure our router with.
-func (s *Service) pubsubOptions() []pubsub.Option {
+// pubsubOptions creates a list of options to configure our router with. It fails when segmented
+// payload gossip is on and the node's setting breaks one of the segment path's conditions.
+func (s *Service) pubsubOptions() ([]pubsub.Option, error) {
 	filt := pubsub.NewAllowlistSubscriptionFilter(s.allTopicStrings()...)
 	filt = pubsub.WrapLimitSubscriptionFilter(filt, pubsubSubscriptionRequestLimit)
 	psOpts := []pubsub.Option{
@@ -176,15 +180,85 @@ func (s *Service) pubsubOptions() []pubsub.Option {
 		directPeersAddrInfos, err := parsePeersEnr(s.cfg.StaticPeers)
 		if err != nil {
 			log.WithError(err).Error("Could not add direct peer option")
-			return psOpts
+			if features.Get().EnableSegmentedPayloadGossip {
+				// Returning here would start the node without the segment path and its checks.
+				return nil, errors.Wrap(err, "static peers")
+			}
+			return psOpts, nil
 		}
 		psOpts = append(psOpts, pubsub.WithDirectPeers(directPeersAddrInfos))
 	}
 	if s.partialColumnBroadcaster != nil {
 		psOpts = s.partialColumnBroadcaster.AppendPubSubOpts(psOpts)
 	}
+	if features.Get().EnableSegmentedPayloadGossip {
+		seacastOpts, err := s.seacastOptions(filt)
+		if err != nil {
+			return nil, err
+		}
+		psOpts = append(psOpts, seacastOpts...)
+	}
 
-	return psOpts
+	return psOpts, nil
+}
+
+// seacastOptions are the router's options for SEACAST's payload path on the segment topic. They
+// are built only from a setting that segmentgossip.CheckSetting passes, so a node whose setting
+// breaks one of the path's conditions does not start.
+func (s *Service) seacastOptions(filt pubsub.SubscriptionFilter) ([]pubsub.Option, error) {
+	setting, typ := s.seacastSetting(filt)
+	if err := segmentgossip.CheckSetting(setting); err != nil {
+		return nil, err
+	}
+	s.segmentPayloadType = typ
+	s.seacastMetrics = &segmentgossip.PathMetrics{} // exported once the router is built (NewService)
+	return segmentgossip.RouterOptions(setting, typ, gossipSubHeartbeatInterval, s.seacastMetrics), nil
+}
+
+// seacastSetting is the node's setting for the segment path, and the payload type it runs: the
+// segment topic at every fork digest of the schedule, the subscription filter that must admit them,
+// cancel on, and the fork's default limits, which bound no group a peer names.
+func (s *Service) seacastSetting(filt pubsub.SubscriptionFilter) (segmentgossip.Setting, *segmentgossip.PayloadType) {
+	var topics []string
+	for _, t := range s.allTopicStrings() {
+		if isSegmentTopic(t) {
+			topics = append(topics, t)
+		}
+	}
+	uplink := features.Get().SeacastUplinkMbps
+	typ := segmentgossip.NewPayloadType(segmentgossip.PayloadConfig{
+		Topics:       topics,
+		CurrentTopic: s.currentSegmentTopic,
+		CurrentSlot:  s.seacastCurrentSlot,
+		UplinkMbps:   uplink,
+	})
+	return segmentgossip.Setting{
+		SegmentTopics: topics,
+		Allowed:       filt.CanSubscribe,
+		TypeTopics:    typ.Topics(),
+		Params:        typ.Params(),
+		Limits:        pubsub.DefaultSeacastLimits,
+		Cancel:        true,
+		UplinkMbps:    uplink,
+	}, typ
+}
+
+// currentSegmentTopic is the segment topic at the current fork digest, empty before the node knows
+// its genesis.
+func (s *Service) currentSegmentTopic() string {
+	digest, err := s.currentForkDigest()
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf(ExecutionPayloadSegmentTopicFormat, digest) + sszEnc.ProtocolSuffix()
+}
+
+// seacastCurrentSlot is the node's current slot, 0 before it knows its genesis.
+func (s *Service) seacastCurrentSlot() uint64 {
+	if !s.isInitialized() {
+		return 0
+	}
+	return uint64(slots.CurrentSlot(s.genesisTime))
 }
 
 // parsePeersEnr takes a list of raw ENRs and converts them into a list of AddrInfos.
@@ -212,6 +286,9 @@ func pubsubGossipParam() pubsub.GossipSubParams {
 	gParams.HeartbeatInterval = gossipSubHeartbeatInterval
 	gParams.HistoryLength = gossipSubMcacheLen
 	gParams.HistoryGossip = gossipSubMcacheGossip
+	if features.Get().EnableSegmentedPayloadGossip {
+		gParams.MaxIHaveMessages = segmentgossip.MaxIHaveMessages
+	}
 	return gParams
 }
 

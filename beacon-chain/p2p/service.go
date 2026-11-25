@@ -11,6 +11,7 @@ import (
 
 	"github.com/OffchainLabs/prysm/v7/async"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/partialdatacolumnbroadcaster"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers/scorers"
@@ -79,6 +80,8 @@ type Service struct {
 	metaData                 metadata.Metadata
 	pubsub                   *pubsub.PubSub
 	partialColumnBroadcaster partialdatacolumnbroadcaster.Broadcaster
+	segmentPayloadType       *segmentgossip.PayloadType // the payload on SEACAST's path; nil with the segment flag off
+	seacastMetrics           *segmentgossip.PathMetrics // what the path's options count
 	joinedTopics             map[string]*pubsub.Topic
 	joinedTopicsLock         sync.RWMutex
 	subnetsLock              map[uint64]*sync.RWMutex
@@ -174,7 +177,17 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	// due to libp2p's gossipsub implementation not taking into
 	// account previously added peers when creating the gossipsub
 	// object.
-	psOpts := s.pubsubOptions()
+	psOpts, err := s.pubsubOptions()
+	if err != nil {
+		// The node doesn't start, so what was built above for it goes with it: the host, the IP
+		// limiter's prune goroutine and the service's context.
+		if cerr := h.Close(); cerr != nil {
+			log.WithError(cerr).Error("Could not close the p2p host")
+		}
+		ipLimiter.Free()
+		cancel()
+		return nil, errors.Wrap(err, "failed to configure p2p pubsub")
+	}
 
 	// Set the pubsub global parameters that we require.
 	setPubSubParameters()
@@ -189,6 +202,12 @@ func NewService(ctx context.Context, cfg *Config) (*Service, error) {
 	}
 
 	s.pubsub = gs
+	// The router is built: its written bytes are the ones exported, until Stop.
+	uploadBytesCollector.set(gs)
+	if s.seacastMetrics != nil {
+		// The router is built: its path's counters are the ones exported, until Stop.
+		seacastPathCollector.m.Store(s.seacastMetrics)
+	}
 
 	s.peers = peers.NewStatus(ctx, &peers.StatusConfig{
 		PeerLimit:             int(s.cfg.MaxPeers),
@@ -312,6 +331,7 @@ func (s *Service) Start() {
 		logExternalDNSAddr(s.host.ID(), p2pHostDNS, p2pTCPPort)
 	}
 	go s.forkWatcher()
+	go s.seacastWindow()
 }
 
 // Stop the p2p service and terminate all peer connections.
@@ -320,6 +340,14 @@ func (s *Service) Stop() error {
 	s.started = false
 	if s.dv5Listener != nil {
 		s.dv5Listener.Close()
+	}
+	if s.seacastMetrics != nil {
+		// Only this service's counters: a later service may have taken the collector over.
+		seacastPathCollector.m.CompareAndSwap(s.seacastMetrics, nil)
+	}
+	if s.pubsub != nil {
+		// Only this service's router: a later service may have taken the collector over.
+		uploadBytesCollector.clear(s.pubsub)
 	}
 
 	return nil

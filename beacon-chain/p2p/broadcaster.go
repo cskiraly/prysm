@@ -23,7 +23,9 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	"github.com/OffchainLabs/prysm/v7/crypto/hash"
+	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing"
 	"github.com/OffchainLabs/prysm/v7/monitoring/tracing/trace"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
@@ -35,6 +37,15 @@ const minimumPeersPerSubnetForBroadcast = 1
 // ErrMessageNotMapped occurs on a Broadcast attempt when a message has not been defined in the
 // GossipTypeMapping.
 var ErrMessageNotMapped = errors.New("message type is not mapped to a PubSub topic")
+
+var (
+	// ErrSegmentsNoPeers is BroadcastSegments' error when the segment topic has no peers, so no
+	// segment was published.
+	ErrSegmentsNoPeers = errors.New("no peers on the segment topic")
+	// ErrSegmentsNotEnqueued is BroadcastSegments' error when the router admitted the batch to no
+	// peer's outbound queue, or did not say so before the batch's deadline.
+	ErrSegmentsNotEnqueued = errors.New("segment batch enqueued to no peer")
+)
 
 // Broadcast a message to the p2p network, the message is assumed to be
 // broadcasted to the current fork.
@@ -88,6 +99,107 @@ func (s *Service) BroadcastForEpoch(ctx context.Context, msg proto.Message, epoc
 		return errors.Errorf("message of %T does not support marshaller interface", msg)
 	}
 	return s.broadcastObject(ctx, castMsg, fmt.Sprintf(topic, forkDigest))
+}
+
+// segmentBatchDeadline bounds two waits in BroadcastSegments: the wait for a topic peer that
+// addToBatch performs if the last one leaves between the check in BroadcastSegments and the
+// publish, and the wait for the router's report of the peers it enqueued the batch to. It
+// doesn't bound the router's own calls (ListPeers, the group's registration, the batch's
+// submission), which wait for the router's event loop as every publish does; a stalled loop
+// stalls them too.
+const segmentBatchDeadline = time.Second
+
+// BroadcastSegments publishes the segments of a segmented execution payload envelope, each
+// as an ordinary gossip message on the segment topic, as one batch.
+//
+// Batching changes the order in which (message, peer) sends are emitted rather than
+// coalescing them: PublishBatch plans one RPC per recipient per segment, then the round-robin
+// scheduler emits one RPC per message id per pass, so the first copy of every segment is
+// queued before the second copy of any. The first pass spreads one copy of each segment over
+// the mesh; which peer gets which first copy is up to the router.
+//
+// It never waits for the segment topic to have peers and gives the batch only a short
+// deadline, so that a caller sending only the segments can fall back to the whole envelope in
+// time. It returns ErrSegmentsNoPeers when the topic has no peers, and ErrSegmentsNotEnqueued
+// when the router queued the batch to no peer (every peer's outbound queue full, say) or did not
+// report within the deadline. A nil error means at least one peer's queue took the batch, not
+// that any peer received it.
+func (s *Service) BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error {
+	ctx, span := trace.StartSpan(ctx, "p2p.BroadcastSegments")
+	defer span.End()
+
+	if len(segs) == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, segmentBatchDeadline)
+	defer cancel()
+
+	forkDigest, err := s.currentForkDigest()
+	if err != nil {
+		err := errors.Wrap(err, "could not retrieve fork digest")
+		tracing.AnnotateError(span, err)
+		return err
+	}
+	topic := fmt.Sprintf(ExecutionPayloadSegmentTopicFormat, forkDigest)
+	// The router knows topics by their full name, with the encoding suffix: that is what the
+	// subscription allowlist holds and what batchObject publishes on. Joining the bare name
+	// would be refused by the filter before a single segment left this node.
+	fullTopic := topic + s.Encoding().ProtocolSuffix()
+	span.SetAttributes(trace.StringAttribute("topic", fullTopic))
+
+	topicHandle, err := s.JoinTopic(fullTopic)
+	if err != nil {
+		err := errors.Wrap(err, "could not join segment topic")
+		tracing.AnnotateError(span, err)
+		return err
+	}
+	if len(topicHandle.ListPeers()) == 0 {
+		return ErrSegmentsNoPeers
+	}
+
+	var batch pubsub.MessageBatch
+	for _, seg := range segs {
+		pb, err := seg.ToProto()
+		if err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not convert payload segment to its wire type")
+		}
+		if err := s.batchObject(ctx, &batch, pb, topic); err != nil {
+			tracing.AnnotateError(span, err)
+			return errors.Wrap(err, "could not batch payload segment")
+		}
+	}
+	// The source's own segments skip its validator, so the payload's path learns the group here,
+	// before the router stores and pushes the batch.
+	d := segs[0].Descriptor
+	count, threshold := int(d.Count), int(d.Required()) // lint:ignore uintcast -- bounded by segments.MaxSegments.
+	s.SegmentGroupSeen(bytesutil.ToBytes32(segs[0].Group), fullTopic, count, threshold)
+	// The router reports once, from its event loop, after it has tried every peer's queue.
+	report := make(chan int, 1)
+	if err := s.pubsub.PublishBatch(&batch, pubsub.WithBatchEnqueued(func(peers int) { report <- peers })); err != nil {
+		tracing.AnnotateError(span, err)
+		return errors.Wrap(err, "could not publish payload segment batch")
+	}
+	if err := awaitEnqueued(ctx, report); err != nil {
+		tracing.AnnotateError(span, err)
+		return err
+	}
+	return nil
+}
+
+// awaitEnqueued waits for the router's report of how many peers' queues took a batch, and
+// returns ErrSegmentsNotEnqueued for none or for no report before ctx ends.
+func awaitEnqueued(ctx context.Context, report <-chan int) error {
+	select {
+	case peers := <-report:
+		if peers == 0 {
+			return ErrSegmentsNotEnqueued
+		}
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ErrSegmentsNotEnqueued, ctx.Err().Error())
+	}
 }
 
 // BroadcastAttestation broadcasts an attestation to the p2p network, the message is assumed to be

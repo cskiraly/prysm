@@ -22,6 +22,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/OffchainLabs/prysm/v7/testing/require"
@@ -60,6 +61,8 @@ type TestP2P struct {
 	joinedTopics          map[string]*pubsub.Topic
 	BroadcastCalled       atomic.Bool
 	broadcastedPartials   []blocks.PartialDataColumn
+	broadcastedSegments   []*segments.SegmentMessage
+	seenGroups            []SeenSegmentGroup
 	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
 	DelaySend             bool
 	Digest                [4]byte
@@ -271,6 +274,43 @@ func (p *TestP2P) BroadcastedPartialColumns() []blocks.PartialDataColumn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.broadcastedPartials
+}
+
+// BroadcastSegments records the segments passed to it.
+func (p *TestP2P) BroadcastSegments(_ context.Context, segs []*segments.SegmentMessage) error {
+	p.BroadcastCalled.Store(true)
+	p.mu.Lock()
+	p.broadcastedSegments = segs
+	p.mu.Unlock()
+	return nil
+}
+
+// BroadcastedSegments returns the segments passed to the most recent BroadcastSegments call.
+func (p *TestP2P) BroadcastedSegments() []*segments.SegmentMessage {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.broadcastedSegments
+}
+
+// SeenSegmentGroup is one call of SegmentGroupSeen.
+type SeenSegmentGroup struct {
+	Group            [32]byte
+	Topic            string
+	Count, Threshold int
+}
+
+// SegmentGroupSeen records the call.
+func (p *TestP2P) SegmentGroupSeen(group [32]byte, topic string, count, threshold int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seenGroups = append(p.seenGroups, SeenSegmentGroup{Group: group, Topic: topic, Count: count, Threshold: threshold})
+}
+
+// SeenSegmentGroups returns the calls of SegmentGroupSeen, in order.
+func (p *TestP2P) SeenSegmentGroups() []SeenSegmentGroup {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.seenGroups
 }
 
 // EnablePartialColumnBroadcaster sets a non-nil partial column broadcaster.

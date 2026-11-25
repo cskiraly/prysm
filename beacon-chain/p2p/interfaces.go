@@ -10,6 +10,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1/metadata"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -27,6 +28,7 @@ type (
 	// P2P represents the full p2p interface composed of all of the sub-interfaces.
 	P2P interface {
 		Broadcaster
+		SegmentGossiper
 		SetStreamHandler
 		PubSubProvider
 		PartialColumnBroadcasterProvider
@@ -56,6 +58,13 @@ type (
 		BroadcastLightClientOptimisticUpdate(ctx context.Context, update interfaces.LightClientOptimisticUpdate) error
 		BroadcastLightClientFinalityUpdate(ctx context.Context, update interfaces.LightClientFinalityUpdate) error
 		BroadcastDataColumnSidecars(ctx context.Context, sidecars []blocks.VerifiedRODataColumn, partialColumns []blocks.PartialDataColumn) error
+		BroadcastSegments(ctx context.Context, segs []*segments.SegmentMessage) error
+	}
+
+	// SegmentGossiper lets the sync layer tell the payload's path the shape and topic of each group
+	// whose segment passed validation.
+	SegmentGossiper interface {
+		SegmentGroupSeen(group [32]byte, topic string, count, threshold int)
 	}
 
 	// SetStreamHandler configures p2p to handle streams of a certain topic ID.

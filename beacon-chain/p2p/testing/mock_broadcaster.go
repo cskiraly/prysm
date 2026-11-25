@@ -8,6 +8,7 @@ import (
 	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
+	"github.com/OffchainLabs/prysm/v7/container/segments"
 	ethpb "github.com/OffchainLabs/prysm/v7/proto/prysm/v1alpha1"
 	"google.golang.org/protobuf/proto"
 )
@@ -20,11 +21,21 @@ type MockBroadcaster struct {
 	BroadcastAttestations []ethpb.Att
 	msgLock               sync.Mutex
 	attLock               sync.Mutex
+
+	// BroadcastErr, when set, is Broadcast's error; the message is not recorded.
+	BroadcastErr error
+	// SegmentsErr, when set, is BroadcastSegments' error; the segments are still recorded.
+	SegmentsErr error
+	// BroadcastedSegments holds the segments of every BroadcastSegments call, in order.
+	BroadcastedSegments [][]*segments.SegmentMessage
 }
 
 // Broadcast records a broadcast occurred.
 func (m *MockBroadcaster) Broadcast(_ context.Context, msg proto.Message) error {
 	m.BroadcastCalled.Store(true)
+	if m.BroadcastErr != nil {
+		return m.BroadcastErr
+	}
 	m.msgLock.Lock()
 	defer m.msgLock.Unlock()
 	m.BroadcastMessages = append(m.BroadcastMessages, msg)
@@ -90,4 +101,19 @@ func (m *MockBroadcaster) NumAttestations() int {
 	m.attLock.Lock()
 	defer m.attLock.Unlock()
 	return len(m.BroadcastAttestations)
+}
+
+// BroadcastSegments records the segments and returns SegmentsErr.
+func (m *MockBroadcaster) BroadcastSegments(_ context.Context, segs []*segments.SegmentMessage) error {
+	m.msgLock.Lock()
+	defer m.msgLock.Unlock()
+	m.BroadcastedSegments = append(m.BroadcastedSegments, segs)
+	return m.SegmentsErr
+}
+
+// NumSegmentBroadcasts returns the number of BroadcastSegments calls.
+func (m *MockBroadcaster) NumSegmentBroadcasts() int {
+	m.msgLock.Lock()
+	defer m.msgLock.Unlock()
+	return len(m.BroadcastedSegments)
 }

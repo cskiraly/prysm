@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 )
@@ -54,6 +55,8 @@ const (
 	GossipExecutionPayloadBidMessage = "execution_payload_bid"
 	// GossipSignedProposerPreferencesMessage is the name for the proposer preferences message type.
 	GossipSignedProposerPreferencesMessage = "proposer_preferences"
+	// GossipExecutionPayloadSegmentMessage is the name for one segment of a segmented execution payload envelope.
+	GossipExecutionPayloadSegmentMessage = "execution_payload_segment"
 
 	// Topic Formats
 	//
@@ -91,6 +94,8 @@ const (
 	ExecutionPayloadBidTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadBidMessage
 	// SignedProposerPreferencesTopicFormat is the topic format for signed proposer preferences.
 	SignedProposerPreferencesTopicFormat = GossipProtocolAndDigest + GossipSignedProposerPreferencesMessage
+	// ExecutionPayloadSegmentTopicFormat is the topic format for execution payload segments.
+	ExecutionPayloadSegmentTopicFormat = GossipProtocolAndDigest + GossipExecutionPayloadSegmentMessage
 )
 
 // topic is a struct representing a single gossipsub topic.
@@ -179,6 +184,10 @@ func (s *Service) allTopics() []topic {
 		newTopic(gloas, future, empty, GossipExecutionPayloadEnvelopeMessage),
 		newTopic(gloas, future, empty, GossipExecutionPayloadBidMessage),
 		newTopic(gloas, future, empty, GossipSignedProposerPreferencesMessage),
+	}
+	if features.Get().EnableSegmentedPayloadGossip {
+		// Only a node on the segment path may join the segment topic; others refuse its subscriptions.
+		templates = append(templates, newTopic(gloas, future, empty, GossipExecutionPayloadSegmentMessage))
 	}
 	last := params.GetNetworkScheduleEntry(genesis)
 	schedule := []params.NetworkScheduleEntry{last}

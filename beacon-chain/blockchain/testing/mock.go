@@ -60,6 +60,7 @@ type ChainService struct {
 	ParentPayloadReadyVal                *bool
 	HasPayloadBlockHashVal               *bool
 	BlockSlot                            primitives.Slot
+	BlockSlots                           map[[32]byte]primitives.Slot // when set, RecentBlockSlot's answer per root; a root not in it is unknown
 	RecentBlockSlotErr                   error
 	OptimisticRoots                      map[[32]byte]bool
 	FinalizedRoots                       map[[32]byte]bool
@@ -576,9 +577,16 @@ func (s *ChainService) AvailableBlocks(ctx context.Context, blockRoots [][32]byt
 }
 
 // RecentBlockSlot mocks the same method in the chain service.
-func (s *ChainService) RecentBlockSlot([32]byte) (primitives.Slot, error) {
+func (s *ChainService) RecentBlockSlot(root [32]byte) (primitives.Slot, error) {
 	if s.RecentBlockSlotErr != nil {
 		return 0, s.RecentBlockSlotErr
+	}
+	if s.BlockSlots != nil {
+		slot, ok := s.BlockSlots[root]
+		if !ok {
+			return 0, errors.Errorf("unknown block root %#x", root)
+		}
+		return slot, nil
 	}
 	return s.BlockSlot, nil
 }
