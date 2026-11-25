@@ -3,10 +3,12 @@ package sync
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	mock "github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain/testing"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/forkchoice"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/peers"
 	p2ptest "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/testing"
@@ -312,4 +314,88 @@ func TestFetchPayloadEnvelope_ReceiveHasDeadline(t *testing.T) {
 
 	s.fetchPayloadEnvelope(root)
 	require.True(t, chain.ReceivePayloadEnvelopeCtxHadDeadline)
+}
+
+// fullDuringRequest is a fork choice whose payload for the requested root becomes full while a request
+// by root is out, as when gossip imports it in the meantime.
+type fullDuringRequest struct {
+	forkchoice.ForkChoicer
+	full atomic.Bool
+}
+
+func (f *fullDuringRequest) HasFullNode([32]byte) bool { return f.full.Load() }
+
+func (f *fullDuringRequest) HasNode([32]byte) bool { return false }
+
+// A payload that another path imports while its request by root is out isn't imported again from the
+// answer (pq-t2-l2's node 2: the late request at the payload-due deadline, then the reassembled
+// envelope's import, then the answer's).
+func TestFetchPayloadEnvelope_SkipsAnImportedPayload(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	cfg := params.BeaconConfig()
+	cfg.FuluForkEpoch = 0
+	cfg.GloasForkEpoch = 0
+	params.OverrideBeaconConfig(cfg)
+	params.BeaconConfig().InitializeForkSchedule()
+
+	ctxMap, err := ContextByteVersionsForValRoot(params.BeaconConfig().GenesisValidatorsRoot)
+	require.NoError(t, err)
+
+	root := [32]byte{0x42}
+	envelope := &ethpb.SignedExecutionPayloadEnvelope{
+		Message: &ethpb.ExecutionPayloadEnvelope{
+			Payload: &enginev1.ExecutionPayloadGloas{
+				ParentHash:    make([]byte, fieldparams.RootLength),
+				FeeRecipient:  make([]byte, 20),
+				StateRoot:     make([]byte, fieldparams.RootLength),
+				ReceiptsRoot:  make([]byte, fieldparams.RootLength),
+				LogsBloom:     make([]byte, 256),
+				PrevRandao:    make([]byte, fieldparams.RootLength),
+				BaseFeePerGas: make([]byte, fieldparams.RootLength),
+				BlockHash:     make([]byte, fieldparams.RootLength),
+				SlotNumber:    1,
+			},
+			BeaconBlockRoot:       root[:],
+			ParentBeaconBlockRoot: make([]byte, fieldparams.RootLength),
+		},
+		Signature: make([]byte, fieldparams.BLSSignatureLength),
+	}
+
+	for _, meanwhile := range []bool{false, true} {
+		t.Run(fmt.Sprintf("imported meanwhile=%v", meanwhile), func(t *testing.T) {
+			p1, p2 := p2ptest.NewTestP2P(t), p2ptest.NewTestP2P(t)
+			p1.Connect(p2)
+			p1.Peers().SetConnectionState(p2.PeerID(), peers.Connected)
+			p1.Peers().SetChainState(p2.PeerID(), &ethpb.StatusV2{})
+
+			fc := &fullDuringRequest{}
+			protocol := fmt.Sprintf("%s/ssz_snappy", p2p.RPCExecutionPayloadEnvelopesByRootTopicV1)
+			p2.SetStreamHandler(protocol, func(stream network.Stream) {
+				req := new(p2ptypes.ExecutionPayloadEnvelopesByRootReq)
+				require.NoError(t, p2.Encoding().DecodeWithMaxLength(stream, req))
+				fc.full.Store(meanwhile)
+				require.NoError(t, WriteExecutionPayloadEnvelopeChunk(stream, p2.Encoding(), envelope))
+				require.NoError(t, stream.CloseWrite())
+			})
+
+			chain := &mock.ChainService{FinalizedCheckPoint: &ethpb.Checkpoint{}, ForkChoiceStore: fc}
+			s := &Service{
+				ctx: context.Background(),
+				cfg: &config{
+					chain: chain,
+					p2p:   p1,
+					clock: startup.NewClock(time.Now(), [fieldparams.RootLength]byte{}),
+				},
+				ctxMap:          ctxMap,
+				badPayloadCache: lruwrpr.New(10),
+			}
+
+			s.fetchPayloadEnvelope(root)
+			want := 1
+			if meanwhile {
+				want = 0
+			}
+			require.Equal(t, want, len(chain.PayloadEnvelopesReceived))
+		})
+	}
 }

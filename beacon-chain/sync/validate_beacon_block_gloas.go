@@ -135,6 +135,12 @@ func (s *Service) fetchPayloadEnvelope(root [32]byte) {
 		if len(envelopes) == 0 {
 			continue
 		}
+		// Gossip may have imported the payload while the request was out: the late request at the
+		// payload-due deadline races a payload that arrives just after it. Importing the answer as
+		// well would repeat the import.
+		if s.cfg.chain.HasFullNode(root) {
+			return
+		}
 		ctx, cancel := context.WithTimeout(s.ctx, params.BeaconConfig().SlotDuration())
 		err = s.cfg.chain.ReceiveExecutionPayloadEnvelope(ctx, envelopes[0])
 		cancel()

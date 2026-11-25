@@ -102,6 +102,12 @@ type ChainService struct {
 	Blobs                       []blocks.VerifiedROBlob
 	DataColumns                 []blocks.VerifiedRODataColumn
 	SyncCommitteeDomain         []byte
+
+	// ReceivePayloadEnvelopeFn, when set, gives ReceiveExecutionPayloadEnvelope's result for each
+	// envelope in place of ReceivePayloadEnvelopeErr.
+	ReceivePayloadEnvelopeFn func(interfaces.ROSignedExecutionPayloadEnvelope) error
+	// PayloadEnvelopesReceived are the envelopes ReceiveExecutionPayloadEnvelope imported.
+	PayloadEnvelopesReceived []interfaces.ROSignedExecutionPayloadEnvelope
 }
 
 type EquivocationKey struct {
@@ -1008,9 +1014,16 @@ func (c *ChainService) PtcLookupState(_ context.Context, _ [32]byte, _ primitive
 }
 
 // ReceiveExecutionPayloadEnvelope implements the same method in the chain service.
-func (c *ChainService) ReceiveExecutionPayloadEnvelope(ctx context.Context, _ interfaces.ROSignedExecutionPayloadEnvelope) error {
+func (c *ChainService) ReceiveExecutionPayloadEnvelope(ctx context.Context, env interfaces.ROSignedExecutionPayloadEnvelope) error {
 	_, c.ReceivePayloadEnvelopeCtxHadDeadline = ctx.Deadline()
-	return c.ReceivePayloadEnvelopeErr
+	err := c.ReceivePayloadEnvelopeErr
+	if c.ReceivePayloadEnvelopeFn != nil {
+		err = c.ReceivePayloadEnvelopeFn(env)
+	}
+	if err == nil {
+		c.PayloadEnvelopesReceived = append(c.PayloadEnvelopesReceived, env)
+	}
+	return err
 }
 
 // BuiltOnFullParent mocks the same method in the chain service.
