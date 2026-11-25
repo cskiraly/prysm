@@ -21,6 +21,7 @@ import (
 	p2ptypes "github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/types"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	"github.com/OffchainLabs/prysm/v7/config/params"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	leakybucket "github.com/OffchainLabs/prysm/v7/container/leaky-bucket"
 	engpb "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
@@ -139,20 +140,25 @@ func TestValidateEnvelopesByRange(t *testing.T) {
 func TestValidateExecutionPayloadEnvelopeByRangeResponseRejectsMalformedEnvelope(t *testing.T) {
 	req := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: 1}
 
+	// The wrapper refuses a malformed envelope, so each is wrapped well-formed and then broken.
 	t.Run("nil message", func(t *testing.T) {
 		env := testSignedEnvelope(5, make([]byte, 32))
+		e, err := blocks.WrappedROSignedExecutionPayloadEnvelope(env)
+		require.NoError(t, err)
 		env.Message = nil
 
-		_, _, err := validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
+		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(e, req, 0, nil, false)
 		require.NotNil(t, err)
 		assert.ErrorContains(t, "invalid execution payload envelope", err)
 	})
 
 	t.Run("nil payload", func(t *testing.T) {
 		env := testSignedEnvelope(5, make([]byte, 32))
+		e, err := blocks.WrappedROSignedExecutionPayloadEnvelope(env)
+		require.NoError(t, err)
 		env.Message.Payload = nil
 
-		_, _, err := validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
+		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(e, req, 0, nil, false)
 		require.NotNil(t, err)
 		assert.ErrorContains(t, "invalid execution payload envelope", err)
 	})
@@ -162,21 +168,29 @@ func TestValidateExecutionPayloadEnvelopeByRangeResponseRange(t *testing.T) {
 	t.Run("count overflowing end slot", func(t *testing.T) {
 		req := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: math.MaxUint64}
 
-		slot, _, err := validateExecutionPayloadEnvelopeByRangeResponse(testSignedEnvelope(7, make([]byte, 32)), req, 0, nil, false)
+		env, err := blocks.WrappedROSignedExecutionPayloadEnvelope(testSignedEnvelope(7, make([]byte, 32)))
+		require.NoError(t, err)
+		slot, _, err := validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
 		require.NoError(t, err)
 		assert.Equal(t, primitives.Slot(7), slot)
 
-		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(testSignedEnvelope(4, make([]byte, 32)), req, 0, nil, false)
+		env, err = blocks.WrappedROSignedExecutionPayloadEnvelope(testSignedEnvelope(4, make([]byte, 32)))
+		require.NoError(t, err)
+		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
 		require.ErrorIs(t, err, ErrInvalidFetchedData)
 	})
 
 	t.Run("slot at end of range", func(t *testing.T) {
 		req := &pb.ExecutionPayloadEnvelopesByRangeRequest{StartSlot: 5, Count: 2}
 
-		_, _, err := validateExecutionPayloadEnvelopeByRangeResponse(testSignedEnvelope(6, make([]byte, 32)), req, 0, nil, false)
+		env, err := blocks.WrappedROSignedExecutionPayloadEnvelope(testSignedEnvelope(6, make([]byte, 32)))
+		require.NoError(t, err)
+		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
 		require.NoError(t, err)
 
-		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(testSignedEnvelope(7, make([]byte, 32)), req, 0, nil, false)
+		env, err = blocks.WrappedROSignedExecutionPayloadEnvelope(testSignedEnvelope(7, make([]byte, 32)))
+		require.NoError(t, err)
+		_, _, err = validateExecutionPayloadEnvelopeByRangeResponse(env, req, 0, nil, false)
 		require.ErrorIs(t, err, ErrInvalidFetchedData)
 	})
 }
@@ -363,13 +377,17 @@ func TestExecutionPayloadEnvelopesByRangeRPCHandler(t *testing.T) {
 		remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
 			defer wg.Done()
 			for {
-				env, readErr := readChunkedExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
+				env, readErr := readChunkedROExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
 				if errors.Is(readErr, io.EOF) {
 					break
 				}
 				assert.NoError(t, readErr)
 				if env != nil {
-					receivedSlots = append(receivedSlots, primitives.Slot(env.Message.Payload.SlotNumber))
+					message, envErr := env.Envelope()
+					assert.NoError(t, envErr)
+					if envErr == nil {
+						receivedSlots = append(receivedSlots, message.Slot())
+					}
 				}
 			}
 		})
@@ -470,13 +488,17 @@ func TestExecutionPayloadEnvelopesByRangeRPCHandler(t *testing.T) {
 		remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
 			defer wg.Done()
 			for {
-				env, readErr := readChunkedExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
+				env, readErr := readChunkedROExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
 				if errors.Is(readErr, io.EOF) {
 					break
 				}
 				assert.NoError(t, readErr)
 				if env != nil {
-					receivedSlots = append(receivedSlots, primitives.Slot(env.Message.Payload.SlotNumber))
+					message, envErr := env.Envelope()
+					assert.NoError(t, envErr)
+					if envErr == nil {
+						receivedSlots = append(receivedSlots, message.Slot())
+					}
 				}
 			}
 		})
@@ -592,13 +614,17 @@ func TestExecutionPayloadEnvelopesByRangeRPCHandler(t *testing.T) {
 		remoteP2P.BHost.SetStreamHandler(protocolID, func(stream network.Stream) {
 			defer wg.Done()
 			for {
-				env, readErr := readChunkedExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
+				env, readErr := readChunkedROExecutionPayloadEnvelope(stream, remoteP2P.Encoding(), ctxMap)
 				if errors.Is(readErr, io.EOF) {
 					break
 				}
 				assert.NoError(t, readErr)
 				if env != nil {
-					receivedSlots = append(receivedSlots, primitives.Slot(env.Message.Payload.SlotNumber))
+					message, envErr := env.Envelope()
+					assert.NoError(t, envErr)
+					if envErr == nil {
+						receivedSlots = append(receivedSlots, message.Slot())
+					}
 				}
 			}
 		})
@@ -680,9 +706,15 @@ func TestSendExecutionPayloadEnvelopesByRangeRequest(t *testing.T) {
 		envelopes, recvErr := SendExecutionPayloadEnvelopesByRangeRequest(ctx, clock, p1, p2.PeerID(), ctxMap, req)
 		require.NoError(t, recvErr)
 		require.Equal(t, int(count), len(envelopes))
-		assert.Equal(t, startSlot, primitives.Slot(envelopes[0].Message.Payload.SlotNumber))
-		assert.Equal(t, startSlot+1, primitives.Slot(envelopes[1].Message.Payload.SlotNumber))
-		assert.Equal(t, startSlot+2, primitives.Slot(envelopes[2].Message.Payload.SlotNumber))
+		env0, err := envelopes[0].Envelope()
+		require.NoError(t, err)
+		env1, err := envelopes[1].Envelope()
+		require.NoError(t, err)
+		env2, err := envelopes[2].Envelope()
+		require.NoError(t, err)
+		assert.Equal(t, startSlot, env0.Slot())
+		assert.Equal(t, startSlot+1, env1.Slot())
+		assert.Equal(t, startSlot+2, env2.Slot())
 	})
 
 	t.Run("empty response from remote peer", func(t *testing.T) {

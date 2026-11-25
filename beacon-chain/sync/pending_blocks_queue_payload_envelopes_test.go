@@ -14,6 +14,8 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/startup"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
 	enginev1 "github.com/OffchainLabs/prysm/v7/proto/engine/v1"
@@ -38,6 +40,7 @@ func makeSignedEnvelope(root [32]byte, slot primitives.Slot) *ethpb.SignedExecut
 				BlockHash:     make([]byte, fieldparams.RootLength),
 				SlotNumber:    slot,
 			},
+			ExecutionRequests:     &enginev1.ExecutionRequestsGloas{},
 			BeaconBlockRoot:       root[:],
 			ParentBeaconBlockRoot: make([]byte, fieldparams.RootLength),
 		},
@@ -57,7 +60,7 @@ func newEnvelopeFetchService(t *testing.T, p1 p2p.P2P) *Service {
 			chain:    chain,
 			clock:    startup.NewClock(chain.Genesis, chain.ValidatorsRoot),
 		},
-		pendingPayloadEnvelopes: make(map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope),
+		pendingPayloadEnvelopes: make(map[[32]byte]map[uint64]interfaces.ROSignedExecutionPayloadEnvelope),
 	}
 	ctxMap, err := ContextByteVersionsForValRoot(chain.ValidatorsRoot)
 	require.NoError(t, err)
@@ -117,7 +120,9 @@ func TestQueuePendingPayloadEnvelopeFromRootRequest_RejectsFutureSlot(t *testing
 	p1 := p2ptest.NewTestP2P(t)
 	r := newEnvelopeFetchService(t, p1)
 
-	r.queuePendingPayloadEnvelopeFromRootRequest(makeSignedEnvelope([32]byte{0xDD}, 1_000_000))
+	env, err := blocks.WrappedROSignedExecutionPayloadEnvelope(makeSignedEnvelope([32]byte{0xDD}, 1_000_000))
+	require.NoError(t, err)
+	r.queuePendingPayloadEnvelopeFromRootRequest(env)
 
 	r.pendingEnvelopeLock.RLock()
 	defer r.pendingEnvelopeLock.RUnlock()
@@ -130,9 +135,13 @@ func TestQueuePendingPayloadEnvelopeFromRootRequest_RootsCap(t *testing.T) {
 	r := newEnvelopeFetchService(t, p1)
 
 	for i := range maxPendingPayloadRoots {
-		r.queuePendingPayloadEnvelopeFromRootRequest(makeSignedEnvelope([32]byte{byte(i), byte(i >> 8)}, 1))
+		env, err := blocks.WrappedROSignedExecutionPayloadEnvelope(makeSignedEnvelope([32]byte{byte(i), byte(i >> 8)}, 1))
+		require.NoError(t, err)
+		r.queuePendingPayloadEnvelopeFromRootRequest(env)
 	}
-	r.queuePendingPayloadEnvelopeFromRootRequest(makeSignedEnvelope([32]byte{0xFF, 0xFF, 0xFF}, 1))
+	env, err := blocks.WrappedROSignedExecutionPayloadEnvelope(makeSignedEnvelope([32]byte{0xFF, 0xFF, 0xFF}, 1))
+	require.NoError(t, err)
+	r.queuePendingPayloadEnvelopeFromRootRequest(env)
 
 	r.pendingEnvelopeLock.RLock()
 	defer r.pendingEnvelopeLock.RUnlock()
@@ -148,7 +157,9 @@ func TestQueuePendingPayloadEnvelopeFromRootRequest_BuildersPerRootCap(t *testin
 	for i := 0; i <= maxPendingBuildersPerRoot; i++ {
 		env := makeSignedEnvelope(root, 1)
 		env.Message.BuilderIndex = primitives.BuilderIndex(i)
-		r.queuePendingPayloadEnvelopeFromRootRequest(env)
+		wrapped, err := blocks.WrappedROSignedExecutionPayloadEnvelope(env)
+		require.NoError(t, err)
+		r.queuePendingPayloadEnvelopeFromRootRequest(wrapped)
 	}
 
 	r.pendingEnvelopeLock.RLock()

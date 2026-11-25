@@ -26,6 +26,7 @@ import (
 	lruwrpr "github.com/OffchainLabs/prysm/v7/cache/lru"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
 	"github.com/OffchainLabs/prysm/v7/crypto/bls"
 	"github.com/OffchainLabs/prysm/v7/encoding/bytesutil"
@@ -172,7 +173,7 @@ func TestProcessPendingAtts_RequestsEnvelopeWithBlock(t *testing.T) {
 	ctxMap, err := ContextByteVersionsForValRoot(r.cfg.chain.(*mock.ChainService).ValidatorsRoot)
 	require.NoError(t, err)
 	r.ctxMap = ctxMap
-	r.pendingPayloadEnvelopes = make(map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope)
+	r.pendingPayloadEnvelopes = make(map[[32]byte]map[uint64]interfaces.ROSignedExecutionPayloadEnvelope)
 	rootB := [32]byte{'B'}
 	r.savePendingAtt(sender.PeerID(), pendingAttFor(rootB, 1))
 

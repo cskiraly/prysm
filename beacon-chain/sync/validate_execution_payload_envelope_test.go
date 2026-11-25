@@ -411,7 +411,7 @@ func newEnvelopeServiceForTest(t *testing.T, envelopeSlot, blockSlot primitives.
 	stateGen := stategen.New(db, doublylinkedtree.New())
 	s := &Service{
 		seenPayloadEnvelopeCache: lruwrpr.New(10),
-		pendingPayloadEnvelopes:  make(map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope),
+		pendingPayloadEnvelopes:  make(map[[32]byte]map[uint64]interfaces.ROSignedExecutionPayloadEnvelope),
 		cfg: &config{
 			p2p:               p,
 			initialSync:       &mockSync.Sync{},
@@ -500,7 +500,7 @@ func TestQueuePendingPayloadEnvelope_SelfBuildInvalidSignature(t *testing.T) {
 
 			s := &Service{
 				seenPayloadEnvelopeCache: lruwrpr.New(10),
-				pendingPayloadEnvelopes:  make(map[[32]byte]map[uint64]*ethpb.SignedExecutionPayloadEnvelope),
+				pendingPayloadEnvelopes:  make(map[[32]byte]map[uint64]interfaces.ROSignedExecutionPayloadEnvelope),
 				cfg: &config{
 					p2p:         p,
 					initialSync: &mockSync.Sync{},

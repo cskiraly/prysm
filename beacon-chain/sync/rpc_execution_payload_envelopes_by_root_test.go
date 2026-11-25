@@ -137,10 +137,12 @@ func TestExecutionPayloadEnvelopesByRootRPCHandler_AvailableEnvelopes(t *testing
 			}
 			var receivedRoots [][32]byte
 			for _, envelope := range received {
-				root := bytesutil.ToBytes32(envelope.Message.BeaconBlockRoot)
+				message, err := envelope.Envelope()
+				require.NoError(t, err)
+				root := message.BeaconBlockRoot()
 				receivedRoots = append(receivedRoots, root)
-				assert.Equal(t, root, bytesutil.ToBytes32(envelope.Message.Payload.BlockHash))
-				assert.Equal(t, reconstructor.SlotByBlockHash[root], envelope.Message.Payload.SlotNumber)
+				assert.Equal(t, root, message.BlockHash())
+				assert.Equal(t, reconstructor.SlotByBlockHash[root], message.Slot())
 			}
 			assert.Equal(t, true, slices.Equal(tt.wantRoots, receivedRoots), "unexpected roots: got %v, want %v", receivedRoots, tt.wantRoots)
 			require.Equal(t, len(tt.wantBatches), len(reconstructor.batches))
@@ -217,7 +219,9 @@ func TestSendExecutionPayloadEnvelopesByRootRequest(t *testing.T) {
 		envelopes, err := SendExecutionPayloadEnvelopesByRootRequest(t.Context(), clock, p1, p2p2.PeerID(), ctxMap, &reqRoots)
 		require.NoError(t, err)
 		require.Equal(t, 1, len(envelopes))
-		assert.Equal(t, rootA, bytesutil.ToBytes32(envelopes[0].Message.BeaconBlockRoot))
+		envA, err := envelopes[0].Envelope()
+		require.NoError(t, err)
+		assert.Equal(t, rootA, envA.BeaconBlockRoot())
 
 		if util.WaitTimeout(&wg, time.Second) {
 			t.Fatal("Did not receive stream within 1 sec")
@@ -344,8 +348,12 @@ func TestSendExecutionPayloadEnvelopesByRootRequest(t *testing.T) {
 		envelopes, err := SendExecutionPayloadEnvelopesByRootRequest(t.Context(), clock, p1, p2p2.PeerID(), ctxMap, &reqRoots)
 		require.NoError(t, err)
 		require.Equal(t, 2, len(envelopes))
-		assert.Equal(t, rootA, bytesutil.ToBytes32(envelopes[0].Message.BeaconBlockRoot))
-		assert.Equal(t, rootB, bytesutil.ToBytes32(envelopes[1].Message.BeaconBlockRoot))
+		envA, err := envelopes[0].Envelope()
+		require.NoError(t, err)
+		envB, err := envelopes[1].Envelope()
+		require.NoError(t, err)
+		assert.Equal(t, rootA, envA.BeaconBlockRoot())
+		assert.Equal(t, rootB, envB.BeaconBlockRoot())
 
 		if util.WaitTimeout(&wg, time.Second) {
 			t.Fatal("Did not receive stream within 1 sec")
