@@ -245,6 +245,8 @@ func TestPayloadTypeDecodeTakesHandedBytes(t *testing.T) {
 		typ, held := g.holding(t, 1)
 		work := typ.Decode(g.group, held)
 		typ.Advance(7+2, 2) // the group's slot is 7: its segments go at 9 with a window of 2
+		_, ok := typ.Store().Get(g.group, held[0])
+		require.Equal(t, false, ok, "a decoded group's segments outlived the window")
 		typ.NoteCommitted(g.group, committed)
 		require.Equal(t, 0, typ.HandoffsHeld())
 		require.Equal(t, int64(1), typ.Counts().DecodeHandedLate.Load())
