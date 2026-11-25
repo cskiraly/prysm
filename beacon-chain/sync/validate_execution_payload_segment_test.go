@@ -29,54 +29,54 @@ import (
 
 // TestSegmentAddResult pins the split between "the peer is at fault" and "we cannot judge
 // this yet". Only the former should cost the sender reputation, since Reject is what feeds
-// gossipsub's invalid-message scoring.
+// the binding's invalid-message scoring (gossipsub's, as ValidationReject).
 func TestSegmentAddResult(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
-		want pubsub.ValidationResult
+		want segmentVerdict
 		why  string
 	}{
 		{
 			name: "our group cap",
 			err:  segments.ErrTooManyGroups,
-			want: pubsub.ValidationIgnore,
+			want: segmentIgnore,
 			why:  "our own limit, the peer did nothing wrong",
 		},
 		{
 			name: "our byte budget",
 			err:  segments.ErrBufferFull,
-			want: pubsub.ValidationIgnore,
+			want: segmentIgnore,
 			why:  "our own limit, the peer did nothing wrong",
 		},
 		{
 			name: "group not committed by any known block yet",
 			err:  segmentauth.ErrNotCommitted,
-			want: pubsub.ValidationIgnore,
+			want: segmentIgnore,
 			why:  "transient: the commitment arrives with a block, so the sender is blameless",
 		},
 		{
 			name: "descriptor conflicts with the group's pinned descriptor",
 			err:  segments.ErrDescriptorConflict,
-			want: pubsub.ValidationReject,
+			want: segmentReject,
 			why:  "attributable to the sender",
 		},
 		{
 			name: "first-seen conflict under the interim authority",
 			err:  segmentauth.ErrFirstSeenConflict,
-			want: pubsub.ValidationIgnore,
+			want: segmentIgnore,
 			why:  "must never cost reputation: under first-seen a conflict proves only that two peers disagree",
 		},
 		{
 			name: "unauthenticated wrapper alone",
 			err:  segments.ErrUnauthenticatedDescriptor,
-			want: pubsub.ValidationReject,
+			want: segmentReject,
 			why:  "no transient cause identified, so treat as the sender's fault",
 		},
 		{
 			name: "coded group that is not a codeword",
 			err:  segments.ErrCodewordMismatch,
-			want: pubsub.ValidationReject,
+			want: segmentReject,
 			why:  "every segment proved against the root, so the builder committed an inconsistent group",
 		},
 	} {
@@ -92,7 +92,7 @@ func TestSegmentAddResult(t *testing.T) {
 		// two layers or every auth failure would be punished as a Reject.
 		wrapped := errors.Join(segments.ErrUnauthenticatedDescriptor, segmentauth.ErrNotCommitted)
 		got, _ := segmentAddResult(wrapped)
-		require.Equal(t, pubsub.ValidationIgnore, got)
+		require.Equal(t, segmentIgnore, got)
 	})
 }
 
@@ -288,6 +288,65 @@ func TestSegmentValidatorCompletesCodedGroup(t *testing.T) {
 		require.Equal(t, 0, s.segmentReassembler.Bytes())
 		require.Equal(t, 1, len(p.CommittedSegmentGroups()), "a delivered group's bytes handed over again")
 	})
+}
+
+// TestSegmentAcceptPathOverAChunk: the accept path runs over a chunk with no gossipsub message around it,
+// as another binding would hand one over. The place the chunk travelled is handed to the payload path as
+// is, the group completes at its K-th chunk and imports, and a chunk whose group key is not its
+// descriptor's is the sender's fault.
+func TestSegmentAcceptPathOverAChunk(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	n := newSegmentNode(t, 1, mockExecutionPayloadEnvelopeVerifier{})
+	s := n.s
+	p, ok := s.cfg.p2p.(*p2ptest.TestP2P)
+	require.Equal(t, true, ok)
+	ctx := t.Context()
+
+	env, _ := n.block(t, 1)
+	txs := make([][]byte, 40)
+	for i := range txs {
+		txs[i] = bytes.Repeat([]byte{byte(i + 1)}, 4096)
+	}
+	txList, err := enginev1.NewProgressiveTransactionList(txs)
+	require.NoError(t, err)
+	env.Message.Payload.Transactions = txList
+	msgs, err := segmentauth.SegmentMessagesForEnvelope(env, segmentauth.DefaultParams())
+	require.NoError(t, err)
+	k := int(msgs[0].Descriptor.Required())
+	require.Equal(t, segments.VersionCoded, msgs[0].Descriptor.Version)
+
+	// A stream binding's protocol, say: not a gossip topic, and the path hands it back as is.
+	const place = "/seacast/2.0.0"
+	arrival := func(m *segments.SegmentMessage) segmentArrival {
+		chunk, err := m.ToProto()
+		require.NoError(t, err)
+		return segmentArrival{from: peer.ID("other"), place: place, digest: s.currentForkDigest(), chunk: chunk}
+	}
+
+	t.Run("a chunk whose group key is not its descriptor's", func(t *testing.T) {
+		a := arrival(msgs[0])
+		a.chunk.Slot++ // the key binds the slot
+		v, err := s.acceptSegment(ctx, a)
+		require.NotNil(t, err)
+		require.Equal(t, segmentReject, v)
+	})
+
+	for i, m := range msgs[k : 2*k] {
+		v, err := s.acceptSegment(ctx, arrival(m))
+		require.NoError(t, err)
+		require.Equal(t, segmentAccept, v, "chunk %d", i)
+		s.segmentWork.Wait()
+		if i < k-1 {
+			require.Equal(t, 0, n.imported(env), "imported at chunk %d of %d", i, k)
+		}
+	}
+	require.Equal(t, 1, n.imported(env), "not imported at the %dth chunk", k)
+	seen := p.SeenSegmentGroups()
+	require.Equal(t, k, len(seen))
+	for _, g := range seen {
+		require.Equal(t, place, g.Topic, "the place not handed to the path as is")
+	}
+	require.Equal(t, 1, len(p.CommittedSegmentGroups()))
 }
 
 // TestSegmentValidatorTypeFollowsTheDigest: a completed group decodes as the signed envelope of the

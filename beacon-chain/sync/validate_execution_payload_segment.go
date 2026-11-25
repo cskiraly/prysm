@@ -50,28 +50,58 @@ const (
 
 var errSegmentedGossipDisabled = errors.New("segmented payload gossip is disabled")
 
-// validateExecutionPayloadSegment validates one segment of a segmented execution payload.
-//
-// Ordering is deliberate and runs cheapest-first: decode, then the per-peer budget when the
-// segment would open a group, then the Merkle proof, the length checks and the descriptor
-// authentication, all inside the reassembler's Add so a segment is verified exactly once.
-// The segment that completes a group is followed by the group's recovery, the payload's
-// decompression when the descriptor says it was compressed, the envelope's decode, and the
-// envelope topic's checks. While the node is still syncing every
-// segment is ignored, as envelopes are: nothing here could be judged against a chain the node
-// does not have yet.
+// segmentVerdict is the payload chunk's accept path's verdict, the same whichever binding carried the
+// chunk. Accept: the chunk is taken and passed on. Ignore: neither, and the sender is not to blame; the
+// node's own limits and a group it can't judge yet (the specification's DEFER, which this path doesn't
+// buffer) are ignored. Reject: the sender's fault (the specification's REJECT, which penalises the sender,
+// seacast.md §4.2's on_validated).
+type segmentVerdict int
+
+const (
+	segmentAccept segmentVerdict = iota
+	segmentIgnore
+	segmentReject
+)
+
+// gossip is the verdict as gossipsub's validation result.
+func (v segmentVerdict) gossip() pubsub.ValidationResult {
+	switch v {
+	case segmentAccept:
+		return pubsub.ValidationAccept
+	case segmentReject:
+		return pubsub.ValidationReject
+	default:
+		return pubsub.ValidationIgnore
+	}
+}
+
+// segmentPathOpen is the node's side of the accept path's first check: whether it takes payload chunks at
+// all. While the node is still syncing every chunk is ignored, as envelopes are: nothing on the path could
+// be judged against a chain the node does not have yet.
+func (s *Service) segmentPathOpen() (segmentVerdict, error) {
+	if s.segmentReassembler == nil {
+		return segmentIgnore, errSegmentedGossipDisabled
+	}
+	if s.cfg.initialSync.Syncing() {
+		return segmentIgnore, nil
+	}
+	return segmentAccept, nil
+}
+
+// validateExecutionPayloadSegment is the segment topic's gossip validator: the gossipsub binding's side of
+// a payload chunk's accept path (acceptSegment). It accepts the node's own segments at once, and checks
+// that the node takes chunks before it reads one from its gossip wire form. Then it hands the chunk, the
+// sender and the topic to the accept path, and returns its verdict as gossipsub's. An accepted segment
+// carries its decoded chunk to the subscriber.
 func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.ID, msg *pubsub.Message) (pubsub.ValidationResult, error) {
 	if pid == s.cfg.p2p.PeerID() {
 		return pubsub.ValidationAccept, nil
 	}
-	if s.segmentReassembler == nil {
-		return pubsub.ValidationIgnore, errSegmentedGossipDisabled
-	}
-	if s.cfg.initialSync.Syncing() {
-		return pubsub.ValidationIgnore, nil
+	if v, err := s.segmentPathOpen(); v != segmentAccept {
+		return v.gossip(), err
 	}
 
-	_, span := trace.StartSpan(ctx, "sync.validateExecutionPayloadSegment")
+	ctx, span := trace.StartSpan(ctx, "sync.validateExecutionPayloadSegment")
 	defer span.End()
 
 	if msg.Topic == nil {
@@ -86,13 +116,59 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 	if !ok {
 		return pubsub.ValidationReject, errWrongMessage
 	}
-
-	// A message the wire type carries but the descriptor cannot hold is the peer's fault and
-	// provably invalid, so reject rather than ignore: this feeds gossipsub's invalid-message scoring.
-	seg, hasher, err := segments.FromProto(pb)
+	digest, err := p2p.ExtractGossipDigest(*msg.Topic)
+	if err != nil {
+		// The router runs this validator on the segment topic only, whose name carries a digest.
+		tracing.AnnotateError(span, err)
+		return pubsub.ValidationIgnore, err
+	}
+	v, err := s.acceptSegment(ctx, segmentArrival{from: pid, place: *msg.Topic, digest: digest, chunk: pb})
 	if err != nil {
 		tracing.AnnotateError(span, err)
-		return pubsub.ValidationReject, err
+	}
+	if v == segmentAccept {
+		msg.ValidatorData = pb
+	}
+	return v.gossip(), err
+}
+
+// segmentArrival is a payload chunk as a binding hands it to the accept path.
+type segmentArrival struct {
+	// from is the peer that sent the chunk.
+	from peer.ID
+	// place is where the chunk travelled, in its binding's terms, handed back to the binding's path as is
+	// (SegmentGroupSeen). On gossipsub it is the segment topic, which keys the message ids of the
+	// segments the router rebuilds.
+	place string
+	// digest is the fork digest the chunk travelled under, which names the envelope type the group decodes
+	// as.
+	digest [4]byte
+	chunk  *ethpb.ExecutionPayloadSegment
+}
+
+// acceptSegment is a payload chunk's accept path, whatever binding carried it. It runs from the chunk to a
+// verdict and, for the chunk that completes its group, to the envelope's admission and import.
+//
+// The order is deliberate and runs cheapest-first:
+//   - the chunk's group key and slot;
+//   - the per-peer budget, when the chunk would open a group;
+//   - the Merkle proof, the length checks and the descriptor's authentication, all inside the
+//     reassembler's Add, so that a chunk is verified exactly once.
+//
+// The chunk that completes a group is followed by the group's recovery, the payload's decompression
+// when the descriptor says it was compressed, the envelope's decode, and the envelope topic's checks.
+// The binding has read the chunk from its wire form by then. The path tells the binding's path what it
+// learns of the group: its shape (SegmentGroupSeen) and, once recovered, its bytes
+// (SegmentGroupCommitted).
+func (s *Service) acceptSegment(ctx context.Context, a segmentArrival) (segmentVerdict, error) {
+	if v, err := s.segmentPathOpen(); v != segmentAccept {
+		return v, err
+	}
+	// A message the wire type carries but the descriptor cannot hold is the peer's fault and
+	// provably invalid, so reject rather than ignore: this feeds the binding's invalid-message scoring.
+	seg, hasher, err := segments.FromProto(a.chunk)
+	if err != nil {
+		return segmentReject, err
 	}
 	// seacast-lite.md §3's level 1, as far as it goes without the bid's commitment. The chunk's group
 	// key must be its descriptor's group id at its slot: the key names the group in every message id,
@@ -100,28 +176,24 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 	// where the node has the block. A chunk whose block the node lacks is taken, not deferred as the
 	// specification would: the interim authority below does not need the block.
 	if err := seg.VerifyGroupKey(hasher); err != nil {
-		tracing.AnnotateError(span, err)
-		return pubsub.ValidationReject, err
+		return segmentReject, err
 	}
 	if blockSlot, err := s.cfg.chain.RecentBlockSlot(bytesutil.ToBytes32(seg.BeaconBlockRoot)); err == nil && uint64(blockSlot) != seg.Slot {
-		err := fmt.Errorf("segment names slot %d for a block at slot %d", seg.Slot, blockSlot)
-		tracing.AnnotateError(span, err)
-		return pubsub.ValidationReject, err
+		return segmentReject, fmt.Errorf("segment names slot %d for a block at slot %d", seg.Slot, blockSlot)
 	}
 
 	// Only a segment that would open a group is charged. A segment joining an open group
 	// proves itself against the already-authenticated root inside Add and costs nothing here.
 	groupID := seg.Descriptor.GroupID(hasher)
 	if !s.segmentReassembler.Has(groupID) {
-		if !s.spendSegmentAuthBudget(pid) {
+		if !s.spendSegmentAuthBudget(a.from) {
 			segmentAuthThrottledCounter.Inc()
-			return pubsub.ValidationIgnore, nil
+			return segmentIgnore, nil
 		}
 	}
 
 	complete, err := s.segmentReassembler.Add(hasher, seg)
 	if err != nil {
-		tracing.AnnotateError(span, err)
 		if errors.Is(err, segmentauth.ErrFirstSeenConflict) {
 			// The interim authority's assumption is that at most one earlier slot's group is still
 			// in flight when a slot's own group starts; a refusal here means it broke.
@@ -133,13 +205,12 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 	// The segment is verified against an authenticated descriptor, so its group's shape is known:
 	// the payload's path learns it here, before the router counts the segment.
 	count, threshold := int(seg.Descriptor.Count), int(seg.Descriptor.Required()) // lint:ignore uintcast -- bounded by segments.MaxSegments.
-	s.cfg.p2p.SegmentGroupSeen(bytesutil.ToBytes32(seg.Group), *msg.Topic, count, threshold)
+	s.cfg.p2p.SegmentGroupSeen(bytesutil.ToBytes32(seg.Group), a.place, count, threshold)
 	if complete == nil {
 		// Buffered a new segment, or one more of a group already delivered. Accept so it
 		// propagates: it is verified and belongs to an authenticated descriptor, which is
 		// the whole precondition for forwarding.
-		msg.ValidatorData = pb
-		return pubsub.ValidationAccept, nil
+		return segmentAccept, nil
 	}
 
 	// This node holds what the root committed to. It asks for no more of the group: the router's
@@ -153,19 +224,16 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 	if err != nil {
 		// The bytes hashed to an authenticated root, so a failure here means the builder
 		// committed to something that does not decode as it said. Reject: it is attributable.
-		tracing.AnnotateError(span, err)
-		return pubsub.ValidationReject, err
+		return segmentReject, err
 	}
-	envelope, err := envelopeOfTopic(*msg.Topic)
+	envelope, err := envelopeOfDigest(a.digest)
 	if err != nil {
-		// The node subscribes to the segment topic only at digests its schedule has.
-		tracing.AnnotateError(span, err)
-		return pubsub.ValidationIgnore, err
+		// The node takes chunks only at digests its schedule has.
+		return segmentIgnore, err
 	}
 	if err := envelope.UnmarshalSSZ(payload); err != nil {
 		// Likewise: the builder committed to something that is not its fork's envelope.
-		tracing.AnnotateError(span, err)
-		return pubsub.ValidationReject, err
+		return segmentReject, err
 	}
 	segmentReassembledCounter.Inc()
 	// The group's key binds its slot, so a payload of another slot was published under a false one.
@@ -173,12 +241,13 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 	if slot, ok := envelopeSlot(envelope); !ok || slot != seg.Slot {
 		segmentGroupRefusedCounter.WithLabelValues(segmentRefusedSlot).Inc()
 		log.WithFields(logrus.Fields{"groupSlot": seg.Slot, "payloadSlot": slot}).Debug("Reassembled payload envelope is not of its group's slot")
-		return pubsub.ValidationIgnore, nil
+		return segmentIgnore, nil
 	}
 
 	// The envelope gets the envelope topic's checks, branch by branch. Their verdict is the
 	// envelope's, not this segment's: the segment verified against its root, and the peer that sent
-	// the group's last segment is not answerable for what the builder committed to.
+	// the group's last segment is not answerable for what the builder committed to. (The admission is
+	// the envelope topic's, so its verdict is gossipsub's type.)
 	res := pubsub.ValidationIgnore
 	ro, err := wrapSignedEnvelope(envelope)
 	if err == nil {
@@ -186,11 +255,10 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 		res, err = s.admitExecutionPayloadEnvelope(ctx, ro, prysmTime.Now(), envelopeFromSegments)
 		s.validateEnvelopeLock.Unlock()
 	}
-	msg.ValidatorData = pb
 	if res != pubsub.ValidationAccept {
 		// Queued for its block, or refused.
 		log.WithError(err).WithFields(envelopeFields(ro)).Debug("Reassembled payload envelope not imported on completion")
-		return pubsub.ValidationAccept, nil
+		return segmentAccept, nil
 	}
 	// The envelope passed and is marked seen, so this node takes no other copy of it: the import
 	// starts here rather than at the delivery of this segment, which the router may still drop
@@ -206,7 +274,7 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 			}
 		})
 	}
-	return pubsub.ValidationAccept, nil
+	return segmentAccept, nil
 }
 
 // importReassembledEnvelope imports an envelope its group completed, as the envelope topic's
@@ -236,15 +304,11 @@ type signedEnvelopeMessage interface {
 	UnmarshalSSZ([]byte) error
 }
 
-// envelopeOfTopic is an empty signed envelope of the segment topic's fork, as the envelope topic
-// maps it at that fork's epoch: the PQ fork's envelope from the PQ fork on, Gloas's before it. The
-// type follows the topic's digest, not the node's clock, so a group published just before a fork
-// decodes as its own fork's envelope.
-func envelopeOfTopic(topic string) (signedEnvelopeMessage, error) {
-	digest, err := p2p.ExtractGossipDigest(topic)
-	if err != nil {
-		return nil, err
-	}
+// envelopeOfDigest is an empty signed envelope of the fork a chunk travelled under (the segment topic's
+// digest on gossipsub), as the envelope topic maps it at that fork's epoch: the PQ fork's envelope from
+// the PQ fork on, Gloas's before it. The type follows the chunk's digest, not the node's clock, so a
+// group published just before a fork decodes as its own fork's envelope.
+func envelopeOfDigest(digest [4]byte) (signedEnvelopeMessage, error) {
 	_, epoch, err := params.ForkDataFromDigest(digest)
 	if err != nil {
 		return nil, err
@@ -298,30 +362,30 @@ func decodeSegmentedPayload(enc segments.Encoding, committed []byte) ([]byte, er
 	}
 }
 
-// segmentAddResult maps a reassembler error onto a gossip validation result.
+// segmentAddResult maps a reassembler error onto the accept path's verdict.
 //
 // The split is between "this peer sent something wrong" and "we cannot judge it yet or do
 // not have room", because only the former should cost the peer reputation.
-func segmentAddResult(err error) (pubsub.ValidationResult, error) {
+func segmentAddResult(err error) (segmentVerdict, error) {
 	switch {
 	// Our own limits, not the peer's fault.
 	case errors.Is(err, segments.ErrTooManyGroups), errors.Is(err, segments.ErrBufferFull):
-		return pubsub.ValidationIgnore, err
+		return segmentIgnore, err
 	// Transient: the commitment arrives with a block, so a segment that outruns its block is
 	// not the sender's fault. Nothing in this package buffers it -- the segment is dropped and
 	// must arrive again, which is why the pending-segment store is still an open item rather
 	// than a claim.
 	case errors.Is(err, segmentauth.ErrNotCommitted):
-		return pubsub.ValidationIgnore, err
+		return segmentIgnore, err
 	// Under the interim first-seen authority a conflict proves only that two peers disagree.
 	// If an attacker won the race it is the honest peer that conflicts, so this must never
 	// cost reputation. Only a commitment-backed refusal may be attributable.
 	case errors.Is(err, segmentauth.ErrFirstSeenConflict):
-		return pubsub.ValidationIgnore, err
+		return segmentIgnore, err
 	// Everything else -- a malformed descriptor, a proof that does not verify, a descriptor
 	// conflicting with the one pinned for its group -- is attributable to whoever sent it.
 	default:
-		return pubsub.ValidationReject, err
+		return segmentReject, err
 	}
 }
 
