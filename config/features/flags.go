@@ -152,6 +152,24 @@ var (
 		Name:  "prepare-all-payloads",
 		Usage: "Informs the engine to prepare all local payloads. Useful for relayers and builders.",
 	}
+	EnableSegmentedPayloadGossip = &cli.BoolFlag{
+		Name: "enable-segmented-payload-gossip",
+		Usage: "Publishes execution payload envelopes as authenticated gossip segments on their own topic, " +
+			"and reassembles segments received from peers. Experimental: the segment commitment is not yet " +
+			"carried in the execution payload bid.",
+	}
+	SeacastUplinkMbps = &cli.IntFlag{
+		Name: "seacast-uplink-mbps",
+		Usage: "The node's uplink in Mbps, which sizes the segment topic's send window and push budget. " +
+			"Required with --enable-segmented-payload-gossip.",
+	}
+	SeacastPayloadOnly = &cli.BoolFlag{
+		Name: "seacast-payload-only",
+		Usage: "Sends a published execution payload envelope as segments only, without the whole envelope, " +
+			"falling back to the whole envelope when the segments cannot go out; and does not rebroadcast a " +
+			"queued envelope whole. For networks whose nodes all reassemble segments. " +
+			"Requires --enable-segmented-payload-gossip.",
+	}
 	EnableLightClient = &cli.BoolFlag{
 		Name:  "enable-light-client",
 		Usage: "Enables the light client support in the beacon node",
@@ -303,6 +321,9 @@ var BeaconChainFlags = combinedFlags([]cli.Flag{
 	aggregateThirdInterval,
 	disableResourceManager,
 	EnableLightClient,
+	EnableSegmentedPayloadGossip,
+	SeacastUplinkMbps,
+	SeacastPayloadOnly,
 	BlobSaveFsync,
 	DisableQUIC,
 	EnableDiscoveryReboot,

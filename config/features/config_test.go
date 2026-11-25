@@ -111,6 +111,22 @@ func TestConfigureBeaconConfig_ReorgLatePayloads(t *testing.T) {
 	assert.Equal(t, true, Get().ReorgLatePayloads)
 }
 
+// TestConfigureBeaconChain_SeacastPayloadOnly: the switch that stops the whole envelope needs the
+// segment path, or a node would publish its envelopes nowhere.
+func TestConfigureBeaconChain_SeacastPayloadOnly(t *testing.T) {
+	app := cli.App{}
+	set := flag.NewFlagSet("test", 0)
+	set.Bool(SeacastPayloadOnly.Name, true, "test")
+	require.ErrorContains(t, EnableSegmentedPayloadGossip.Name, ConfigureBeaconChain(cli.NewContext(&app, set, nil)))
+
+	set = flag.NewFlagSet("test", 0)
+	set.Bool(SeacastPayloadOnly.Name, true, "test")
+	set.Bool(EnableSegmentedPayloadGossip.Name, true, "test")
+	require.NoError(t, ConfigureBeaconChain(cli.NewContext(&app, set, nil)))
+	assert.Equal(t, true, Get().SeacastPayloadOnly)
+	assert.Equal(t, true, Get().EnableSegmentedPayloadGossip)
+}
+
 func TestValidateNetworkFlags(t *testing.T) {
 	// Define the test cases
 	tests := []struct {
