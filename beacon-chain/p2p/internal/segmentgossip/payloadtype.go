@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
 	"github.com/OffchainLabs/prysm/v7/config/params"
@@ -44,6 +45,13 @@ type groupShape struct {
 	dropped bool
 }
 
+// DecodeCounts is what the payload type's decodes count, for the node's metrics.
+type DecodeCounts struct {
+	// DecodeRecoveries counts the decodes that recovered the group's committed bytes from its held
+	// segments (segments.RecoverAndVerify).
+	DecodeRecoveries atomic.Int64
+}
+
 // PayloadType is the execution payload on SEACAST's path (seacast.md §6.1): one group per
 // payload, keyed by its group key (seacast-lite.md §1, the chunk's group field and the head of its
 // message id), every peer with interest ALL and duty FORWARD.
@@ -59,6 +67,7 @@ type PayloadType struct {
 	store  *pubsub.MapCellStore
 	// recordSlots is RecordSlots at the configuration the type was made with.
 	recordSlots uint64
+	counts      DecodeCounts
 
 	mu     sync.Mutex
 	groups map[string]groupShape
@@ -84,6 +93,9 @@ func NewPayloadType(cfg PayloadConfig) *PayloadType {
 	t.params.DecodeAtK = t.coded
 	return t
 }
+
+// Counts is what the type's decodes counted.
+func (t *PayloadType) Counts() *DecodeCounts { return &t.counts }
 
 // coded is the type's DecodeAtK: the node decodes a group at K when the group has parity segments,
 // so that K of them rebuild the rest. A plain group (K = N) completes when every segment is in, with
@@ -241,7 +253,7 @@ func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pub
 		}
 	}
 	return func() (map[uint32]*pubsub.Message, bool) {
-		out, err := rebuildMissing(root, topic, chunks)
+		out, err := rebuildMissing(root, topic, chunks, &t.counts)
 		if err != nil {
 			return nil, false
 		}
@@ -252,8 +264,8 @@ func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pub
 var errDecode = errors.New("payload decode")
 
 // rebuildMissing is Decode's work: the missing segments of the group whose key is group, from the
-// held segments' wire bytes, as wire messages on topic.
-func rebuildMissing(group, topic string, chunks map[uint32][]byte) (map[uint32]*pubsub.Message, error) {
+// held segments' wire bytes, as wire messages on topic. A recovery is counted in counts.
+func rebuildMissing(group, topic string, chunks map[uint32][]byte, counts *DecodeCounts) (map[uint32]*pubsub.Message, error) {
 	if topic == "" || len(chunks) == 0 {
 		return nil, fmt.Errorf("%w: no held segment", errDecode)
 	}
@@ -289,6 +301,7 @@ func rebuildMissing(group, topic string, chunks map[uint32][]byte) (map[uint32]*
 	var committed []byte
 	var err error
 	if d.Version == segments.VersionCoded {
+		counts.DecodeRecoveries.Add(1)
 		committed, err = segments.RecoverAndVerify(d, h, segs)
 	} else {
 		committed, err = segments.Join(d, h, segs)

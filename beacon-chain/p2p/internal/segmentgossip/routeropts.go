@@ -40,6 +40,9 @@ type PathMetrics struct {
 	ParkBreaks, Parks, OfferRetries, GuardDemotions atomic.Int64
 	// V05 is what the router's v0.5 rules count (PromisesAtWrite: the promises a written ask opened).
 	V05 pubsub.SpecV05Counters
+	// Payload is what the payload type's decodes count (PayloadType.Counts), nil where the node runs
+	// no payload type.
+	Payload *DecodeCounts
 }
 
 // payloadRoles is §6.1's JOIN for every peer: interest ALL and duty FORWARD on the payload, no node id.

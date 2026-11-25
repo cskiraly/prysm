@@ -211,7 +211,7 @@ func (s *Service) seacastOptions(filt pubsub.SubscriptionFilter) ([]pubsub.Optio
 		return nil, err
 	}
 	s.segmentPayloadType = typ
-	s.seacastMetrics = &segmentgossip.PathMetrics{} // exported once the router is built (NewService)
+	s.seacastMetrics = &segmentgossip.PathMetrics{Payload: typ.Counts()} // exported once the router is built (NewService)
 	return segmentgossip.RouterOptions(setting, typ, gossipSubHeartbeatInterval, s.seacastMetrics), nil
 }
 

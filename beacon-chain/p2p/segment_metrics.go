@@ -44,6 +44,9 @@ func (c *seacastCollector) Collect(ch chan<- prometheus.Metric) {
 	collectCounters(ch, reflect.ValueOf(m).Elem(), "")
 	// The v0.5 rules' counters share names with the path's (Expired), so theirs carry a prefix.
 	collectCounters(ch, reflect.ValueOf(&m.V05).Elem(), "V05")
+	if m.Payload != nil {
+		collectCounters(ch, reflect.ValueOf(m.Payload).Elem(), "")
+	}
 }
 
 // collectCounters sends every atomic.Int64 field of the struct v as a series under its name, after

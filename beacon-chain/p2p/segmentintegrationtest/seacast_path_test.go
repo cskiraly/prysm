@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -92,6 +93,11 @@ type pathNode struct {
 	// reject makes validate reject another node's segment at index rejectIndex.
 	reject      bool
 	rejectIndex uint32
+	// reasm, when set, is the node's reassembler, which validate runs as the node's validator does
+	// (pathNetwork's nodes); recovered counts the coded groups it returned, each one recovery
+	// (segments.Reassembler.Add), and addErrors the segments it refused.
+	reasm                *segments.Reassembler
+	recovered, addErrors atomic.Int64
 
 	scoreMu sync.Mutex
 	// lowest is the lowest score the node gave each peer at any inspection; last is the latest
@@ -139,8 +145,8 @@ func (n *pathNode) inspect(snaps map[peer.ID]*pubsub.PeerScoreSnapshot) {
 }
 
 // validate does what the node's segment validator does for the path: it accepts the node's own
-// segments at once, verifies any other against its descriptor, and records the group's shape and
-// topic, telling the router the first time.
+// segments at once, verifies any other against its descriptor (in the node's reassembler where it
+// has one), and records the group's shape and topic, telling the router the first time.
 func (n *pathNode) validate(_ context.Context, pid peer.ID, msg *pubsub.Message) pubsub.ValidationResult {
 	if pid == n.self {
 		return pubsub.ValidationAccept
@@ -150,11 +156,25 @@ func (n *pathNode) validate(_ context.Context, pid peer.ID, msg *pubsub.Message)
 		return pubsub.ValidationReject
 	}
 	seg, h, err := segments.FromProto(pb)
-	if err != nil || seg.Verify(h) != nil {
+	if err != nil {
 		return pubsub.ValidationReject
 	}
 	if n.reject && seg.Index == n.rejectIndex {
 		return pubsub.ValidationReject
+	}
+	if n.reasm == nil {
+		if seg.Verify(h) != nil {
+			return pubsub.ValidationReject
+		}
+	} else {
+		complete, err := n.reasm.Add(h, seg)
+		if err != nil {
+			n.addErrors.Add(1)
+			return pubsub.ValidationReject
+		}
+		if complete != nil && seg.Descriptor.Version == segments.VersionCoded {
+			n.recovered.Add(1)
+		}
 	}
 	d := seg.Descriptor
 	group := string(seg.Group)
@@ -206,9 +226,11 @@ func pathNetwork(t *testing.T, cfg pathConfig) ([]*pathNode, string, func()) {
 			UplinkMbps:    pathUpMbps,
 		}
 		require.NoError(t, segmentgossip.CheckSetting(setting))
+		reasm, err := segments.NewReassembler(segments.ReassemblerConfig{AllowUnauthenticated: true})
+		require.NoError(t, err)
 		n := &pathNode{
 			self: h.ID(), typ: typ, decodes: &decodeRecorder{PayloadType: typ}, m: &segmentgossip.PathMetrics{},
-			reject: cfg.rejectAt > 0 && i == cfg.rejectAt, rejectIndex: cfg.rejectIndex,
+			reject: cfg.rejectAt > 0 && i == cfg.rejectAt, rejectIndex: cfg.rejectIndex, reasm: reasm,
 			lowest: map[peer.ID]float64{},
 		}
 		opts := []pubsub.Option{
@@ -433,7 +455,28 @@ func TestSeacastPayloadPath(t *testing.T) {
 			require.Equal(t, count, held, "node %d holds %d of %d", i+1, held, count)
 			require.Equal(t, true, bytes.Equal(want, got), "node %d's envelope is not the source's", i+1)
 		}
+		requireRecoveries(t, nodes)
 	})
+}
+
+// requireRecoveries checks how often each node recovered the group's committed bytes: in its
+// reassembler, and in its router's decode at K. The source recovers in neither: its own segments skip
+// the reassembler, and the batch it publishes them in holds them whole without completing the group
+// segment by segment, so its router never decodes. A receiver recovers once in each.
+func requireRecoveries(t *testing.T, nodes []*pathNode) {
+	t.Helper()
+	for i, n := range nodes {
+		router := n.typ.Counts().DecodeRecoveries.Load()
+		t.Logf("node %d: recoveries: reassembler %d, router %d; decodes started at %v held",
+			i, n.recovered.Load(), router, n.decodes.starts())
+		require.Equal(t, int64(0), n.addErrors.Load(), "node %d: the reassembler refused a segment", i)
+		want := int64(1)
+		if i == 0 {
+			want = 0
+		}
+		require.Equal(t, want, n.recovered.Load(), "node %d: reassembler recoveries", i)
+		require.Equal(t, want, router, "node %d: router recoveries", i)
+	}
 }
 
 // TestSeacastPayloadPathPlain: a plain group (no parity segments, K = N), as a publisher sends a payload
