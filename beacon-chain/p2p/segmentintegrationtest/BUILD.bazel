@@ -1,0 +1,36 @@
+load("@prysm//tools/go:def.bzl", "go_test")
+
+go_test(
+    name = "go_default_test",
+    size = "small",
+    srcs = [
+        "seacast_coupling_test.go",
+        "seacast_msgid_test.go",
+        "seacast_offers_test.go",
+        "seacast_parks_test.go",
+        "seacast_path_test.go",
+        "seacast_scoring_test.go",
+        "seacast_v05_test.go",
+        "two_node_test.go",
+    ],
+    deps = [
+        "//beacon-chain/p2p:go_default_library",
+        "//beacon-chain/p2p/encoder:go_default_library",
+        "//beacon-chain/p2p/internal/segmentgossip:go_default_library",
+        "//beacon-chain/verification/segmentauth:go_default_library",
+        "//config/params:go_default_library",
+        "//container/segments:go_default_library",
+        "//proto/engine/v1:go_default_library",
+        "//proto/prysm/v1alpha1:go_default_library",
+        "//testing/require:go_default_library",
+        "@com_github_golang_snappy//:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/host:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/network:go_default_library",
+        "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
+        "@com_github_libp2p_go_libp2p//x/simlibp2p:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
+        "@com_github_marcopolo_simnet//:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
+    ],
+)
