@@ -144,6 +144,10 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 
 	// This node holds what the root committed to. It asks for no more of the group: the router's
 	// group machine stops the group's asks once its decoder completes it (stop-pull).
+	// The router's decode cuts the group again for its missing segments. It takes these bytes rather
+	// than recover them a second time. They are the root's whatever the envelope checks below decide,
+	// and nothing below writes to them.
+	s.cfg.p2p.SegmentGroupCommitted(bytesutil.ToBytes32(seg.Group), complete)
 
 	payload, err := decodeSegmentedPayload(seg.Descriptor.Encoding, complete)
 	if err != nil {

@@ -36,6 +36,18 @@ func (s *Service) SegmentGroupSeen(group [32]byte, topic string, count, threshol
 	s.pubsub.SeacastHeaderValidated([]string{string(group[:])})
 }
 
+// SegmentGroupCommitted hands the payload's path the bytes a coded group's root commits to, once the
+// node's reassembler recovered them, so that the router's decode of the group cuts them again for the
+// missing segments without recovering them a second time. The path keeps the slice until the decode
+// takes it or the live window passes the group, so the caller must not write to it. A no-op while
+// segmented payload gossip is off.
+func (s *Service) SegmentGroupCommitted(group [32]byte, committed []byte) {
+	if s.segmentPayloadType == nil {
+		return
+	}
+	s.segmentPayloadType.NoteCommitted(string(group[:]), committed)
+}
+
 // seacastWindow moves SEACAST's live window with the beacon slot, from now and then at the start of
 // every slot, until the service stops. A no-op while segmented payload gossip is off.
 func (s *Service) seacastWindow() {

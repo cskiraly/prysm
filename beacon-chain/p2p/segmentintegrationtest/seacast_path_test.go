@@ -162,12 +162,13 @@ func (n *pathNode) validate(_ context.Context, pid peer.ID, msg *pubsub.Message)
 	if n.reject && seg.Index == n.rejectIndex {
 		return pubsub.ValidationReject
 	}
+	var complete []byte
 	if n.reasm == nil {
 		if seg.Verify(h) != nil {
 			return pubsub.ValidationReject
 		}
 	} else {
-		complete, err := n.reasm.Add(h, seg)
+		complete, err = n.reasm.Add(h, seg)
 		if err != nil {
 			n.addErrors.Add(1)
 			return pubsub.ValidationReject
@@ -180,6 +181,9 @@ func (n *pathNode) validate(_ context.Context, pid peer.ID, msg *pubsub.Message)
 	group := string(seg.Group)
 	if n.typ.NoteGroup(group, msg.GetTopic(), int(d.Count), int(d.Required())) { // lint:ignore uintcast -- bounded by segments.MaxSegments.
 		n.ps.SeacastHeaderValidated([]string{group})
+	}
+	if complete != nil {
+		n.typ.NoteCommitted(group, complete) // as the node's validator hands a recovered group over
 	}
 	return pubsub.ValidationAccept
 }
@@ -459,23 +463,24 @@ func TestSeacastPayloadPath(t *testing.T) {
 	})
 }
 
-// requireRecoveries checks how often each node recovered the group's committed bytes: in its
-// reassembler, and in its router's decode at K. The source recovers in neither: its own segments skip
-// the reassembler, and the batch it publishes them in holds them whole without completing the group
-// segment by segment, so its router never decodes. A receiver recovers once in each.
+// requireRecoveries checks that each node recovers the group's committed bytes at most once. A receiver
+// recovers them in its reassembler, and its router's decode at K takes them from there. The source
+// recovers them nowhere: its own segments skip the reassembler, and the batch it publishes them in holds
+// them whole without completing the group segment by segment, so its router never decodes.
 func requireRecoveries(t *testing.T, nodes []*pathNode) {
 	t.Helper()
 	for i, n := range nodes {
-		router := n.typ.Counts().DecodeRecoveries.Load()
-		t.Logf("node %d: recoveries: reassembler %d, router %d; decodes started at %v held",
-			i, n.recovered.Load(), router, n.decodes.starts())
+		c := n.typ.Counts()
+		t.Logf("node %d: recoveries: reassembler %d, router %d; router decodes on handed bytes %d; decodes started at %v held",
+			i, n.recovered.Load(), c.DecodeRecoveries.Load(), c.DecodeHanded.Load(), n.decodes.starts())
 		require.Equal(t, int64(0), n.addErrors.Load(), "node %d: the reassembler refused a segment", i)
-		want := int64(1)
+		receiver := int64(1)
 		if i == 0 {
-			want = 0
+			receiver = 0
 		}
-		require.Equal(t, want, n.recovered.Load(), "node %d: reassembler recoveries", i)
-		require.Equal(t, want, router, "node %d: router recoveries", i)
+		require.Equal(t, receiver, n.recovered.Load(), "node %d: reassembler recoveries", i)
+		require.Equal(t, int64(0), c.DecodeRecoveries.Load(), "node %d: router recoveries", i)
+		require.Equal(t, receiver, c.DecodeHanded.Load(), "node %d: router decodes on handed bytes", i)
 	}
 }
 

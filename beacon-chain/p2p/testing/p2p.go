@@ -63,6 +63,7 @@ type TestP2P struct {
 	broadcastedPartials   []blocks.PartialDataColumn
 	broadcastedSegments   []*segments.SegmentMessage
 	seenGroups            []SeenSegmentGroup
+	committedGroups       []CommittedSegmentGroup
 	partialBroadcaster    partialdatacolumnbroadcaster.Broadcaster
 	DelaySend             bool
 	Digest                [4]byte
@@ -311,6 +312,26 @@ func (p *TestP2P) SeenSegmentGroups() []SeenSegmentGroup {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.seenGroups
+}
+
+// CommittedSegmentGroup is one call of SegmentGroupCommitted.
+type CommittedSegmentGroup struct {
+	Group     [32]byte
+	Committed []byte
+}
+
+// SegmentGroupCommitted records the call.
+func (p *TestP2P) SegmentGroupCommitted(group [32]byte, committed []byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.committedGroups = append(p.committedGroups, CommittedSegmentGroup{Group: group, Committed: committed})
+}
+
+// CommittedSegmentGroups returns the calls of SegmentGroupCommitted, in order.
+func (p *TestP2P) CommittedSegmentGroups() []CommittedSegmentGroup {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.committedGroups
 }
 
 // EnablePartialColumnBroadcaster sets a non-nil partial column broadcaster.

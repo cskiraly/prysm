@@ -265,6 +265,16 @@ func TestSegmentValidatorCompletesCodedGroup(t *testing.T) {
 	for _, g := range seen {
 		require.DeepEqual(t, p2ptest.SeenSegmentGroup{Group: group, Topic: topic, Count: int(d.Count), Threshold: k}, g)
 	}
+	// The segment that completed the group handed its committed bytes (the systematic segments, in
+	// order) to the payload path, so the router's decode does not recover them again.
+	var want []byte
+	for _, m := range msgs[:k] {
+		want = append(want, m.Data...)
+	}
+	committed := p.CommittedSegmentGroups()
+	require.Equal(t, 1, len(committed))
+	require.Equal(t, group, committed[0].Group)
+	require.Equal(t, true, bytes.Equal(want, committed[0].Committed), "the handed bytes are not the group's")
 
 	t.Run("the rest of the group forwards without a second delivery", func(t *testing.T) {
 		for _, m := range msgs[:k] {
@@ -276,6 +286,7 @@ func TestSegmentValidatorCompletesCodedGroup(t *testing.T) {
 			require.Equal(t, true, ok)
 		}
 		require.Equal(t, 0, s.segmentReassembler.Bytes())
+		require.Equal(t, 1, len(p.CommittedSegmentGroups()), "a delivered group's bytes handed over again")
 	})
 }
 

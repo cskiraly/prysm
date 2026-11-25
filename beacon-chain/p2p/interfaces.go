@@ -62,9 +62,10 @@ type (
 	}
 
 	// SegmentGossiper lets the sync layer tell the payload's path the shape and topic of each group
-	// whose segment passed validation.
+	// whose segment passed validation, and hand it a coded group's committed bytes once recovered.
 	SegmentGossiper interface {
 		SegmentGroupSeen(group [32]byte, topic string, count, threshold int)
+		SegmentGroupCommitted(group [32]byte, committed []byte)
 	}
 
 	// SetStreamHandler configures p2p to handle streams of a certain topic ID.

@@ -43,13 +43,17 @@ type groupShape struct {
 	topic string
 	// dropped is set once the live window passed the group and its segments went.
 	dropped bool
+	// committed is the group's committed bytes where the node already holds them (NoteCommitted),
+	// until the router's decode takes them or the group's segments go.
+	committed []byte
 }
 
 // DecodeCounts is what the payload type's decodes count, for the node's metrics.
 type DecodeCounts struct {
 	// DecodeRecoveries counts the decodes that recovered the group's committed bytes from its held
-	// segments (segments.RecoverAndVerify).
-	DecodeRecoveries atomic.Int64
+	// segments (segments.RecoverAndVerify); DecodeHanded those that took the bytes the node already
+	// held (NoteCommitted).
+	DecodeRecoveries, DecodeHanded atomic.Int64
 }
 
 // PayloadType is the execution payload on SEACAST's path (seacast.md §6.1): one group per
@@ -134,6 +138,25 @@ func (t *PayloadType) NoteGroupSlot(root, topic string, n, k int) (uint64, bool)
 	return slot, true
 }
 
+// NoteCommitted hands the type the bytes a coded group's root commits to, once the node holds them: its
+// reassembler recovered them and checked them against the root. The router's decode of the group then
+// takes them instead of recovering them again from the held segments. It still cuts them again, as the
+// publisher did, and the cut must give the held segments' descriptor and group key, so bytes of another
+// group fail the decode. A group not yet noted, a plain one (the router never decodes it), one whose
+// segments went and one that has its bytes already are left as they are. The type keeps the slice
+// until the decode takes it or the live window passes the group, and writes nothing to it; nor may the
+// caller.
+func (t *PayloadType) NoteCommitted(root string, committed []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	g, ok := t.groups[root]
+	if !ok || g.n <= g.k || g.dropped || g.committed != nil || len(committed) == 0 {
+		return
+	}
+	g.committed = committed
+	t.groups[root] = g
+}
+
 // RecordSlots is how long the type keeps a group's record after the group's slot: two epochs of the
 // configuration the type was made with (64 slots at 32 an epoch), the span of the node's seen cache,
 // longer than any copy of the group is offered or relayed. While the record stands, a late segment,
@@ -160,6 +183,7 @@ func (t *PayloadType) Advance(slot, window uint64) {
 		}
 		if !g.dropped && g.slot+window <= slot {
 			g.dropped = true
+			g.committed = nil
 			t.groups[root] = g
 			t.store.Drop(root)
 		}
@@ -234,12 +258,20 @@ func (*PayloadType) Cross(string, uint32) (pubsub.GroupIndex, string, bool) {
 func (*PayloadType) Family(string) string { return PayloadTypeName }
 
 // Decode is the payload's decode (seacast.md §4.6's T.decode). On the router's goroutine it takes
-// the held segments' wire bytes from the store. Off it, it recovers the committed bytes from them,
-// cuts them again as the publisher cut them, gives the cut the held segments' slot, block root and
-// group key, checks that the cut is the group's, and frames every missing index as the broadcaster
-// frames a segment. So each rebuilt message is byte for byte the source's, and has the id the
-// network already uses for it.
+// the held segments' wire bytes from the store, and the group's committed bytes where the node holds
+// them already (NoteCommitted). Off it, it recovers the committed bytes from the held segments if it
+// has not got them, cuts them again as the publisher cut them, gives the cut the held segments' slot,
+// block root and group key, checks that the cut is the group's, and frames every missing index as the
+// broadcaster frames a segment. So each rebuilt message is byte for byte the source's, and has the id
+// the network already uses for it.
 func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pubsub.Message, bool) {
+	var committed []byte
+	t.mu.Lock()
+	if g, ok := t.groups[root]; ok && g.committed != nil {
+		committed, g.committed = g.committed, nil
+		t.groups[root] = g
+	}
+	t.mu.Unlock()
 	chunks := make(map[uint32][]byte, len(held))
 	var topic string
 	for _, i := range held {
@@ -253,7 +285,7 @@ func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pub
 		}
 	}
 	return func() (map[uint32]*pubsub.Message, bool) {
-		out, err := rebuildMissing(root, topic, chunks, &t.counts)
+		out, err := rebuildMissing(root, topic, chunks, committed, &t.counts)
 		if err != nil {
 			return nil, false
 		}
@@ -264,8 +296,9 @@ func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pub
 var errDecode = errors.New("payload decode")
 
 // rebuildMissing is Decode's work: the missing segments of the group whose key is group, from the
-// held segments' wire bytes, as wire messages on topic. A recovery is counted in counts.
-func rebuildMissing(group, topic string, chunks map[uint32][]byte, counts *DecodeCounts) (map[uint32]*pubsub.Message, error) {
+// held segments' wire bytes, as wire messages on topic. A coded group's committed bytes are handed, when
+// the node holds them already, and recovered from the held segments otherwise; counts counts which.
+func rebuildMissing(group, topic string, chunks map[uint32][]byte, handed []byte, counts *DecodeCounts) (map[uint32]*pubsub.Message, error) {
 	if topic == "" || len(chunks) == 0 {
 		return nil, fmt.Errorf("%w: no held segment", errDecode)
 	}
@@ -300,11 +333,17 @@ func rebuildMissing(group, topic string, chunks map[uint32][]byte, counts *Decod
 	parity := len(segs) - k
 	var committed []byte
 	var err error
-	if d.Version == segments.VersionCoded {
+	switch {
+	case d.Version != segments.VersionCoded:
+		committed, err = segments.Join(d, h, segs)
+	case handed != nil:
+		// Checked against the root where the node got them. The cut below must give the held
+		// segments' count, descriptor (its root included) and group key, so other bytes fail the decode.
+		counts.DecodeHanded.Add(1)
+		committed = handed
+	default:
 		counts.DecodeRecoveries.Add(1)
 		committed, err = segments.RecoverAndVerify(d, h, segs)
-	} else {
-		committed, err = segments.Join(d, h, segs)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errDecode, err)

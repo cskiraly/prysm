@@ -126,19 +126,8 @@ func TestPayloadTypeDecodeIsTheSource(t *testing.T) {
 			typ, held := g.holding(t, seed)
 			cells, ok := typ.Decode(g.group, held)()
 			require.Equal(t, true, ok)
-			require.Equal(t, g.n-g.k, len(cells))
-			for i := range g.n {
-				idx := uint32(i) // lint:ignore uintcast -- an index below the group's count.
-				m, rebuilt := cells[idx]
-				if slices.Contains(held, idx) {
-					require.Equal(t, false, rebuilt, "held index %d rebuilt", i)
-					continue
-				}
-				require.Equal(t, true, rebuilt, "missing index %d not rebuilt", i)
-				require.Equal(t, g.topic, m.GetTopic())
-				require.Equal(t, true, bytes.Equal(g.wire[i].Data, m.GetData()), "index %d: wire bytes differ", i)
-				require.Equal(t, p2p.MsgID(g.wire[i]), p2p.MsgID(m.Message), "index %d: message id differs", i)
-			}
+			requireSourceCells(t, g, held, cells)
+			require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
 		})
 	}
 }
@@ -160,6 +149,124 @@ func TestPayloadTypeDecodeRefuses(t *testing.T) {
 		typ.Store().Put(g.group, 1000, &pubsub.Message{Message: other.wire[0]})
 		_, ok := typ.Decode(g.group, append(held, 1000))()
 		require.Equal(t, false, ok)
+	})
+}
+
+// committed is the bytes the group's root commits to: its systematic segments, in order.
+func (g *sourceGroup) committed(t testing.TB) []byte {
+	var out []byte
+	for _, s := range g.segs[:g.k] {
+		out = append(out, s.Data...)
+	}
+	require.Equal(t, g.segs[0].Descriptor.TotalLength, uint64(len(out)))
+	return out
+}
+
+// requireSourceCells checks a decode's messages: the source's wire bytes and message id for every index
+// not held, nothing for a held one.
+func requireSourceCells(t *testing.T, g *sourceGroup, held []uint32, cells map[uint32]*pubsub.Message) {
+	t.Helper()
+	require.Equal(t, g.n-len(held), len(cells))
+	for i := range g.n {
+		idx := uint32(i) // lint:ignore uintcast -- an index below the group's count.
+		m, rebuilt := cells[idx]
+		if slices.Contains(held, idx) {
+			require.Equal(t, false, rebuilt, "held index %d rebuilt", i)
+			continue
+		}
+		require.Equal(t, true, rebuilt, "missing index %d not rebuilt", i)
+		require.Equal(t, g.topic, m.GetTopic())
+		require.Equal(t, true, bytes.Equal(g.wire[i].Data, m.GetData()), "index %d: wire bytes differ", i)
+		require.Equal(t, p2p.MsgID(g.wire[i]), p2p.MsgID(m.Message), "index %d: message id differs", i)
+	}
+}
+
+// TestPayloadTypeDecodeTakesHandedBytes: with the group's committed bytes handed over (NoteCommitted, as
+// the validator does once its reassembler recovered them), the decode takes them instead of recovering,
+// and rebuilds what it rebuilds from a recovery. It takes them once. Bytes that are not the root's fail
+// the decode, through the checks of the cut: its count, its descriptor with the root, and its group key.
+func TestPayloadTypeDecodeTakesHandedBytes(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	g := newSourceGroup(t, seacastEnvelope(t, 40, 4096, false))
+	committed := g.committed(t)
+
+	for seed := range uint64(5) {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			typ, held := g.holding(t, seed)
+			typ.NoteCommitted(g.group, committed)
+			cells, ok := typ.Decode(g.group, held)()
+			require.Equal(t, true, ok)
+			requireSourceCells(t, g, held, cells)
+			require.Equal(t, int64(1), typ.Counts().DecodeHanded.Load())
+			require.Equal(t, int64(0), typ.Counts().DecodeRecoveries.Load())
+
+			// Taken once: a second decode of the group recovers, and rebuilds the same.
+			cells, ok = typ.Decode(g.group, held)()
+			require.Equal(t, true, ok)
+			requireSourceCells(t, g, held, cells)
+			require.Equal(t, int64(1), typ.Counts().DecodeHanded.Load())
+			require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
+		})
+	}
+	t.Run("the first bytes stay", func(t *testing.T) {
+		typ, held := g.holding(t, 1)
+		typ.NoteCommitted(g.group, committed)
+		typ.NoteCommitted(g.group, []byte("not the group's"))
+		cells, ok := typ.Decode(g.group, held)()
+		require.Equal(t, true, ok)
+		requireSourceCells(t, g, held, cells)
+	})
+	t.Run("another group's bytes", func(t *testing.T) {
+		other := newSourceGroup(t, seacastEnvelope(t, 41, 4096, false))
+		typ, held := g.holding(t, 1)
+		typ.NoteCommitted(g.group, other.committed(t))
+		_, ok := typ.Decode(g.group, held)()
+		require.Equal(t, false, ok)
+		require.Equal(t, int64(1), typ.Counts().DecodeHanded.Load())
+	})
+	t.Run("one bit off", func(t *testing.T) {
+		bad := bytes.Clone(committed)
+		bad[len(bad)/2] ^= 1
+		typ, held := g.holding(t, 1)
+		typ.NoteCommitted(g.group, bad)
+		_, ok := typ.Decode(g.group, held)()
+		require.Equal(t, false, ok)
+		require.Equal(t, int64(1), typ.Counts().DecodeHanded.Load())
+	})
+	t.Run("released when the window passes the group", func(t *testing.T) {
+		typ, held := g.holding(t, 1)
+		typ.NoteCommitted(g.group, committed)
+		typ.Advance(7+2, 2) // the group's slot is 7: its segments go at 9 with a window of 2
+		for _, i := range held {
+			typ.Store().Put(g.group, i, &pubsub.Message{Message: g.wire[i]})
+		}
+		_, ok := typ.Decode(g.group, held)()
+		require.Equal(t, true, ok)
+		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load(), "the bytes outlived the group's segments")
+		require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
+	})
+	t.Run("not kept for a plain group", func(t *testing.T) {
+		p := segmentauth.DefaultParams()
+		p.Coded = false
+		segs, err := segmentauth.SegmentMessagesForEnvelope(seacastEnvelope(t, 40, 4096, false), p)
+		require.NoError(t, err)
+		plain := &sourceGroup{segs: segs, topic: g.topic, group: string(segs[0].Group), n: len(segs), k: len(segs)}
+		for _, s := range segs {
+			pb, err := s.ToProto()
+			require.NoError(t, err)
+			var buf bytes.Buffer
+			_, err = encoder.SszNetworkEncoder{}.EncodeGossip(&buf, pb)
+			require.NoError(t, err)
+			tp := plain.topic
+			plain.wire = append(plain.wire, &pubsubpb.Message{Data: buf.Bytes(), Topic: &tp})
+		}
+		typ, held := plain.holding(t, 1)
+		typ.NoteCommitted(plain.group, plain.committed(t))
+		cells, ok := typ.Decode(plain.group, held)()
+		require.Equal(t, true, ok)
+		require.Equal(t, 0, len(cells))
+		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load())
+		require.Equal(t, int64(0), typ.Counts().DecodeRecoveries.Load())
 	})
 }
 
@@ -271,7 +378,8 @@ func TestPayloadTypeRecordSpanFollowsTheEpoch(t *testing.T) {
 
 // BenchmarkPayloadTypeDecode is the decoder's cost: the decode from K held of an incompressible envelope of about
 // 1 MiB, and of the largest the publisher still codes (128 data segments of 16 KiB, just under 2 MiB; a larger
-// envelope is a plain group, which never decodes).
+// envelope is a plain group, which never decodes). Each recovers the committed bytes from the held segments, or
+// takes them handed over, as the validator hands them over once its reassembler recovered them.
 func BenchmarkPayloadTypeDecode(b *testing.B) {
 	params.SetupTestConfigCleanup(b)
 	for _, c := range []struct {
@@ -284,12 +392,20 @@ func BenchmarkPayloadTypeDecode(b *testing.B) {
 				b.Fatalf("%s: a plain group of %d segments", c.name, g.n)
 			}
 			typ, held := g.holding(b, 3)
-			for b.Loop() {
-				if _, ok := typ.Decode(g.group, held)(); !ok {
-					b.Fatal("decode failed")
-				}
+			committed := g.committed(b)
+			for _, handed := range []bool{false, true} {
+				b.Run(map[bool]string{false: "recovered", true: "handed"}[handed], func(b *testing.B) {
+					for b.Loop() {
+						if handed {
+							typ.NoteCommitted(g.group, committed) // as the validator hands them over
+						}
+						if _, ok := typ.Decode(g.group, held)(); !ok {
+							b.Fatal("decode failed")
+						}
+					}
+					b.ReportMetric(float64(g.n), "segments")
+				})
 			}
-			b.ReportMetric(float64(g.n), "segments")
 		})
 	}
 }
