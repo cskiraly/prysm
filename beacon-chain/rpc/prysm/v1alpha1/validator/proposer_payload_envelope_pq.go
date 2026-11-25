@@ -5,6 +5,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	consensusblocks "github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
@@ -119,8 +120,19 @@ func (vs *Server) PublishExecutionPayloadEnvelopeContentsPQ(ctx context.Context,
 			log.WithError(err).Error("Failed to broadcast PQ data column sidecars")
 		}
 	}
-	if err := vs.P2P.Broadcast(ctx, req); err != nil {
-		return status.Errorf(codes.Internal, "Could not broadcast envelope: %v", err)
+	// SEACAST carries a PQ envelope's payload as it carries a Gloas one's: as segments only with
+	// --seacast-payload-only, otherwise the whole envelope with its segments beside it, sent off the
+	// call's path while the envelope is imported.
+	plog := log.WithField("slot", req.Message.Payload.SlotNumber)
+	if features.Get().SeacastPayloadOnly {
+		if err := vs.publishPayloadOnly(ctx, plog, req, bytesutil.ToBytes32(req.Message.BeaconBlockRoot)); err != nil {
+			return status.Errorf(codes.Internal, "Could not broadcast envelope: %v", err)
+		}
+	} else {
+		if err := vs.P2P.Broadcast(ctx, req); err != nil {
+			return status.Errorf(codes.Internal, "Could not broadcast envelope: %v", err)
+		}
+		go vs.publishEnvelopeSegments(context.WithoutCancel(ctx), plog, req)
 	}
 	// The DA check on import needs the columns first.
 	if len(verified) > 0 {

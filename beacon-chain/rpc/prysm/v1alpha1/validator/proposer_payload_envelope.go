@@ -8,7 +8,10 @@ import (
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/blockchain/kzg"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/cache"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/core/peerdas"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p"
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/state"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/verification/segmentauth"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	fieldparams "github.com/OffchainLabs/prysm/v7/config/fieldparams"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	consensusblocks "github.com/OffchainLabs/prysm/v7/consensus-types/blocks"
@@ -22,11 +25,22 @@ import (
 	"github.com/OffchainLabs/prysm/v7/runtime/version"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+// envelopeFallbackCounter counts the payload-only publishes (--seacast-payload-only) that sent the
+// whole envelope, by the reason the segments did not go out, and under fallback-failed those whose
+// whole envelope also failed.
+var envelopeFallbackCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "execution_payload_segment_fallback_total",
+	Help: "Payload-only publishes that sent the whole execution payload envelope, by reason; fallback-failed counts those whose whole envelope also failed.",
+}, []string{"reason"})
 
 // storeExecutionPayloadEnvelope creates and caches the execution payload envelope
 // after the block is fully built (state root set), returning the envelope for the caller to bundle.
@@ -217,12 +231,26 @@ func (vs *Server) PublishExecutionPayloadEnvelopeV2(
 		}
 	}
 
-	if err := vs.P2P.Broadcast(ctx, signed); err != nil {
+	payloadOnly := features.Get().SeacastPayloadOnly
+	if payloadOnly {
+		if err := vs.publishPayloadOnly(ctx, log, signed, beaconBlockRoot); err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to broadcast execution payload envelope: %v", err)
+		}
+	} else if err := vs.P2P.Broadcast(ctx, signed); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to broadcast execution payload envelope: %v", err)
 	}
 
 	// Import in the background so the reveal is not delayed past the PTC deadline.
 	go vs.importPublishedEnvelope(log, verifiedSidecars, roSigned)
+
+	if !payloadOnly {
+		// Segments go out in addition to the whole envelope, never instead of it. Peers that do
+		// not subscribe to the segment topic must still receive the payload, and the feature can
+		// be turned off network-wide without stranding anyone. Off the RPC path, so a slow
+		// segment publish cannot hold the validator's call; the context keeps the request's
+		// values but not its cancellation, which fires when this handler returns.
+		go vs.publishEnvelopeSegments(context.WithoutCancel(ctx), log, signed)
+	}
 
 	log.WithField("duration", time.Since(start)).Info("Published execution payload envelope")
 
@@ -386,4 +414,96 @@ func (vs *Server) setParentExecutionRequests(ctx context.Context, sBlk interface
 		return errors.Wrap(err, "could not get parent execution payload envelope")
 	}
 	return sBlk.SetParentExecutionRequests(signedEnvelope.Message.ExecutionRequests)
+}
+
+// publishEnvelopeSegments broadcasts the envelope, a Gloas or a PQ one, as authenticated gossip
+// segments.
+//
+// Runs in its own goroutine, after the whole envelope has gone out. Every failure here is logged
+// and swallowed: a node that cannot segment is merely not helping, and failing the publish call
+// would turn an optimisation into a proposal failure.
+func (vs *Server) publishEnvelopeSegments(
+	ctx context.Context,
+	log *logrus.Entry,
+	signed proto.Message,
+) {
+	if !features.Get().EnableSegmentedPayloadGossip {
+		return
+	}
+	// The default segmentation, until the bid carries the one the builder committed to.
+	segs, err := segmentauth.SegmentMessagesForEnvelope(signed, segmentauth.DefaultParams())
+	if err != nil {
+		// Segmentation that fails here would also fail on every peer, so publishing the
+		// segments anyway would only earn us invalid-message penalties.
+		log.WithError(err).Warn("Could not derive payload segments, publishing envelope unsegmented")
+		return
+	}
+	if err := vs.P2P.BroadcastSegments(ctx, segs); err != nil {
+		if errors.Is(err, p2p.ErrSegmentsNoPeers) {
+			// Not helping, not failing: the whole envelope has gone out.
+			log.Debug("No peers on the segment topic, envelope published unsegmented")
+			return
+		}
+		log.WithError(err).Warn("Could not broadcast execution payload segments")
+		return
+	}
+	log.WithField("segments", len(segs)).Debug("Broadcast execution payload segments")
+}
+
+// The reasons a payload-only publish falls back to the whole envelope, and the counter's label for
+// a fallback that also failed.
+const (
+	fallbackSegmentError = "segment-error" // the envelope could not be segmented
+	fallbackNoPeers      = "no-peers"      // the segment topic has no peers
+	fallbackNoEnqueue    = "no-enqueue"    // the router queued the segments to no peer
+	fallbackPublishError = "publish-error" // the segments could not be published for another reason
+	fallbackFailed       = "fallback-failed"
+)
+
+// publishPayloadOnly sends the envelope, a Gloas or a PQ one, as segments only
+// (--seacast-payload-only). It runs on the RPC path, so that when the segments cannot go out the
+// whole envelope still can before the call returns. Each fallback is logged with the slot, the
+// block root and the reason, and counted under the reason; a whole envelope that also fails is
+// counted under fallback-failed and its error returned.
+func (vs *Server) publishPayloadOnly(
+	ctx context.Context,
+	log *logrus.Entry,
+	signed proto.Message,
+	blockRoot [32]byte,
+) error {
+	reason, err := vs.broadcastSegmentsOnly(ctx, signed)
+	if err == nil {
+		return nil
+	}
+	log.WithFields(logrus.Fields{
+		"blockRoot": fmt.Sprintf("%#x", blockRoot),
+		"reason":    reason,
+	}).WithError(err).Warn("Segments not sent, publishing the whole execution payload envelope")
+	envelopeFallbackCounter.WithLabelValues(reason).Inc()
+	if err := vs.P2P.Broadcast(ctx, signed); err != nil {
+		envelopeFallbackCounter.WithLabelValues(fallbackFailed).Inc()
+		return err
+	}
+	return nil
+}
+
+// broadcastSegmentsOnly segments the envelope and publishes the segments, and on failure returns
+// the fallback's reason with the error.
+func (vs *Server) broadcastSegmentsOnly(ctx context.Context, signed proto.Message) (string, error) {
+	// The default segmentation, until the bid carries the one the builder committed to.
+	segs, err := segmentauth.SegmentMessagesForEnvelope(signed, segmentauth.DefaultParams())
+	if err != nil {
+		return fallbackSegmentError, err
+	}
+	err = vs.P2P.BroadcastSegments(ctx, segs)
+	switch {
+	case err == nil:
+		return "", nil
+	case errors.Is(err, p2p.ErrSegmentsNoPeers):
+		return fallbackNoPeers, err
+	case errors.Is(err, p2p.ErrSegmentsNotEnqueued):
+		return fallbackNoEnqueue, err
+	default:
+		return fallbackPublishError, err
+	}
 }
