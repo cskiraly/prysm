@@ -2027,6 +2027,10 @@ def prysm_deps():
         patch_args = ["-p1"],
         patches = [
             "//third_party:com_github_libp2p_go_libp2p_pubsub-cloneof.patch",
+            # This branch carries the SEACAST fork in third_party/go-libp2p-pubsub, which
+            # go.mod's replace selects for go build and go test. Bazel would build this
+            # upstream module instead, so this patch makes it fail to compile, naming why.
+            "//third_party:com_github_libp2p_go_libp2p_pubsub-seacast-devnet-guard.patch",
         ],
         sum = "h1:9eyitBeXjW09XyDQF+EYL6RGRJ50Df1G9aTjB3XOMQQ=",
         version = "v0.19.0",
