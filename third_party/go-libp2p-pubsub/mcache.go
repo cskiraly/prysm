@@ -58,6 +58,14 @@ func (mc *MessageCache) Put(msg *Message) {
 	mc.history[0] = append(mc.history[0], CacheEntry{mid: mid, topic: msg.GetTopic()})
 }
 
+// PutQuiet caches msg for IWANT answers and ages it out like Put, but keeps it out of
+// GetGossipIDs: a frame a node may serve without announcing it (Rebuilt).
+func (mc *MessageCache) PutQuiet(msg *Message) {
+	mid := mc.msgID(msg)
+	mc.msgs[mid] = msg
+	mc.history[0] = append(mc.history[0], CacheEntry{mid: mid})
+}
+
 func (mc *MessageCache) Get(mid string) (*Message, bool) {
 	m, ok := mc.msgs[mid]
 	return m, ok

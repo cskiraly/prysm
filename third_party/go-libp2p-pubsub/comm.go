@@ -49,6 +49,28 @@ func (p *PubSub) getHelloPacket() *RPC {
 		}
 		rpc.Subscriptions = append(rpc.Subscriptions, as)
 	}
+
+	// Partial interest in topics we joined but did not subscribe to. Sent with subscribe=false,
+	// so a peer that does not implement it reads a no-op unsubscribe. Without this the interest
+	// would be lost on every new stream, since it is announced once when set.
+	for t := range p.myPartialInterest {
+		if subscriptions[t] {
+			// A subscription already carries the partial flags and supersedes the interest.
+			continue
+		}
+		var requestPartial, supportsPartialMessages bool
+		if ts, ok := p.myTopics[t]; ok {
+			requestPartial = ts.requestPartialMessages
+			supportsPartialMessages = ts.supportsPartialMessages
+		}
+		rpc.Subscriptions = append(rpc.Subscriptions, &pb.RPC_SubOpts{
+			Topicid:                proto.String(t),
+			Subscribe:              proto.Bool(false),
+			RequestsPartial:        &requestPartial,
+			SupportsSendingPartial: &supportsPartialMessages,
+		})
+	}
+
 	return &rpc
 }
 
@@ -218,6 +240,20 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC) {
 	writeRpc := func(rpc *RPC) error {
+		if d := time.Duration(p.sendDelay.Load()); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if rpc = outgoing.dropSettledProbes(rpc); rpc == nil {
+			return nil // only a probe settled while queued was left: not written (probe_settled)
+		}
+		if rpc.lostOnly {
+			outgoing.noteAsksWritten(rpc) // its asks were lost on the wire: reported as written
+			return nil                    // and nothing to write
+		}
 		size := uint64(proto.Size(&rpc.RPC))
 
 		buf := pool.Get(varint.UvarintSize(size) + int(size))
@@ -234,13 +270,21 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			return err
 		}
 
-		start := time.Now()
+		wt := time.Now()
 		_, err = s.Write(out)
-		writeDuration := time.Since(start)
+		writeDuration := time.Since(wt)
+		outgoing.noteWrite(writeDuration)
 		if err != nil {
+			// Not reported: the asks never left. The writer resets the stream, the peer is declared
+			// dead (handlePeerDead), and what waits for their report goes with it (v05PeerGone).
 			p.rpcLogger.Debug("failed to send message", "peer", s.Conn().RemotePeer(), "rpc", rpc, "err", err)
 			return err
 		}
+		// v0.5's E: an ask's promise starts at its write, once the transport has taken the frame,
+		// so that a write that blocks holds no peer to an ask it has not received.
+		outgoing.noteAsksWritten(rpc)
+		outgoing.noteRepairWritten(rpc)
+		p.upload.note(rpc, len(out))
 		p.rpcLogger.Debug("sent", "peer", s.Conn().RemotePeer(), "rpc", rpc)
 		p.tracer.SendRPCCompleted(rpc, s.Conn().RemotePeer(), writeDuration)
 		return nil

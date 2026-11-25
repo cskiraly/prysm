@@ -87,13 +87,13 @@ type extensionsState struct {
 	peerExtensions    map[peer.ID]PeerExtensions // peer's extensions
 	sentExtensions    map[peer.ID]struct{}
 	reportMisbehavior func(peer.ID)
-	sendRPC           func(p peer.ID, r *RPC, urgent bool)
+	sendRPC           func(p peer.ID, r *RPC, urgent bool) bool
 	testExtension     *testExtension
 
 	partialMessagesExtension partialMessageInterface
 }
 
-func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool)) *extensionsState {
+func newExtensionsState(myExtensions PeerExtensions, reportMisbehavior func(peer.ID), sendRPC func(peer.ID, *RPC, bool) bool) *extensionsState {
 	return &extensionsState{
 		myExtensions:      myExtensions,
 		peerExtensions:    make(map[peer.ID]PeerExtensions),
@@ -282,9 +282,27 @@ func (r partialMessageRouter) MeshPeers(topic string) iter.Seq[peer.ID] {
 			peerSet = r.gs.getFanoutPeersForPublishing(topic)
 		}
 
+		wants := func(peer peer.ID) bool {
+			return r.gs.extensions.peerExtensions[peer].PartialMessages &&
+				(r.gs.iRequestPartial(topic) && r.gs.peerSupportsSendingPartial(peer, topic)) || (r.gs.iSupportSendingPartial(topic) && r.gs.peerRequestsPartial(peer, topic))
+		}
+
 		for peer := range peerSet {
-			if r.gs.extensions.peerExtensions[peer].PartialMessages &&
-				(r.gs.iRequestPartial(topic) && r.gs.peerSupportsSendingPartial(peer, topic)) || (r.gs.iSupportSendingPartial(topic) && r.gs.peerRequestsPartial(peer, topic)) {
+			if wants(peer) {
+				if !yield(peer) {
+					return
+				}
+			}
+		}
+
+		// Peers that declared partial interest without subscribing are in neither the mesh nor
+		// the fanout set -- both are built from the topic's subscribers. They asked to be sent
+		// partial messages on this topic, so this is the only place they can be reached.
+		for peer := range r.gs.p.partialInterestPeers(topic) {
+			if _, alreadySeen := peerSet[peer]; alreadySeen {
+				continue
+			}
+			if wants(peer) {
 				if !yield(peer) {
 					return
 				}
@@ -293,9 +311,11 @@ func (r partialMessageRouter) MeshPeers(topic string) iter.Seq[peer.ID] {
 	}
 }
 
-// SendRPC implements partialmessages.Router.
-func (r partialMessageRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) {
-	r.gs.sendRPC(p, &RPC{
+// SendRPC implements partialmessages.Router. The bool reports whether the RPC was admitted to the
+// peer's send queue, which the extension passes back to the application so it records only what
+// actually went out. See GossipSubRouter.sendRPC for why an application needs that.
+func (r partialMessageRouter) SendRPC(p peer.ID, rpc *pubsub_pb.PartialMessagesExtension, urgent bool) bool {
+	return r.gs.sendRPC(p, &RPC{
 		RPC: pubsub_pb.RPC{
 			Partial: rpc,
 		},

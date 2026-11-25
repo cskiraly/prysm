@@ -94,6 +94,22 @@ type PubSub struct {
 
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
+	// hose, when set, is the node-wide window over frames in flight (WithHoseWindow).
+	hose *hoseWindow
+	// queueHooks, when set, installs the writer's side of the v0.5 rules on each new peer queue
+	// (WithSpecV05).
+	queueHooks func(*rpcQueue)
+	// admitMsg, when set, decides whether a received message enters at all: at ingress, before
+	// Preprocess and validation, and again when validation finishes (SEACAST's gate,
+	// seacast_accept.go: a chunk of a group past its lifetime is ignored). processLoop goroutine.
+	admitMsg func(*Message) bool
+	// onVerdict, when set, hears each non-local message's validation verdict (seacast_accept.go).
+	onVerdict func(src peer.ID, msg *Message, result ValidationResult)
+	// admitUnsubscribed, when set, admits a received message on a topic we neither subscribe to nor
+	// relay (seacast_want.go: the sampler's answers). processLoop goroutine.
+	admitUnsubscribed func(m *pb.Message, from peer.ID) bool
+	// upload counts the bytes this node has written to its streams, by class (upload.go).
+	upload uploadCounter
 
 	// incoming messages from other peers
 	incoming chan incomingUnion
@@ -154,6 +170,17 @@ type PubSub struct {
 	// topics tracks which topics each of our peers are subscribed to
 	topics map[string]map[peer.ID]peerTopicState
 
+	// partialInterest tracks peers that request partial messages on a topic they are *not*
+	// subscribed to. It is deliberately separate from topics rather than a flag inside
+	// peerTopicState: everything that selects mesh peers, gossip targets and full-message
+	// recipients reads topics, and a partial-interest peer must appear in none of those. A
+	// separate map makes that true by construction instead of by remembering to filter.
+	partialInterest map[string]map[peer.ID]peerTopicState
+
+	// myPartialInterest is the same thing from our side: topics we have joined and want
+	// partial messages on without subscribing. Announced to new peers in the hello packet.
+	myPartialInterest map[string]bool
+
 	// sendMsg handles messages that have been validated
 	sendMsg chan *Message
 
@@ -174,6 +201,13 @@ type PubSub struct {
 	blacklistPeer chan peer.ID
 
 	peers map[peer.ID]*rpcQueue
+
+	// sendDelay, when set (test-only), stalls this
+	// node's outbound writer per RPC, so its rpcQueue backs up and overflows through the
+	// normal doDropRPC path -- real queue pressure from a slow drain, not a probabilistic
+	// strip (that is F2a). Models a node whose send path cannot keep up. Atomic, in nanoseconds: a fixture
+	// may set it after the network is up (seacast_probewrite_test.go).
+	sendDelay atomic.Int64
 
 	inboundStreamsMx sync.Mutex
 	inboundStreams   map[peer.ID]inboundHandler
@@ -275,6 +309,8 @@ type Message struct {
 	ReceivedFrom  peer.ID
 	ValidatorData any
 	Local         bool
+	// rebuilt marks a publication of chunks this node rebuilt (WithRebuiltPublication).
+	rebuilt bool
 }
 
 func (m *Message) GetFrom() peer.ID {
@@ -311,6 +347,27 @@ type RPC struct {
 
 	// unexported on purpose, not sending this over the wire
 	from peer.ID
+	// wire size, set by the router before the RPC enters an outbound queue (queue accounting)
+	size int
+	// solicited marks an IWANT answer: the peer asked for these frames after any bitmap it
+	// sent, so the dispatch-time cancel and projection leave them alone (havebitmap.go).
+	solicited bool
+	// replay marks an owed answer the queue took back in once there was room (A′, rpc_queue.go):
+	// it takes room from no push; among the payload's frames it competes as an ordinary answer, and
+	// it makes no other entry ahead of it wait for the hose nor is chosen ahead of one (fullLocked,
+	// hasDataLocked, replayLead).
+	replay bool
+	// own marks a push of chunks this node published and did not rebuild (choose.go, §4.12's
+	// own_chunk), set at enqueue; never an answer.
+	own bool
+	// repair marks a push of chunks this node rebuilt (§4.6's push_rebuilt), set by the router before it
+	// enqueues it; the writer counts the frames written (OutboundStat.RepairFrames). Measurement only.
+	repair bool
+	// asks is every ask id the writer writes with this RPC, lost ones included, for v0.5's E
+	// (specv05.go): set by the writer as it pops the RPC, read at the write. lostOnly marks an RPC
+	// whose asks a class loss took entirely: reported at the write, then nothing is written.
+	asks     []string
+	lostOnly bool
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -658,6 +715,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		mySubs:                make(map[string]map[*Subscription]struct{}),
 		myRelays:              make(map[string]int),
 		topics:                make(map[string]map[peer.ID]peerTopicState),
+		partialInterest:       make(map[string]map[peer.ID]peerTopicState),
+		myPartialInterest:     make(map[string]bool),
 		peers:                 make(map[peer.ID]*rpcQueue),
 		inboundStreams:        make(map[peer.ID]inboundHandler),
 		blacklist:             NewMapBlacklist(),
@@ -1116,6 +1175,10 @@ func (p *PubSub) handlePendingPeers() {
 		}
 
 		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+		rpcQueue.hose, rpcQueue.peer = p.hose, pid
+		if p.queueHooks != nil {
+			p.queueHooks(rpcQueue)
+		}
 		p.peers[pid] = rpcQueue
 		go p.handleNewPeer(p.ctx, pid, rpcQueue)
 	}
@@ -1129,6 +1192,9 @@ func (p *PubSub) onClosedIncomingStream(pid peer.ID, proto protocol.ID) {
 }
 
 func (p *PubSub) clearPeerFromTopicsState(pid peer.ID) {
+	for t := range p.partialInterest {
+		p.clearPartialInterest(t, pid)
+	}
 	for t, tmap := range p.topics {
 		if _, ok := tmap[pid]; ok {
 			delete(tmap, pid)
@@ -1175,6 +1241,10 @@ func (p *PubSub) handleDeadPeers() {
 			// we respawn the writer as we need to ensure there is a stream active
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
 			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
+			rpcQueue.hose, rpcQueue.peer = p.hose, pid
+			if p.queueHooks != nil {
+				p.queueHooks(rpcQueue)
+			}
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
 		}
@@ -1337,6 +1407,116 @@ func (p *PubSub) handleRemoveRelay(topic string) {
 			p.rt.Leave(topic)
 		}
 	}
+}
+
+// setPartialInterestFromPeer records a peer's partial-message interest in a topic it is not
+// subscribed to. An announcement with both partial flags clear withdraws it, which is the same
+// wire form as an ordinary unsubscribe -- correctly, since both mean "drop my state for this
+// topic".
+// Only called from processLoop.
+func (p *PubSub) setPartialInterestFromPeer(topic string, pid peer.ID, subopt *pb.RPC_SubOpts) {
+	if !subopt.GetRequestsPartial() && !subopt.GetSupportsSendingPartial() {
+		p.clearPartialInterest(topic, pid)
+		return
+	}
+
+	tmap, ok := p.partialInterest[topic]
+	if !ok {
+		tmap = make(map[peer.ID]peerTopicState)
+		p.partialInterest[topic] = tmap
+	}
+	// Derived exactly as for a subscription, so the flags mean the same thing whether or not the
+	// peer is subscribed. Whether "requests implies supports" is the right default is a
+	// pre-existing question and not one to settle here.
+	tmap[pid] = peerTopicState{
+		requestsPartial: subopt.GetRequestsPartial(),
+		supportsPartial: subopt.GetRequestsPartial() || subopt.GetSupportsSendingPartial(),
+	}
+}
+
+// clearPartialInterest drops a peer's partial-only interest in a topic.
+// Only called from processLoop.
+func (p *PubSub) clearPartialInterest(topic string, pid peer.ID) {
+	tmap, ok := p.partialInterest[topic]
+	if !ok {
+		return
+	}
+	delete(tmap, pid)
+	if len(tmap) == 0 {
+		delete(p.partialInterest, topic)
+	}
+}
+
+// PartialInterestState returns a peer's partial-only interest in a topic.
+// Only called from processLoop.
+func (p *PubSub) partialInterestState(topic string, pid peer.ID) (peerTopicState, bool) {
+	tmap, ok := p.partialInterest[topic]
+	if !ok {
+		return peerTopicState{}, false
+	}
+	state, ok := tmap[pid]
+
+	return state, ok
+}
+
+// partialInterestPeers iterates the peers with partial-only interest in a topic.
+// Only called from processLoop.
+func (p *PubSub) partialInterestPeers(topic string) map[peer.ID]peerTopicState {
+	return p.partialInterest[topic]
+}
+
+// announcePartialInterest tells every peer whether we want partial messages on a topic we have
+// joined but not subscribed to.
+//
+// It is sent as subscribe=false so peers do not add us to their mesh, count us as a topic
+// subscriber, or forward us full messages -- none of which we are asking for. What we are asking
+// for is to be a valid recipient of partial messages on the topic, which without this is
+// impossible: the partial flags are carried only in a subscribe announcement, so a
+// joined-but-unsubscribed topic can never be seen as requesting partials at all.
+// Only called from processLoop.
+func (p *PubSub) announcePartialInterest(topic string, interested bool) error {
+	// Refused on a topic we are subscribed to, in either direction. The announcement carries
+	// subscribe=false, so on a subscribed topic it would tell every peer to drop us from the
+	// topic's subscriber set -- silently cutting off the messages we are subscribed for. A
+	// subscription already carries the partial flags, so there is nothing this could add.
+	if len(p.mySubs[topic]) != 0 || p.myRelays[topic] != 0 {
+		return fmt.Errorf("cannot announce partial interest in %q: already subscribed or relaying", topic)
+	}
+
+	if interested {
+		p.myPartialInterest[topic] = true
+	} else {
+		delete(p.myPartialInterest, topic)
+	}
+
+	var requestPartialMessages, supportsPartialMessages bool
+	if interested {
+		if t, ok := p.myTopics[topic]; ok {
+			requestPartialMessages = t.requestPartialMessages
+			supportsPartialMessages = t.supportsPartialMessages
+		}
+	}
+	subopt := &pb.RPC_SubOpts{
+		Topicid:                &topic,
+		Subscribe:              proto.Bool(false),
+		RequestsPartial:        &requestPartialMessages,
+		SupportsSendingPartial: &supportsPartialMessages,
+	}
+
+	out := rpcWithSubs(subopt)
+	for pid, peer := range p.peers {
+		if err := peer.Push(out, false); err != nil {
+			// No retry: unlike a subscription, partial interest is re-announced in the hello
+			// packet of every new stream, and losing it costs a missed optimisation rather than
+			// missed messages.
+			p.logger.Info("Can't send partial-interest announcement to peer: queue full", "peer", pid)
+			p.tracer.DropRPC(out, pid)
+			continue
+		}
+		p.tracer.SendRPC(out, pid)
+	}
+
+	return nil
 }
 
 // announce announces whether or not this node is interested in a given topic
@@ -1528,6 +1708,9 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				// If the peer requested partial, they support it by default
 				supportsPartial: subopt.GetRequestsPartial() || subopt.GetSupportsSendingPartial(),
 			}
+			// A subscription supersedes any partial-only interest, so the peer is never in both
+			// maps at once and peerRequestsPartial has one answer rather than two.
+			p.clearPartialInterest(t, rpc.from)
 			_, seenBefore := tmap[rpc.from]
 			tmap[rpc.from] = pts
 			if !seenBefore {
@@ -1537,6 +1720,12 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				}
 			}
 		} else {
+			// subscribe=false with partial flags set is a peer telling us it wants partial
+			// messages on a topic it is not subscribed to. The encoding costs no new field and
+			// degrades safely: an implementation that does not know about it sees a plain
+			// unsubscribe and simply does not serve the peer.
+			p.setPartialInterestFromPeer(t, rpc.from, subopt)
+
 			tmap, ok := p.topics[t]
 			if !ok {
 				continue
@@ -1566,12 +1755,15 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	case AcceptAll:
 		var toPush []*Message
 		for _, pmsg := range rpc.GetPublish() {
-			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg) || (p.admitUnsubscribed != nil && p.admitUnsubscribed(pmsg, rpc.from))) {
 				p.logger.Debug("received message in topic we didn't subscribe to; ignoring message")
 				continue
 			}
 
 			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
+			if p.admitMsg != nil && !p.admitMsg(msg) {
+				continue
+			}
 			if p.shouldPush(msg) {
 				toPush = append(toPush, msg)
 			}
@@ -1631,6 +1823,10 @@ func (p *PubSub) shouldPush(msg *Message) bool {
 	id := p.idGen.ID(msg)
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
+		if gs, ok := p.rt.(*GossipSubRouter); ok {
+			gs.noteDuplicate(id, src)
+			gs.seacastAckDuplicate(id, src) // the hose's acknowledgement off the path; on it, the path's own
+		}
 		return false
 	}
 
@@ -1684,6 +1880,12 @@ func (p *PubSub) checkSigningPolicy(msg *Message) error {
 }
 
 func (p *PubSub) publishMessage(msg *Message) {
+	if !msg.Local && p.admitMsg != nil && !p.admitMsg(msg) {
+		// Its group died while it was being validated: ignored, and the tracers that saw it enter
+		// validation see it end there.
+		p.tracer.RejectMessage(msg, RejectValidationIgnored)
+		return
+	}
 	if !p.markDelivered(p.idGen.ID(msg)) {
 		return
 	}
@@ -1960,9 +2162,18 @@ func (p *PubSub) PublishBatch(batch *MessageBatch, opts ...BatchPubOpt) error {
 	}
 	setDefaultBatchPublishOptions(publishOptions)
 
-	p.sendMessageBatch <- messageBatchAndPublishOptions{
+	// A stopped router drains the channel no more: return its error rather than block on it. The
+	// check comes first because a select with room in the channel may still take the send.
+	if err := p.ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case p.sendMessageBatch <- messageBatchAndPublishOptions{
 		messages: batch.take(),
 		opts:     publishOptions,
+	}:
+	case <-p.ctx.Done():
+		return p.ctx.Err()
 	}
 
 	return nil

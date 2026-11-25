@@ -403,6 +403,9 @@ func (v *validation) doValidateTopic(vals []*validatorImpl, src peer.ID, msg *Me
 	if result == ValidationAccept && r != ValidationAccept {
 		result = r
 	}
+	if v.p.onVerdict != nil && !msg.Local {
+		v.p.onVerdict(src, msg, result)
+	}
 
 	switch result {
 	case ValidationAccept:

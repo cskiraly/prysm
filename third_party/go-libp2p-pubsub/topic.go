@@ -136,6 +136,54 @@ func (t *Topic) EventHandler(opts ...TopicEventHandlerOpt) (*TopicEventHandler, 
 	return h, nil
 }
 
+// SetPartialInterest announces to our peers whether we request partial messages on this topic
+// without being subscribed to it.
+//
+// This is for a topic joined for its partial-message traffic alone: `Join` gives you the local
+// half -- you can send partial messages on the topic -- but the flags that let a peer send them
+// *to* you are carried only in a subscribe announcement, so a joined-but-unsubscribed topic can
+// never be seen as requesting partials. Subscribing instead would be a lie with consequences:
+// peers would graft us into the topic mesh and forward us full messages we did not ask for.
+//
+// The announcement carries subscribe=false, so a peer that does not implement this reads it as an
+// ordinary unsubscribe and simply does not serve us -- the feature degrades to its absence rather
+// than to a protocol error.
+//
+// It is an error to call this on a topic joined without a partial-messages option (nothing to
+// announce), or on a topic we are subscribed to or relaying: the announcement carries
+// subscribe=false, which on a subscribed topic would tell peers to stop sending us the messages we
+// subscribed for.
+func (t *Topic) SetPartialInterest(ctx context.Context, interested bool) error {
+	t.mux.RLock()
+	defer t.mux.RUnlock()
+	if t.closed {
+		return ErrTopicClosed
+	}
+	if interested && !t.requestPartialMessages && !t.supportsPartialMessages {
+		return errors.New("topic was not joined with a partial messages option")
+	}
+
+	result := make(chan error, 1)
+	select {
+	case t.p.eval <- func() {
+		result <- t.p.announcePartialInterest(t.topic, interested)
+	}:
+	case <-t.p.ctx.Done():
+		return t.p.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-result:
+		return err
+	case <-t.p.ctx.Done():
+		return t.p.ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (t *Topic) sendNotification(evt PeerEvent) {
 	t.evtHandlerMux.RLock()
 	defer t.evtHandlerMux.RUnlock()
@@ -228,10 +276,28 @@ type PublishOptions struct {
 	customKey     ProvideKey
 	local         bool
 	validatorData any
+	rebuilt       bool
 }
 
 type BatchPublishOptions struct {
 	Strategy RPCScheduler
+	// enqueued, when set, is told how many peers had at least one of the batch's RPCs admitted to
+	// their queue (WithBatchEnqueued).
+	enqueued func(peers int)
+}
+
+// WithBatchEnqueued reports, once the router has sent the batch, how many peers had at least one
+// of its RPCs admitted whole to their outbound queue; zero means no RPC of the batch was. An RPC
+// the router splits counts only when every fragment was admitted, so a peer that took some
+// fragments and refused others counts as zero. A batch left empty by the seen cache reports zero.
+// The report comes once, on the router's goroutine, so it must not block; a router that stops
+// before it takes the batch never reports. PublishBatch itself returns as soon as the batch is
+// handed to the router, before any peer's queue is tried.
+func WithBatchEnqueued(report func(peers int)) BatchPubOpt {
+	return func(pub *BatchPublishOptions) error {
+		pub.enqueued = report
+		return nil
+	}
 }
 
 type PubOpt func(pub *PublishOptions) error
@@ -354,6 +420,7 @@ func (t *Topic) validate(ctx context.Context, data []byte, opts ...PubOpt) (*Mes
 		ReceivedFrom:  t.p.host.ID(),
 		ValidatorData: pub.validatorData,
 		Local:         pub.local,
+		rebuilt:       pub.rebuilt,
 	}
 
 	select {
@@ -389,6 +456,16 @@ func WithReadiness(ready RouterReady) PubOpt {
 func WithLocalPublication(local bool) PubOpt {
 	return func(pub *PublishOptions) error {
 		pub.local = local
+		return nil
+	}
+}
+
+// WithRebuiltPublication marks a publication as chunks this node rebuilt after decoding, not chunks
+// it held before any peer: the writer's own-chunks rule (choose.go, seacast.md §4.12) leaves them
+// out. Nothing else reads it.
+func WithRebuiltPublication() PubOpt {
+	return func(pub *PublishOptions) error {
+		pub.rebuilt = true
 		return nil
 	}
 }
