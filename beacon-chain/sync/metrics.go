@@ -386,3 +386,34 @@ func (s *Service) collectMetricForSubnet(topic string, digest [4]byte, index uin
 	formattedTopic := fmt.Sprintf(topic, digest, index)
 	topicPeerCount.WithLabelValues(formattedTopic).Set(float64(len(s.cfg.p2p.PubSub().ListPeers(formattedTopic))))
 }
+
+var (
+	segmentAuthThrottledCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "execution_payload_segment_auth_throttled_total",
+		Help: "Number of payload segments dropped because the sending peer exhausted its descriptor authentication budget.",
+	})
+	segmentReassembledCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "execution_payload_segment_reassembled_total",
+		Help: "Number of execution payload envelopes fully reassembled from gossip segments.",
+	})
+	segmentEnvelopeArrivalDelaySeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "execution_payload_segment_envelope_arrival_delay_seconds",
+		Help:    "Time from slot start to a reassembled execution payload envelope passing its checks.",
+		Buckets: prometheus.DefBuckets,
+	})
+	segmentGroupRefusedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "execution_payload_segment_refused_total",
+		Help: "Number of payload segments refused for a reason worth reading on its own, by reason.",
+	}, []string{"reason"})
+	envelopesFetchedByRootCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "execution_payload_envelope_fetched_by_root_total",
+		Help: "Number of execution payload envelopes received by root over req/resp, apart from gossip and segments.",
+	})
+)
+
+// segmentRefusedFirstSeenFull labels a segment whose group found both of its slot's places taken
+// under the interim first-seen authority.
+const segmentRefusedFirstSeenFull = "first-seen-full"
+
+// segmentRefusedSlot labels a completed group whose payload is not of the slot its chunks name.
+const segmentRefusedSlot = "slot"

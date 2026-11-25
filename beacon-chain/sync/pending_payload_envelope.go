@@ -4,7 +4,9 @@ import (
 	"context"
 
 	"github.com/OffchainLabs/prysm/v7/async"
+	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
+	"github.com/OffchainLabs/prysm/v7/consensus-types/interfaces"
 	"github.com/OffchainLabs/prysm/v7/time/slots"
 )
 
@@ -36,6 +38,7 @@ func (s *Service) processPendingPayloadEnvelope(ctx context.Context, root [32]by
 		return
 	}
 	delete(s.pendingPayloadEnvelopes, root)
+	delete(s.pendingFetchedEnvelopes, root)
 	s.pendingEnvelopeLock.Unlock()
 
 	for _, e := range inner {
@@ -60,6 +63,11 @@ func (s *Service) processPendingPayloadEnvelope(ctx context.Context, root [32]by
 			continue
 		}
 		s.setSeenPayloadEnvelope(root, env.BuilderIndex())
+		if features.Get().SeacastPayloadOnly {
+			// The segment path carries the payload, Gloas's and the PQ fork's alike, so the whole
+			// envelope stays off the network.
+			continue
+		}
 		if err := s.cfg.p2p.Broadcast(ctx, e.Proto()); err != nil {
 			log.WithError(err).Warn("Could not broadcast pending payload envelope")
 		}
@@ -84,19 +92,70 @@ func (s *Service) processPendingPayloadEnvelopes(ctx context.Context) {
 	}
 }
 
-// prunePendingPayloadEnvelopes removes entries whose slot is at or below the
-// finalized epoch start slot, following the same pattern as validatePendingSlots.
+// prunePendingPayloadEnvelopes removes entries whose slot is before the finalized epoch's start
+// slot, following the same pattern as validatePendingSlots. A root's entries can differ in slot: a
+// request by root queues an entry of any slot up to the current one, and the segment path queues a
+// reassembled envelope beside other builders' entries. With the segment path on, each entry is
+// judged by its own slot, and a root goes once none of its entries is left. With it off, one entry
+// decides for the whole root, as before the segment path.
 func (s *Service) prunePendingPayloadEnvelopes() {
 	s.pendingEnvelopeLock.Lock()
 	defer s.pendingEnvelopeLock.Unlock()
 
 	finalizedEpoch := s.cfg.chain.FinalizedCheckpt().Epoch
+	segmentsEnabled := s.segmentReassembler != nil
 	for root, inner := range s.pendingPayloadEnvelopes {
-		for _, signed := range inner {
-			if env, err := signed.Envelope(); err == nil && slots.ToEpoch(env.Slot()) < finalizedEpoch {
-				delete(s.pendingPayloadEnvelopes, root)
+		for builder, signed := range inner {
+			env, err := signed.Envelope()
+			stale := err == nil && slots.ToEpoch(env.Slot()) < finalizedEpoch
+			if !segmentsEnabled {
+				if stale {
+					delete(s.pendingPayloadEnvelopes, root)
+					delete(s.pendingFetchedEnvelopes, root)
+				}
+				break
 			}
-			break // only need one envelope per root; admission enforces current-slot
+			if stale {
+				delete(inner, builder)
+				s.forgetFetchedEnvelope(root, builder)
+			}
 		}
+		if segmentsEnabled && len(inner) == 0 {
+			delete(s.pendingPayloadEnvelopes, root)
+		}
+	}
+}
+
+// markFetchedEnvelope marks the pending entry a request by root queued for root and builder, whose
+// signature nobody checked. The caller holds pendingEnvelopeLock.
+func (s *Service) markFetchedEnvelope(root [32]byte, builder uint64, env interfaces.ROSignedExecutionPayloadEnvelope) {
+	if s.pendingFetchedEnvelopes == nil {
+		s.pendingFetchedEnvelopes = make(map[[32]byte]map[uint64]interfaces.ROSignedExecutionPayloadEnvelope)
+	}
+	marks := s.pendingFetchedEnvelopes[root]
+	if marks == nil {
+		marks = make(map[uint64]interfaces.ROSignedExecutionPayloadEnvelope)
+		s.pendingFetchedEnvelopes[root] = marks
+	}
+	marks[builder] = env
+}
+
+// isFetchedEnvelope reports whether env, pending for root and builder, is the entry a request by
+// root queued unverified: the same message, not an equal one. The caller holds pendingEnvelopeLock.
+func (s *Service) isFetchedEnvelope(root [32]byte, builder uint64, env interfaces.ROSignedExecutionPayloadEnvelope) bool {
+	marked, ok := s.pendingFetchedEnvelopes[root][builder]
+	return ok && marked.Proto() == env.Proto()
+}
+
+// forgetFetchedEnvelope drops the mark of root and builder's pending entry, which has left the
+// queue or been replaced. The caller holds pendingEnvelopeLock.
+func (s *Service) forgetFetchedEnvelope(root [32]byte, builder uint64) {
+	marks, ok := s.pendingFetchedEnvelopes[root]
+	if !ok {
+		return
+	}
+	delete(marks, builder)
+	if len(marks) == 0 {
+		delete(s.pendingFetchedEnvelopes, root)
 	}
 }

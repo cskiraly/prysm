@@ -902,6 +902,8 @@ func SendExecutionPayloadEnvelopesByRootRequest(
 		envelopes = append(envelopes, envelope)
 	}
 
+	// Counted here, where every fetch by root receives its envelopes, whichever recovery asked.
+	envelopesFetchedByRootCounter.Add(float64(len(envelopes)))
 	return envelopes, nil
 }
 

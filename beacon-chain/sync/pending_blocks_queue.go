@@ -558,6 +558,7 @@ func (s *Service) queuePendingPayloadEnvelopeFromRootRequest(signedEnvelope inte
 		s.pendingPayloadEnvelopes[root] = inner
 	}
 	inner[builderIdx] = signedEnvelope
+	s.markFetchedEnvelope(root, builderIdx, signedEnvelope)
 }
 
 // filterOutPendingAndSynced filters out roots that are already seen in pending blocks or being synced.

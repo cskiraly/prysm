@@ -317,7 +317,7 @@ func TestFetchPayloadEnvelope_ReceiveHasDeadline(t *testing.T) {
 }
 
 // fullDuringRequest is a fork choice whose payload for the requested root becomes full while a request
-// by root is out, as when gossip imports it in the meantime.
+// by root is out, as when the segment path or gossip imports it in the meantime.
 type fullDuringRequest struct {
 	forkchoice.ForkChoicer
 	full atomic.Bool
