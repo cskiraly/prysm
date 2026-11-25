@@ -34,3 +34,51 @@ message ExecutionPayloadEnvelopesByRangeRequest {
   ];
   uint64 count = 2;
 }
+
+// ExecutionPayloadSegment carries one segment of a segmented execution payload
+// envelope. It is SEACAST's Chunk (seacast-lite.md §2, the payload's chunk of the gossipsub
+// binding):
+//
+//   class Chunk(Container):
+//       slot: Slot
+//       beacon_block_root: Root    # the block whose bid commits this group
+//       group: Bytes32             # the group's key: group_key(group_id(descriptor), slot)
+//       descriptor: SegmentDescriptor
+//       index: uint32
+//       proof: List[Bytes32, 14]
+//       data: ByteList[MAX_SEGMENT_SIZE]
+//
+// Prysm-local: this is NOT a consensus spec type, unlike the RPC messages above; the
+// feature it belongs to is flag-gated and the type changes with it. SSZ is the wire codec.
+// container/segments converts to and from this type and bounds every field on the way
+// in, so a decoded message that converts can be verified against its descriptor.
+message ExecutionPayloadSegment {
+  uint64 slot = 1;
+  bytes beacon_block_root = 2 [(ethereum.eth.ext.ssz_size) = "32"];
+  bytes group = 3 [(ethereum.eth.ext.ssz_size) = "32"];
+  SegmentDescriptor segment_descriptor = 4;
+  uint32 index = 5;
+  // Sibling digests from the leaf to the root, at most ceil(log2 MaxSegments) = 14
+  // (segments.MaxProofDepth).
+  repeated bytes proof = 6 [
+    (ethereum.eth.ext.ssz_size) = "?,32",
+    (ethereum.eth.ext.ssz_max) = "14"
+  ];
+  // At most MAX_SEGMENT_SIZE = 32 KiB (segments.MaxWireSegmentSize).
+  bytes data = 7 [(ethereum.eth.ext.ssz_max) = "32768"];
+}
+
+// SegmentDescriptor is SEACAST's SegmentDescriptor (seacast-lite.md §1), 51 bytes of SSZ:
+// every field that affects reassembly. version, hash_id and encoding are uint8s, carried
+// as one-byte vectors, which SSZ serializes and hashes as a uint8. encoding names what was
+// done to the message before it was segmented (segments.EncodingRaw,
+// segments.EncodingSnappy), so the receiver knows how to read the reassembled bytes.
+message SegmentDescriptor {
+  bytes version = 1 [(ethereum.eth.ext.ssz_size) = "1"];
+  bytes hash_id = 2 [(ethereum.eth.ext.ssz_size) = "1"];
+  bytes encoding = 3 [(ethereum.eth.ext.ssz_size) = "1"];
+  uint32 count = 4;
+  uint32 segment_size = 5;
+  uint64 total_length = 6;
+  bytes root = 7 [(ethereum.eth.ext.ssz_size) = "32"];
+}
