@@ -1861,8 +1861,8 @@ def prysm_deps():
     go_repository(
         name = "com_github_klauspost_reedsolomon",
         importpath = "github.com/klauspost/reedsolomon",
-        sum = "h1:N/VzgeMfHmLc+KHMD1UL/tNkfXAt8FnUqlgXGIduwAY=",
-        version = "v1.9.3",
+        sum = "h1:SafJYwpBBQBI6amHUygcjxZjXeN2HpiENHQDwuPWCCQ=",
+        version = "v1.14.2",
     )
     go_repository(
         name = "com_github_knetic_govaluate",
