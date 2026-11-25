@@ -46,6 +46,9 @@ type groupShape struct {
 	// committed is the group's committed bytes where the node already holds them (NoteCommitted),
 	// until the router's decode takes them or the group's segments go.
 	committed []byte
+	// decoded is set once the router's decode has taken the group's held segments. Bytes handed over
+	// after it are not kept: nothing would take them before the window passes the group.
+	decoded bool
 }
 
 // DecodeCounts is what the payload type's decodes count, for the node's metrics.
@@ -54,6 +57,11 @@ type DecodeCounts struct {
 	// segments (segments.RecoverAndVerify); DecodeHanded those that took the bytes the node already
 	// held (NoteCommitted).
 	DecodeRecoveries, DecodeHanded atomic.Int64
+	// DecodeHandedLate counts the bytes handed over after the router's decode had run, which the type
+	// does not keep. The validators run concurrently, so a segment validated after the one that
+	// completed the group can bring the router to K before that one's bytes are handed over; its
+	// decode then recovers.
+	DecodeHandedLate atomic.Int64
 }
 
 // PayloadType is the execution payload on SEACAST's path (seacast.md §6.1): one group per
@@ -143,7 +151,8 @@ func (t *PayloadType) NoteGroupSlot(root, topic string, n, k int) (uint64, bool)
 // takes them instead of recovering them again from the held segments. It still cuts them again, as the
 // publisher did, and the cut must give the held segments' descriptor and group key, so bytes of another
 // group fail the decode. A group not yet noted, a plain one (the router never decodes it), one whose
-// segments went and one that has its bytes already are left as they are. The type keeps the slice
+// segments went and one that has its bytes already are left as they are. So is one whose decode has
+// run: bytes that come after it are counted (DecodeHandedLate) and dropped. The type keeps the slice
 // until the decode takes it or the live window passes the group, and writes nothing to it; nor may the
 // caller.
 func (t *PayloadType) NoteCommitted(root string, committed []byte) {
@@ -153,8 +162,26 @@ func (t *PayloadType) NoteCommitted(root string, committed []byte) {
 	if !ok || g.n <= g.k || g.dropped || g.committed != nil || len(committed) == 0 {
 		return
 	}
+	if g.decoded {
+		t.counts.DecodeHandedLate.Add(1)
+		return
+	}
 	g.committed = committed
 	t.groups[root] = g
+}
+
+// HandoffsHeld is the number of groups whose handed bytes the type holds, waiting for the router's
+// decode: the memory the hand-over keeps.
+func (t *PayloadType) HandoffsHeld() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, g := range t.groups {
+		if g.committed != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // RecordSlots is how long the type keeps a group's record after the group's slot: two epochs of the
@@ -267,8 +294,9 @@ func (*PayloadType) Family(string) string { return PayloadTypeName }
 func (t *PayloadType) Decode(root string, held []uint32) func() (map[uint32]*pubsub.Message, bool) {
 	var committed []byte
 	t.mu.Lock()
-	if g, ok := t.groups[root]; ok && g.committed != nil {
+	if g, ok := t.groups[root]; ok {
 		committed, g.committed = g.committed, nil
+		g.decoded = true
 		t.groups[root] = g
 	}
 	t.mu.Unlock()
@@ -339,6 +367,10 @@ func rebuildMissing(group, topic string, chunks map[uint32][]byte, handed []byte
 	case handed != nil:
 		// Checked against the root where the node got them. The cut below must give the held
 		// segments' count, descriptor (its root included) and group key, so other bytes fail the decode.
+		// A decode on fewer than K held fails as a recovery would.
+		if len(chunks) < k {
+			return nil, fmt.Errorf("%w: %w: have %d, need %d", errDecode, segments.ErrNotEnoughSegments, len(chunks), k)
+		}
 		counts.DecodeHanded.Add(1)
 		committed = handed
 	default:

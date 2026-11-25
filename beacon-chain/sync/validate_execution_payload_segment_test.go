@@ -493,5 +493,38 @@ func TestSegmentValidatorChecksTheChunkContext(t *testing.T) {
 		}
 		require.Equal(t, float64(1), counterValue(t, segmentGroupRefusedCounter.WithLabelValues(segmentRefusedSlot))-refused)
 		require.Equal(t, 0, n.imported(env))
+		// The completing chunk never reaches the router, so its bytes are not handed over to wait there.
+		tp, ok := n.p.(*p2ptest.TestP2P)
+		require.Equal(t, true, ok)
+		require.Equal(t, 0, len(tp.CommittedSegmentGroups()), "bytes handed over for a refused completing chunk")
 	})
+}
+
+// flippingSync is a node that is synced at the first check and syncing at every later one: a resync
+// that starts while a segment is being validated.
+type flippingSync struct {
+	mockSync.Sync
+	checks int
+}
+
+func (f *flippingSync) Syncing() bool {
+	f.checks++
+	return f.checks > 1
+}
+
+// TestSegmentValidatorChecksSyncOnce pins that the gossip validator checks once whether the node takes
+// chunks, before it reads the segment, as it did before the accept path was lifted out of it: a resync
+// that starts during the validation does not turn a segment it let through into an ignored one.
+func TestSegmentValidatorChecksSyncOnce(t *testing.T) {
+	params.SetupTestConfigCleanup(t)
+	n := newSegmentNode(t, 1, mockExecutionPayloadEnvelopeVerifier{})
+	env, _ := n.block(t, 1)
+	msgs, err := segmentauth.SegmentMessagesForEnvelope(env, segmentauth.DefaultParams())
+	require.NoError(t, err)
+	checker := &flippingSync{}
+	n.s.cfg.initialSync = checker
+	res, err := n.s.validateExecutionPayloadSegment(t.Context(), peer.ID("sender"), segmentToPubsub(t, n.s, n.p, msgs[0]))
+	require.NoError(t, err)
+	require.Equal(t, pubsub.ValidationAccept, res)
+	require.Equal(t, 1, checker.checks)
 }

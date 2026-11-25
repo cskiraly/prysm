@@ -481,6 +481,8 @@ func requireRecoveries(t *testing.T, nodes []*pathNode) {
 		require.Equal(t, receiver, n.recovered.Load(), "node %d: reassembler recoveries", i)
 		require.Equal(t, int64(0), c.DecodeRecoveries.Load(), "node %d: router recoveries", i)
 		require.Equal(t, receiver, c.DecodeHanded.Load(), "node %d: router decodes on handed bytes", i)
+		require.Equal(t, int64(0), c.DecodeHandedLate.Load(), "node %d: bytes handed over after the decode", i)
+		require.Equal(t, 0, n.typ.HandoffsHeld(), "node %d: handed bytes left held", i)
 	}
 }
 

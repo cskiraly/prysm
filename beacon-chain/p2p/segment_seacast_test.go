@@ -208,6 +208,37 @@ func TestPayloadTypeDecodeTakesHandedBytes(t *testing.T) {
 			require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
 		})
 	}
+	t.Run("held until the decode takes them", func(t *testing.T) {
+		typ, held := g.holding(t, 1)
+		require.Equal(t, 0, typ.HandoffsHeld())
+		typ.NoteCommitted(g.group, committed)
+		require.Equal(t, 1, typ.HandoffsHeld())
+		_, ok := typ.Decode(g.group, held)()
+		require.Equal(t, true, ok)
+		require.Equal(t, 0, typ.HandoffsHeld())
+	})
+	t.Run("not kept when they come after the decode", func(t *testing.T) {
+		// Another segment's validator brought the router to K first, and its decode recovered.
+		typ, held := g.holding(t, 1)
+		_, ok := typ.Decode(g.group, held)()
+		require.Equal(t, true, ok)
+		require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
+		typ.NoteCommitted(g.group, committed)
+		require.Equal(t, 0, typ.HandoffsHeld(), "late bytes kept until the window passes the group")
+		require.Equal(t, int64(1), typ.Counts().DecodeHandedLate.Load())
+		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load())
+	})
+	t.Run("not enough held", func(t *testing.T) {
+		// A decode on fewer than K held fails with the bytes as it does without them.
+		typ, held := g.holding(t, 1)
+		_, ok := typ.Decode(g.group, held[:len(held)-1])()
+		require.Equal(t, false, ok)
+		typ, held = g.holding(t, 1)
+		typ.NoteCommitted(g.group, committed)
+		_, ok = typ.Decode(g.group, held[:len(held)-1])()
+		require.Equal(t, false, ok)
+		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load())
+	})
 	t.Run("the first bytes stay", func(t *testing.T) {
 		typ, held := g.holding(t, 1)
 		typ.NoteCommitted(g.group, committed)
@@ -262,6 +293,7 @@ func TestPayloadTypeDecodeTakesHandedBytes(t *testing.T) {
 		}
 		typ, held := plain.holding(t, 1)
 		typ.NoteCommitted(plain.group, plain.committed(t))
+		require.Equal(t, 0, typ.HandoffsHeld(), "bytes kept for a plain group")
 		cells, ok := typ.Decode(plain.group, held)()
 		require.Equal(t, true, ok)
 		require.Equal(t, 0, len(cells))

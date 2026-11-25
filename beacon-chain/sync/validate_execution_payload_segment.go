@@ -122,7 +122,9 @@ func (s *Service) validateExecutionPayloadSegment(ctx context.Context, pid peer.
 		tracing.AnnotateError(span, err)
 		return pubsub.ValidationIgnore, err
 	}
-	v, err := s.acceptSegment(ctx, segmentArrival{from: pid, place: *msg.Topic, digest: digest, chunk: pb})
+	// The gate was checked above, once, as it was before the accept path was lifted out of this
+	// validator: a resync between two checks would ignore a segment the first one let through.
+	v, err := s.acceptOpenSegment(ctx, segmentArrival{from: pid, place: *msg.Topic, digest: digest, chunk: pb})
 	if err != nil {
 		tracing.AnnotateError(span, err)
 	}
@@ -158,12 +160,20 @@ type segmentArrival struct {
 // The chunk that completes a group is followed by the group's recovery, the payload's decompression
 // when the descriptor says it was compressed, the envelope's decode, and the envelope topic's checks.
 // The binding has read the chunk from its wire form by then. The path tells the binding's path what it
-// learns of the group: its shape (SegmentGroupSeen) and, once recovered, its bytes
-// (SegmentGroupCommitted).
+// learns of the group: its shape (SegmentGroupSeen) and, once recovered and its completing chunk
+// accepted, its bytes (SegmentGroupCommitted).
+//
+// It checks first that the node takes chunks (segmentPathOpen). A binding that checks that itself before
+// it reads the chunk from its wire form, as the gossipsub validator does, calls acceptOpenSegment.
 func (s *Service) acceptSegment(ctx context.Context, a segmentArrival) (segmentVerdict, error) {
 	if v, err := s.segmentPathOpen(); v != segmentAccept {
 		return v, err
 	}
+	return s.acceptOpenSegment(ctx, a)
+}
+
+// acceptOpenSegment is acceptSegment once the binding has checked that the node takes chunks.
+func (s *Service) acceptOpenSegment(ctx context.Context, a segmentArrival) (segmentVerdict, error) {
 	// A message the wire type carries but the descriptor cannot hold is the peer's fault and
 	// provably invalid, so reject rather than ignore: this feeds the binding's invalid-message scoring.
 	seg, hasher, err := segments.FromProto(a.chunk)
@@ -215,10 +225,6 @@ func (s *Service) acceptSegment(ctx context.Context, a segmentArrival) (segmentV
 
 	// This node holds what the root committed to. It asks for no more of the group: the router's
 	// group machine stops the group's asks once its decoder completes it (stop-pull).
-	// The router's decode cuts the group again for its missing segments. It takes these bytes rather
-	// than recover them a second time. They are the root's whatever the envelope checks below decide,
-	// and nothing below writes to them.
-	s.cfg.p2p.SegmentGroupCommitted(bytesutil.ToBytes32(seg.Group), complete)
 
 	payload, err := decodeSegmentedPayload(seg.Descriptor.Encoding, complete)
 	if err != nil {
@@ -243,6 +249,12 @@ func (s *Service) acceptSegment(ctx context.Context, a segmentArrival) (segmentV
 		log.WithFields(logrus.Fields{"groupSlot": seg.Slot, "payloadSlot": slot}).Debug("Reassembled payload envelope is not of its group's slot")
 		return segmentIgnore, nil
 	}
+	// From here on the segment is accepted, so it reaches the binding's path. That path's decode of the
+	// group cuts it again for its missing segments, and takes these bytes rather than recover them a
+	// second time. They are handed over only now: a segment refused above never reaches the path, which
+	// then may never decode the group, and the bytes would wait for the window to pass it. Nothing below
+	// writes to them.
+	s.cfg.p2p.SegmentGroupCommitted(bytesutil.ToBytes32(seg.Group), complete)
 
 	// The envelope gets the envelope topic's checks, branch by branch. Their verdict is the
 	// envelope's, not this segment's: the segment verified against its root, and the peer that sent
