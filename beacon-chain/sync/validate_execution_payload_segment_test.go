@@ -524,7 +524,11 @@ func TestSegmentValidatorChecksSyncOnce(t *testing.T) {
 	checker := &flippingSync{}
 	n.s.cfg.initialSync = checker
 	res, err := n.s.validateExecutionPayloadSegment(t.Context(), peer.ID("sender"), segmentToPubsub(t, n.s, n.p, msgs[0]))
+	// The group completes at its one segment, and the import it starts reads the configuration that the
+	// cleanup restores: it ends before the test does.
+	n.s.segmentWork.Wait()
 	require.NoError(t, err)
 	require.Equal(t, pubsub.ValidationAccept, res)
 	require.Equal(t, 1, checker.checks)
+	require.Equal(t, 1, n.imported(env))
 }

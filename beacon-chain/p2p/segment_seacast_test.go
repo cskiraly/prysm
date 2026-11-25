@@ -228,6 +228,28 @@ func TestPayloadTypeDecodeTakesHandedBytes(t *testing.T) {
 		require.Equal(t, int64(1), typ.Counts().DecodeHandedLate.Load())
 		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load())
 	})
+	t.Run("not kept when they come between the decode's start and its work", func(t *testing.T) {
+		// The router took its snapshot (Decode) and the worker hasn't run yet: the snapshot missed the
+		// bytes, so the worker recovers, and the bytes must not stay.
+		typ, held := g.holding(t, 1)
+		work := typ.Decode(g.group, held)
+		typ.NoteCommitted(g.group, committed)
+		require.Equal(t, 0, typ.HandoffsHeld(), "bytes kept that the started decode missed")
+		require.Equal(t, int64(1), typ.Counts().DecodeHandedLate.Load())
+		_, ok := work()
+		require.Equal(t, true, ok)
+		require.Equal(t, int64(1), typ.Counts().DecodeRecoveries.Load())
+		require.Equal(t, int64(0), typ.Counts().DecodeHanded.Load())
+	})
+	t.Run("counted late when the window passed the group too", func(t *testing.T) {
+		typ, held := g.holding(t, 1)
+		work := typ.Decode(g.group, held)
+		typ.Advance(7+2, 2) // the group's slot is 7: its segments go at 9 with a window of 2
+		typ.NoteCommitted(g.group, committed)
+		require.Equal(t, 0, typ.HandoffsHeld())
+		require.Equal(t, int64(1), typ.Counts().DecodeHandedLate.Load())
+		_, _ = work()
+	})
 	t.Run("not enough held", func(t *testing.T) {
 		// A decode on fewer than K held fails with the bytes as it does without them.
 		typ, held := g.holding(t, 1)

@@ -159,11 +159,16 @@ func (t *PayloadType) NoteCommitted(root string, committed []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	g, ok := t.groups[root]
-	if !ok || g.n <= g.k || g.dropped || g.committed != nil || len(committed) == 0 {
+	if !ok || g.n <= g.k || len(committed) == 0 {
 		return
 	}
 	if g.decoded {
+		// Counted before the window's test: a decode that ran and a window that passed the group since
+		// leave bytes that came late all the same.
 		t.counts.DecodeHandedLate.Add(1)
+		return
+	}
+	if g.dropped || g.committed != nil {
 		return
 	}
 	g.committed = committed
