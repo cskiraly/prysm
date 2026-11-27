@@ -98,9 +98,9 @@ func (gs *GossipSubRouter) hoseAckDuplicate(mid string, from peer.ID) bool {
 	if !gs.hoseAck || gs.have == nil || from == gs.p.host.ID() || !gs.feature(GossipSubFeatureIdontwant, gs.peers[from]) {
 		return false
 	}
-	ids := append(gs.haveIDontWantIDs([]string{mid}), gs.haveOriginSentAck(from, mid)...)
+	ids := gs.haveIDontWantIDs([]string{mid})
 	if len(ids) == 0 {
-		return false // our own frame under OriginHaveNone: no HAVE, so no acknowledgement
+		return false // nothing held to name: no HAVE, so no acknowledgement
 	}
 	ack := rpcWithControl(nil, nil, nil, nil, nil, []*pb.ControlIDontWant{{MessageIDs: ids}})
 	gs.sendRPC(from, ack, true)
@@ -316,10 +316,10 @@ func (q *rpcQueue) hasDataLocked() bool {
 	}
 	lead := replayLead(q.queue.normal, index)
 	for i, e := range q.queue.normal {
-		if e.rpc.replay && i >= lead {
+		if e.replay && i >= lead {
 			continue
 		}
-		if len(e.rpc.Publish) > 0 {
+		if len(e.Publish) > 0 {
 			return true
 		}
 	}

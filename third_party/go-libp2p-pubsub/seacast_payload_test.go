@@ -88,14 +88,14 @@ func TestSeacastPayloadSetting(t *testing.T) {
 		for i, ps := range psubs {
 			gs := ps.rt.(*GossipSubRouter)
 			var held int
-			var state uint8
+			state := seacastCollecting
 			var known bool
 			on(gs, func() {
-				if m := gs.have.mine[root]; m != nil {
-					held = m.bits.Count()
+				if m := gs.have.mine[seacastGID(root)]; m != nil {
+					held = m.Bits.Count()
 				}
-				if g := gs.seacast.groups[root]; g != nil {
-					state, known = g.state, true
+				if g := gs.seacast.group(root); g != nil {
+					state, known = g.State, true
 				}
 			})
 			if held != 8 {

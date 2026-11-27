@@ -80,8 +80,8 @@ func TestSeacastRepairModes(t *testing.T) {
 				done := make(chan struct{})
 				gsB.p.eval <- func() {
 					// A and C short by K in B's eyes: each is owed the rebuilt chunks.
-					delete(gsB.have.peers[hosts[0].ID()], root)
-					delete(gsB.have.peers[hosts[2].ID()], root)
+					delete(gsB.have.peers[hosts[0].ID()], seacastGID(root))
+					delete(gsB.have.peers[hosts[2].ID()], seacastGID(root))
 					close(done)
 				}
 				<-done

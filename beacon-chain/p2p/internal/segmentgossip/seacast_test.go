@@ -31,6 +31,9 @@ func nodeSetting() Setting {
 // that names it, and the node's setting passes.
 func TestCheckSetting(t *testing.T) {
 	require.NoError(t, CheckSetting(nodeSetting()))
+	atMax := nodeSetting()
+	atMax.UplinkMbps = maxUplinkMbps // the largest uplink whose bits per second fit
+	require.NoError(t, CheckSetting(atMax))
 
 	cases := []struct {
 		name string
@@ -47,6 +50,7 @@ func TestCheckSetting(t *testing.T) {
 		{"a serve limit", func(s *Setting) { s.Params.ServeLimit = 4 }, "condition 3"},
 		{"unknown groups bounded", func(s *Setting) { s.Limits.UnknownGroupsPerPeer = 8 }, "condition 3"},
 		{"no uplink", func(s *Setting) { s.UplinkMbps = 0 }, "--seacast-uplink-mbps"},
+		{"an uplink whose bits per second overflow", func(s *Setting) { s.UplinkMbps = maxUplinkMbps + 1 }, "overflows"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -77,4 +81,7 @@ func TestPayloadParamsPushBudget(t *testing.T) {
 	require.Equal(t, 2, PayloadParams(499).RNode)
 	require.Equal(t, 6, PayloadParams(500).RNode)
 	require.Equal(t, 6, PayloadParams(1000).RNode)
+	// The source keeps its class's budget (seacast-lite.md §5.1 says R).
+	require.Equal(t, 2, PayloadParams(499).RSource)
+	require.Equal(t, 6, PayloadParams(500).RSource)
 }

@@ -48,6 +48,28 @@ func TestPacedGossipRelease(t *testing.T) {
 			t.Fatal("at 450 ms the id is old enough")
 		}
 	})
+	t.Run("a typed job left with nothing spends its tick, unless passed over", func(t *testing.T) {
+		for _, skip := range []bool{false, true} {
+			gs := newGS()
+			gs.paced.skipHeld = skip
+			gs.paced.born["old"], gs.paced.born["held"] = t0.Add(-time.Second), t0.Add(-time.Second)
+			gs.unwanted[a] = map[checksum]int{computeChecksum("held"): 3}
+			gs.paced.queue = []pacedJob{
+				{p: a, topics: []pacedTopicIDs{{topic: "t", mids: []string{"held"}}}, at: t0},
+				{p: b, topics: []pacedTopicIDs{{topic: "t", mids: []string{"old"}}}, at: t0},
+			}
+			j, _, ok := gs.nextPaced(t0)
+			if skip && (!ok || j.p != b || len(gs.paced.queue) != 0) {
+				t.Fatalf("passed over: got %v %v, %d queued; want peer b's job in the same tick, none queued", j.p, ok, len(gs.paced.queue))
+			}
+			if !skip && (ok || len(gs.paced.queue) != 1 || gs.paced.queue[0].p != b) {
+				t.Fatalf("spent: got %v %v, %d queued; want nothing this tick, peer b's job next", j.p, ok, len(gs.paced.queue))
+			}
+			if gs.paced.emptied.Load() != 1 {
+				t.Fatalf("emptied %d, want 1", gs.paced.emptied.Load())
+			}
+		}
+	})
 	t.Run("stale jobs and departed peers are dropped", func(t *testing.T) {
 		gs := newGS()
 		gs.paced.queue = []pacedJob{{p: a, mids: []string{"x"}, at: t0.Add(-hb)}, {p: gone, mids: []string{"x"}, at: t0}}
@@ -55,4 +77,31 @@ func TestPacedGossipRelease(t *testing.T) {
 			t.Fatalf("dropped %d, want both jobs dropped", gs.paced.dropped.Load())
 		}
 	})
+}
+
+// TestPacedGossipSkipHeldOption: WithPacedGossipSkipHeld, given after WithPacedGossip, sets the
+// pacer to pass over a typed job whose every id the peer holds; without it the pacer keeps the
+// spec's tick; given before paced gossip, it is refused.
+func TestPacedGossipSkipHeldOption(t *testing.T) {
+	apply := func(opts ...Option) (*GossipSubRouter, error) {
+		gs := &GossipSubRouter{}
+		ps := &PubSub{rt: gs}
+		for _, o := range opts {
+			if err := o(ps); err != nil {
+				return gs, err
+			}
+		}
+		return gs, nil
+	}
+	gs, err := apply(WithPacedGossip(time.Millisecond, 0), WithPacedGossipSkipHeld())
+	if err != nil || !gs.paced.skipHeld {
+		t.Fatalf("with the option: err %v, skip %v; want nil true", err, err == nil && gs.paced.skipHeld)
+	}
+	gs, err = apply(WithPacedGossip(time.Millisecond, 0))
+	if err != nil || gs.paced.skipHeld {
+		t.Fatalf("without it: err %v, skip %v; want nil false", err, gs.paced.skipHeld)
+	}
+	if _, err = apply(WithPacedGossipSkipHeld(), WithPacedGossip(time.Millisecond, 0)); err == nil {
+		t.Fatal("given before paced gossip: accepted")
+	}
 }

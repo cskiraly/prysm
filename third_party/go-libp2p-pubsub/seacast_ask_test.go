@@ -43,7 +43,7 @@ func newSeacastAskCell(t *testing.T, n int) *seacastAskCell {
 			WithIHaveParkPerGroup(nil),
 			WithOfferTable(nil),
 			WithRequestObservation(),
-			WithSpecV05(SpecV05{LastResort: true, CloseWithConn: true}, nil),
+			WithSpecV05(SpecV05{}, nil),
 			WithSeacast([]ObjectType{T}, nil),
 		}
 	})
@@ -77,8 +77,23 @@ func (c *seacastAskCell) offerOn(i int, topic, mid string) {
 	time.Sleep(50 * time.Millisecond)
 }
 
-// asksTo counts the asker's asks of mid to peer p, from the request ledger.
+// asksTo counts the asker's asks of mid to peer p, from the request ledger. A chunk's asks count under
+// its id and by its index: on the path the asker records no id from an offer, so the asks that follow
+// the offerer's (the retry, the last resort, a held-back ask) go by index.
 func (c *seacastAskCell) asksTo(mid string, p peer.ID) int {
+	n := 0
+	forms := []string{mid}
+	if root, i, ok := seacastTestIndex(mid); ok {
+		forms = append(forms, encodeWant(root, i))
+	}
+	for _, f := range forms {
+		n += c.asksUnder(f, p)
+	}
+	return n
+}
+
+// asksUnder is how many times the cell's last node asked p under mid itself, in that form alone.
+func (c *seacastAskCell) asksUnder(mid string, p peer.ID) int {
 	gs := c.gs(len(c.hosts) - 1)
 	n := 0
 	done := make(chan struct{})
@@ -250,8 +265,9 @@ func TestSeacastStockRetryAsksFree(t *testing.T) {
 	})
 }
 
-// TestSeacastCloseWithConnChunksOnly: CloseWithConn closes the promises and drops the offers and
-// tried asks of chunks; an id outside any group keeps the base's. P offers B a chunk and, on a stock
+// TestSeacastCloseWithConnChunksOnly: a connection's close closes the promises and drops the offers
+// and tried asks of chunks, in the core's tables (seacast_pull.go); an id outside any group keeps the
+// base's. P offers B a chunk and, on a stock
 // topic, an ungrouped id, never answers, and closes the connection after both asks. B closes the
 // chunk's promise and drops its offer; the stock id's offer stays for the ordinary retry once P is
 // back, and its promise falls due as the router without the rule lets it. Before, both closed and
@@ -274,20 +290,28 @@ func TestSeacastCloseWithConnChunksOnly(t *testing.T) {
 		if a, b := c.asksTo(chunk, P), c.asksTo(block, P); a != 1 || b != 1 {
 			t.Fatalf("both offers should be asked: %d %d", a, b)
 		}
+		var chunkOffer, chunkTried, blockOffer, blockTried bool
+		read := func() {
+			c.eval(1, func(gs *GossipSubRouter) {
+				chunkOffer, chunkTried = gs.pullOffered(P, chunk), gs.pullTried(P, chunk) // the core's (seacast_pull.go)
+				_, blockOffer = gs.offerTable[block][P]
+				_, blockTried = gs.offerTried[block][P]
+			})
+		}
+		read()
+		if !chunkOffer || !chunkTried || !blockOffer || !blockTried {
+			t.Fatalf("before the close: the chunk's offer %v and try %v, the stock id's offer %v and try %v; want all true",
+				chunkOffer, chunkTried, blockOffer, blockTried)
+		}
 		if err := c.hosts[0].Network().ClosePeer(c.hosts[1].ID()); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(100 * time.Millisecond)
-		var chunkOffer, blockOffer, blockTried bool
-		c.eval(1, func(gs *GossipSubRouter) {
-			_, chunkOffer = gs.offerTable[chunk][P]
-			_, blockOffer = gs.offerTable[block][P]
-			_, blockTried = gs.offerTried[block][P]
-		})
+		read()
 		closed := c.gs(1).v05.ctr.ClosedPromises.Load()
-		if chunkOffer || !blockOffer || !blockTried || closed != 1 {
-			t.Errorf("after the close: the chunk's offer kept %v, the stock id's offer kept %v and tried %v, promises closed %d; want false true true 1",
-				chunkOffer, blockOffer, blockTried, closed)
+		if chunkOffer || chunkTried || !blockOffer || !blockTried || closed != 1 {
+			t.Errorf("after the close: the chunk's offer kept %v and try %v, the stock id's offer kept %v and tried %v, promises closed %d; want false false true true 1",
+				chunkOffer, chunkTried, blockOffer, blockTried, closed)
 		}
 		time.Sleep(500 * time.Millisecond) // past the stock id's promise
 		if b := c.breaks.Load(); b != 1 {

@@ -3,17 +3,16 @@ package pubsub
 import (
 	"context"
 	"crypto/sha256"
-	"fmt"
+	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-pubsub/timecache"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -52,7 +51,7 @@ func TestHaveBitsEncoding(t *testing.T) {
 	}
 	var c haveBits
 	c.Set(80)
-	c.b[10] = 0 // clear again by hand: trailing zeros must trim
+	c[10] = 0 // clear again by hand: trailing zeros must trim
 	if got := len(c.Bytes()); got != 0 {
 		t.Fatalf("all-zero bitmap encodes as %d bytes, want 0", got)
 	}
@@ -157,7 +156,7 @@ func TestHaveExpandsIntoUnwanted(t *testing.T) {
 		if _, ok := gs.unwanted[p][computeChecksum(testMid(root, 7))]; !ok {
 			t.Fatal("learning the id must expand the peer's HAVE for it")
 		}
-		if gs.have.mine[root] != nil {
+		if gs.have.mine[seacastGID(root)] != nil {
 			t.Fatal("learning an id must not claim we hold it")
 		}
 		// And the other way round: id learned first, HAVE second.
@@ -504,6 +503,96 @@ func TestIHaveBitmapSide(t *testing.T) {
 	})
 }
 
+// TestRarestHoldersAreLive: rarest's holder counts are the peers' live holdings (seacast-lite.md
+// §4.3's holders). A peer leaves them when its holding of the group ages out, and counts once when
+// it announces the group again; it leaves them when its connection closes; the node's own holding of
+// the group expiring leaves them as they are; and the root goes with its last holder, to be counted
+// anew. The writer's order follows: once p's holding ages out, index 1 ties with index 3 and goes
+// first, behind index 4's two holders. With p still counted, index 3 would go first; without rarest,
+// index 4.
+func TestRarestHoldersAreLive(t *testing.T) {
+	root := strings.Repeat("h", 32)
+	gs := testHaveRouter()
+	gs.have.holders = &holderCounts{}
+	have := func(p peer.ID, indices ...uint32) {
+		var b haveBits
+		for _, i := range indices {
+			b.Set(i)
+		}
+		if !gs.haveAbsorb(p, encodeHave(root, &b)) {
+			t.Fatalf("%s's HAVE not read as one", string(p))
+		}
+	}
+	check := func(when string, want ...int) {
+		t.Helper()
+		got := make([]int, len(want))
+		for i := range got {
+			got[i] = gs.have.holders.get(root, uint32(i))
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s: holders of indices 0 to %d %v, want %v", when, len(want)-1, got, want)
+		}
+	}
+	p, q, r, s, u := peer.ID("p"), peer.ID("q"), peer.ID("r"), peer.ID("s"), peer.ID("u")
+	have(p, 1, 2)
+	have(q, 1)
+	have(r, 2, 3)
+	have(s, 4)
+	have(u, 4)
+	check("five holdings", 0, 2, 2, 1, 2)
+
+	ttl := gs.params.IDontWantMessageTTL
+	for range ttl - 1 {
+		gs.haveHeartbeat()
+	}
+	for _, again := range []peer.ID{q, r, s, u} { // all but p announce again, so only p's holding ages out
+		have(again, gs.have.peers.Of(again, seacastGID(root)).Bits.Indices()...)
+	}
+	check("all but p again", 0, 2, 2, 1, 2)
+	gs.haveHeartbeat()
+	if gs.have.peers.Of(p, seacastGID(root)) != nil {
+		t.Fatalf("p's holding did not age out after %d heartbeats", ttl)
+	}
+	check("p's holding aged out", 0, 1, 1, 1, 2)
+
+	wq := newRpcQueue(16)
+	wq.enableHave(testQueueIndex, false, false)
+	wq.enableRarest(func(m *pb.Message) (int, bool) {
+		rt, i, ok := testQueueIndex(m)
+		return gs.have.holders.get(rt, i), ok
+	})
+	for _, i := range []byte{4, 1, 3} {
+		if err := wq.Push(testDataRPC(root, i), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rpc, err := wq.Pop(t.Context()); err != nil || rpc.Publish[0].Data[32] != 1 {
+		t.Fatalf("after p's holding aged out the writer did not send index 1 first: %v", err)
+	}
+
+	have(p, 2)
+	check("p again", 0, 1, 2, 1, 2)
+	gs.haveForget(r)
+	check("r gone", 0, 1, 1, 0, 2)
+	gs.have.mine[seacastGID(root)] = &core.Holding{TTL: 1}
+	gs.haveHeartbeat()
+	if gs.have.mine[seacastGID(root)] != nil {
+		t.Fatal("the node's own holding did not expire")
+	}
+	check("the node's own holding expired", 0, 1, 1, 0, 2)
+	for _, gone := range []peer.ID{p, q, s, u} {
+		gs.haveForget(gone)
+	}
+	gs.have.holders.mu.Lock()
+	_, kept := gs.have.holders.counts[root]
+	gs.have.holders.mu.Unlock()
+	if kept {
+		t.Fatal("the root's counts stayed after its last holder went")
+	}
+	have(q, 1)
+	check("q back", 0, 1, 0, 0, 0)
+}
+
 func TestRarestDispatchOnTheQueue(t *testing.T) {
 	root := strings.Repeat("g", 32)
 	ctx := t.Context()
@@ -577,6 +666,26 @@ func TestRarestDispatchOnTheQueue(t *testing.T) {
 		}
 		if q.outboundStat().Reordered != 0 {
 			t.Fatal("nothing should have been reordered")
+		}
+	})
+
+	t.Run("a stock message is not chosen, and the rarer chunk behind it still goes first", func(t *testing.T) {
+		q := newQ()
+		stock := &RPC{RPC: pb.RPC{Publish: []*pb.Message{{Data: []byte("a block")}}}}
+		stock.size = 100
+		for _, rpc := range []*RPC{testDataRPC(root, 0), stock, testDataRPC(root, 1)} {
+			if err := q.Push(rpc, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The stock message's holders are unknown, so it is no candidate: index 1 (one holder)
+		// goes first, then index 0 (five) at the head, then the stock message.
+		var got []string
+		for range 3 {
+			got = append(got, string(pop(t, q).Publish[0].Data))
+		}
+		if want := []string{testMid(root, 1), testMid(root, 0), "a block"}; !slices.Equal(got, want) {
+			t.Fatalf("popped %q, want %q", got, want)
 		}
 	})
 
@@ -809,13 +918,13 @@ func TestPhaseSelectFewest(t *testing.T) {
 	mid := testMid(root, 9)
 	have := func(p peer.ID, idx ...uint32) {
 		if gs.have.peers[p] == nil {
-			gs.have.peers[p] = make(map[string]*haveEntry)
+			gs.have.peers[p] = make(map[core.GroupID]*core.PeerHolding)
 		}
-		e := &haveEntry{}
+		e := &core.PeerHolding{}
 		for _, i := range idx {
-			e.bits.Set(i)
+			e.Bits.Set(i)
 		}
-		gs.have.peers[p][root] = e
+		gs.have.peers[p][seacastGID(root)] = e
 	}
 	have("a", 0, 1, 2, 3)
 	have("b", 0, 1)
@@ -854,7 +963,7 @@ func TestPhaseSelectFewest(t *testing.T) {
 			for _, i := range idx {
 				gs.haveNotePushed(p, testMid(root, i))
 			}
-			gs.have.pushed[p][root].first = time.Now().Add(-ago)
+			gs.have.pushed[p][seacastGID(root)].First = time.Now().Add(-ago)
 		}
 		hv := func(p peer.ID, idx ...byte) {
 			var b haveBits
@@ -921,11 +1030,11 @@ func TestPhaseSelectFewest(t *testing.T) {
 		// u under-reports: we pushed it one frame and it said nothing more; the rest told us.
 		gs.haveNotePushed("u", testMid(root, 0))
 		for p, n := range map[peer.ID]int{"a": 2, "b": 3, "c": 6, "d": 7, "e": 8} {
-			e := &haveEntry{}
+			e := &core.PeerHolding{}
 			for i := range n {
-				e.bits.Set(uint32(i))
+				e.Bits.Set(uint32(i))
 			}
-			gs.have.peers[p] = map[string]*haveEntry{root: e}
+			gs.have.peers[p] = map[core.GroupID]*core.PeerHolding{seacastGID(root): e}
 		}
 		mesh := map[peer.ID]struct{}{"u": {}, "a": {}, "b": {}, "c": {}, "d": {}, "e": {}}
 		const trims = 3000
@@ -1051,228 +1160,9 @@ func TestControlMute(t *testing.T) {
 	})
 	t.Run("a HAVE is not parked", func(t *testing.T) {
 		gs.have.attach = true
-		gs.have.mine[root] = &haveEntry{bits: b}
+		gs.have.mine[seacastGID(root)] = &core.Holding{Bits: b}
 		if gs.havePendAll("peer", []string{have}) {
 			t.Fatal("a mute node parked a HAVE for the queue to attach")
-		}
-	})
-}
-
-// TestOriginHave is WithOriginHave's known answer: a batch publisher's mesh peer gets one HAVE with every published index; without it, none.
-func TestOriginHave(t *testing.T) {
-	root := strings.Repeat("g", 32)
-	for _, on := range []bool{false, true} {
-		t.Run(fmt.Sprintf("origin HAVE %v", on), func(t *testing.T) {
-			synctestTest(t, func(t *testing.T) {
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				hosts := getDefaultHosts(t, 2)
-				var mu sync.Mutex
-				var got []haveBits
-				tr := &mockRawTracer{onRecvRPC: func(rpc *RPC) {
-					mu.Lock()
-					defer mu.Unlock()
-					for _, idw := range rpc.GetControl().GetIdontwant() {
-						for _, mid := range idw.GetMessageIDs() {
-							if r, enc, ok := decodeHave(mid); ok && r == root {
-								var b haveBits
-								b.Or(enc)
-								got = append(got, b)
-							}
-						}
-					}
-				}}
-				psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-					opts := []Option{
-						WithMessageSignaturePolicy(StrictNoSign), WithNoAuthor(),
-						WithMessageIdFn(func(m *pb.Message) string { return string(m.Data) }),
-						WithHaveBitmaps(testIndex),
-					}
-					if on && i == 0 {
-						opts = append(opts, WithOriginHave())
-					}
-					if i == 1 {
-						opts = append(opts, WithRawTracer(tr))
-					}
-					return opts
-				})
-				var topics []*Topic
-				for _, ps := range psubs {
-					tp, err := ps.Join("t")
-					if err != nil {
-						t.Fatal(err)
-					}
-					if _, err := tp.Subscribe(); err != nil {
-						t.Fatal(err)
-					}
-					topics = append(topics, tp)
-				}
-				connectAll(t, hosts)
-				time.Sleep(2 * time.Second)
-				var batch MessageBatch
-				for i := byte(0); i < 3; i++ {
-					if err := topics[0].AddToBatch(ctx, &batch, []byte(testMid(root, i))); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := psubs[0].PublishBatch(&batch); err != nil {
-					t.Fatal(err)
-				}
-				time.Sleep(time.Second)
-				mu.Lock()
-				defer mu.Unlock()
-				if !on {
-					if len(got) != 0 {
-						t.Fatalf("no origin HAVE without the option, got %d", len(got))
-					}
-					return
-				}
-				if len(got) != 1 || got[0].Count() != 3 || !got[0].Has(0) || !got[0].Has(2) {
-					t.Fatalf("want one HAVE with indices 0..2, got %v", got)
-				}
-			})
-		})
-	}
-}
-
-// TestOriginHaveModes is WithOriginHaveMode's known answer. Frames above the IDONTWANT threshold
-// make a publisher's Preprocess send its mesh a HAVE per frame it publishes, all before its first
-// frame leaves. Paced, the first HAVE leads the first frame and names it alone, every later one
-// names only frames the peer already got, and the last names all; per peer (sent), every HAVE
-// rides a frame and names exactly the frames received; none, the peer gets no HAVE at all.
-func TestOriginHaveModes(t *testing.T) {
-	root := strings.Repeat("p", 32)
-	const frames = 8
-	idLen := len(testMid(root, 0))
-	for _, arm := range []struct {
-		name     string
-		mode     OriginHaveMode // 0: no option
-		dispatch bool
-	}{
-		{"at publish", 0, false},
-		{"paced", OriginHavePaced, false},
-		{"paced with dispatch cancel", OriginHavePaced, true},
-		{"none", OriginHaveNone, true},
-		{"sent", OriginHaveSent, true},
-	} {
-		t.Run(arm.name, func(t *testing.T) {
-			synctestTest(t, func(t *testing.T) {
-				ctx, cancel := context.WithCancel(context.Background())
-				defer cancel()
-				hosts := getDefaultHosts(t, 2)
-				var mu sync.Mutex
-				// got and named: the frames the peer received and the publisher's HAVEs so far; ahead:
-				// HAVEs after the first that name a frame not yet received; exact: HAVEs naming exactly got.
-				var got, named haveBits
-				namedAtFirst, ahead, exact, haves := -1, 0, 0, 0
-				tr := &mockRawTracer{onRecvRPC: func(rpc *RPC) {
-					mu.Lock()
-					defer mu.Unlock()
-					for _, m := range rpc.GetPublish() {
-						if _, i, ok := testIndex(string(m.GetData()[:idLen])); ok {
-							if got.Count() == 0 {
-								namedAtFirst = named.Count()
-							}
-							got.Set(i)
-						}
-					}
-					for _, idw := range rpc.GetControl().GetIdontwant() {
-						for _, mid := range idw.GetMessageIDs() {
-							if r, enc, ok := decodeHave(mid); ok && r == root {
-								haves++
-								var b haveBits
-								b.Or(enc)
-								if haves > 1 && len(b.AndNot(&got).Bytes()) > 0 {
-									ahead++
-								}
-								if len(b.AndNot(&got).Bytes()) == 0 && len(got.AndNot(&b).Bytes()) == 0 {
-									exact++
-								}
-								named.Or(enc)
-							}
-						}
-					}
-				}}
-				psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
-					opts := []Option{
-						WithMessageSignaturePolicy(StrictNoSign), WithNoAuthor(),
-						WithMessageIdFn(func(m *pb.Message) string { return string(m.Data[:idLen]) }),
-						WithHaveBitmaps(testIndex),
-					}
-					if arm.dispatch {
-						opts = append(opts, WithHaveDispatch(true, false))
-					}
-					if arm.mode != 0 && i == 0 {
-						opts = append(opts, WithOriginHaveMode(arm.mode))
-					}
-					if i == 1 {
-						opts = append(opts, WithRawTracer(tr))
-					}
-					return opts
-				})
-				var topics []*Topic
-				for _, ps := range psubs {
-					tp, err := ps.Join("t")
-					if err != nil {
-						t.Fatal(err)
-					}
-					if _, err := tp.Subscribe(); err != nil {
-						t.Fatal(err)
-					}
-					topics = append(topics, tp)
-				}
-				connectAll(t, hosts)
-				time.Sleep(2 * time.Second)
-				pad := strings.Repeat("x", 2*GossipSubIDontWantMessageThreshold)
-				var batch MessageBatch
-				for i := byte(0); i < frames; i++ {
-					if err := topics[0].AddToBatch(ctx, &batch, []byte(testMid(root, i)+pad)); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := psubs[0].PublishBatch(&batch); err != nil {
-					t.Fatal(err)
-				}
-				time.Sleep(time.Second)
-				mu.Lock()
-				defer mu.Unlock()
-				wantNamed := frames
-				if arm.mode == OriginHaveNone {
-					wantNamed = 0
-				}
-				if got.Count() != frames || named.Count() != wantNamed {
-					t.Fatalf("peer got %d of %d frames and was named %d, want %d", got.Count(), frames, named.Count(), wantNamed)
-				}
-				switch arm.mode {
-				case 0:
-					if namedAtFirst != frames {
-						t.Fatalf("at publish: %d of %d frames named before the first arrived, want all", namedAtFirst, frames)
-					}
-				case OriginHavePaced:
-					if namedAtFirst != 1 || ahead != 0 {
-						t.Fatalf("paced: %d frames named before the first arrived (want the lead's 1), %d of %d later HAVEs ahead of their frames (want 0)", namedAtFirst, ahead, haves)
-					}
-				case OriginHaveNone:
-					if haves != 0 {
-						t.Fatalf("none: %d HAVEs, want 0", haves)
-					}
-				case OriginHaveSent:
-					if namedAtFirst != 0 || haves == 0 || exact != haves {
-						t.Fatalf("sent: %d frames named before the first arrived (want 0), %d of %d HAVEs naming exactly the frames received (want all)", namedAtFirst, exact, haves)
-					}
-				}
-			})
-		})
-	}
-	t.Run("exclusive with WithOriginHave", func(t *testing.T) {
-		for i, order := range [][2]Option{{WithOriginHave(), WithOriginHavePaced()}, {WithOriginHaveMode(OriginHaveNone), WithOriginHave()}} {
-			ps := &PubSub{rt: &GossipSubRouter{have: newHaveState(testIndex)}}
-			if err := order[0](ps); err != nil {
-				t.Fatalf("order %d: first option: %v", i, err)
-			}
-			if err := order[1](ps); err == nil {
-				t.Fatalf("order %d: the second option must refuse the first", i)
-			}
 		}
 	})
 }
@@ -1330,7 +1220,7 @@ func TestOwnViewAndPeerHolds(t *testing.T) {
 	gs := &GossipSubRouter{have: h}
 	var b haveBits
 	b.Set(5)
-	h.peers["p"] = map[string]*haveEntry{root: {bits: b}}
+	h.peers["p"] = map[core.GroupID]*core.PeerHolding{seacastGID(root): {Bits: b}}
 	if !gs.havePeerHolds("p", root, 5) || gs.havePeerHolds("p", root, 6) || gs.havePeerHolds("q", root, 5) {
 		t.Fatal("havePeerHolds: p holds 5 only, q nothing")
 	}

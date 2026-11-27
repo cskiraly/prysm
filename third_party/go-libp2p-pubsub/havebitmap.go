@@ -3,12 +3,12 @@ package pubsub
 import (
 	"crypto/sha256"
 	"fmt"
-	"math/bits"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -38,88 +38,19 @@ const (
 	haveMaxBytes = 1024
 )
 
-// haveBits is a growable bitset over segment indices, little-endian within a byte.
-type haveBits struct{ b []byte }
+// haveBits is a growable bitset over segment indices, little-endian within a byte: the core's Bits
+// (seacast/bits.go).
+type haveBits = core.Bits
 
-// Set marks index i. Indices past the bound are ignored rather than grown into.
-func (h *haveBits) Set(i uint32) {
-	if i >= haveMaxBytes*8 {
-		return
-	}
-	at := int(i / 8)
-	for len(h.b) <= at {
-		h.b = append(h.b, 0)
-	}
-	h.b[at] |= 1 << (i % 8)
-}
-
-// Clear unmarks index i; indices past the stored bytes are already clear.
-func (h *haveBits) Clear(i uint32) {
-	at := int(i / 8)
-	if at < len(h.b) {
-		h.b[at] &^= 1 << (i % 8)
-	}
-}
-
-// Has reports whether index i is set.
-func (h *haveBits) Has(i uint32) bool {
-	at := int(i / 8)
-	return at < len(h.b) && h.b[at]&(1<<(i%8)) != 0
-}
-
-// Or folds an encoded bitmap in and returns the indices that were clear before.
-func (h *haveBits) Or(enc []byte) []uint32 {
-	var newly []uint32
-	for len(h.b) < len(enc) {
-		h.b = append(h.b, 0)
-	}
-	for i, x := range enc {
-		if flipped := x &^ h.b[i]; flipped != 0 {
-			for bit := uint32(0); bit < 8; bit++ {
-				if flipped&(1<<bit) != 0 {
-					newly = append(newly, uint32(i)*8+bit) // lint:ignore uintcast -- i < haveMaxBytes.
-				}
-			}
-		}
-		h.b[i] |= x
-	}
-	return newly
-}
-
-// AndNot returns a copy of h with other's bits cleared.
-func (h *haveBits) AndNot(other *haveBits) *haveBits {
-	out := &haveBits{b: append([]byte(nil), h.b...)}
-	if other != nil {
-		for i := range out.b {
-			if i < len(other.b) {
-				out.b[i] &^= other.b[i]
-			}
-		}
-	}
-	return out
-}
-
-// Bytes is the wire form: the bitmap with trailing zero bytes trimmed.
-func (h *haveBits) Bytes() []byte {
-	n := len(h.b)
-	for n > 0 && h.b[n-1] == 0 {
-		n--
-	}
-	return h.b[:n]
-}
-
-// Count is the number of indices set.
-func (h *haveBits) Count() int {
-	n := 0
-	for _, x := range h.b {
-		n += bits.OnesCount8(x)
-	}
-	return n
+// newHaveBits is a bitset over b, which it keeps.
+func newHaveBits(b []byte) *haveBits {
+	h := haveBits(b)
+	return &h
 }
 
 // encodeHave builds the pseudo id for root's bitmap.
 func encodeHave(root string, bits *haveBits) string {
-	out := make([]byte, 0, haveHeaderLen+len(bits.b))
+	out := make([]byte, 0, haveHeaderLen+len(*bits))
 	out = append(out, haveMagic...)
 	out = append(out, haveVersion)
 	out = append(out, root...)
@@ -138,19 +69,6 @@ func decodeHave(mid string) (root string, bitmap []byte, ok bool) {
 	return mid[len(haveMagic)+1 : haveHeaderLen], []byte(mid[haveHeaderLen:]), true
 }
 
-// haveEntry is one bitmap with the IDONTWANT TTL, in heartbeats.
-type haveEntry struct {
-	bits haveBits
-	ttl  int
-	// claimAll and complete are a v4 holding's flags (seacast_wire.go): the peer claims every
-	// index of the group, and its interest in the group is satisfied.
-	claimAll, complete bool
-	// In pushed only: when we first pushed the peer a frame of the root, and whether the proof
-	// guard has demoted the pair (WithPhaseSelectFewestGuard).
-	first   time.Time
-	demoted bool
-}
-
 // haveIDs is the ids known at each index of one root -- held or only announced -- with the
 // IDONTWANT TTL, in heartbeats, since the last one was learned.
 type haveIDs struct {
@@ -165,18 +83,18 @@ type haveState struct {
 	// originAcks is the acknowledged indices of the groups the node publishes on the path
 	// (seacast_origin.go): their holding names those only.
 	originAcks *originAcks
-	mine       map[string]*haveEntry
+	mine       core.Holdings // by seacastGID(root)
 	// tomb is the groups past their active lifetime under v0.5's D′, by heartbeats left: their
 	// mine aged out GROUP_TTL after the last chunk, and only the id is kept, for another holdTTL.
 	tomb map[string]int
 	// own mirrors mine for the writers (ownView).
 	own   ownView
 	mids  map[string]*haveIDs
-	peers map[peer.ID]map[string]*haveEntry
+	peers core.PeerHoldings[peer.ID] // by seacastGID(root)
 	// pushed is what we have pushed to each peer per root. The phase announce names a message
 	// only to the peers it did not push it to; the per-peer bitmap keeps that by leaving out
 	// what we pushed to the peer and what the peer has told us it holds.
-	pushed map[peer.ID]map[string]*haveEntry
+	pushed core.Pushes[peer.ID] // by seacastGID(root)
 	// Dispatch-time decisions (WithHaveDispatch): msgIndex is index over a queued message.
 	msgIndex func(m *pb.Message) (root string, index uint32, ok bool)
 	cancel   bool
@@ -199,10 +117,6 @@ type haveState struct {
 	// ledger, when kept, records per (peer, root, index) when we popped the frame to the peer
 	// and when the peer's HAVE covering it reached us (WithHaveLedger; measurement only).
 	ledger *haveLedger
-	// originHave sends our HAVE for each group we publish in a batch (WithOriginHave).
-	originHave bool
-	// originPaced holds our HAVE for each group we publish to its OriginHaveMode (WithOriginHaveMode).
-	originPaced *originPaced
 	// rebuilt is what Rebuilt handed the router, and its counters; nil until it first runs.
 	rebuilt atomic.Pointer[rebuiltState]
 }
@@ -210,12 +124,12 @@ type haveState struct {
 func newHaveState(index func(mid string) (string, uint32, bool)) *haveState {
 	return &haveState{
 		index: index,
-		mine:  make(map[string]*haveEntry),
+		mine:  core.Holdings{},
 		tomb:  make(map[string]int),
 		mids:  make(map[string]*haveIDs),
-		peers: make(map[peer.ID]map[string]*haveEntry),
+		peers: core.PeerHoldings[peer.ID]{},
 
-		pushed: make(map[peer.ID]map[string]*haveEntry),
+		pushed: core.Pushes[peer.ID]{},
 		own:    ownView{bits: make(map[string]*haveBits)},
 	}
 }
@@ -253,13 +167,16 @@ func (gs *GossipSubRouter) markUnwanted(p peer.ID, csum checksum) {
 	u[csum] = gs.params.IDontWantMessageTTL
 }
 
-// haveLearnID records an id at its index, held or merely announced, and expands every peer
-// HAVE that already covers that index into that peer's unwanted set and holder evidence.
+// haveLearnID records an id at its index, held or, off the path, merely announced, and expands
+// every peer HAVE that already covers that index into that peer's unwanted set and holder evidence.
+// The first id recorded at an index stays.
 //
 // A HAVE names an index, not an id, so until the id is known the holder it evidences cannot be
 // recorded, and a node's pulls for the message fall back on whoever announced it -- measured
 // as the publisher's bytes rising 39% under A tuned before announced ids were learned here.
-// Router goroutine, from Preprocess (arrivals) and handleIHave (announces).
+// Router goroutine, from the arrivals (Preprocess, and on the path the accept), what we forward
+// or publish (haveNoteServable), the rebuild, and off the path handleIHave (announces:
+// considerAnnounced).
 func (gs *GossipSubRouter) haveLearnID(mid string) {
 	h := gs.have
 	if h == nil {
@@ -280,37 +197,41 @@ func (gs *GossipSubRouter) haveLearnID(mid string) {
 	}
 	m.ids[index] = mid
 	csum := computeChecksum(mid)
+	gid := seacastGID(root)
 	for p, roots := range h.peers {
-		if pe := roots[root]; pe != nil && pe.bits.Has(index) {
+		if pe := roots[gid]; pe != nil && pe.Bits.Has(index) {
 			gs.markUnwanted(p, csum)
 		}
 	}
 }
 
-// haveNoteArrival records a received (or own) message in our bitmap and learns its id.
-// Router goroutine, from Preprocess -- before any forwarding decision for the message -- and
-// from the publish paths.
-func (gs *GossipSubRouter) haveNoteArrival(mid string) {
+// haveNoteArrival records a received (or own) message in our bitmap and learns its id, and
+// reports whether the index is new to the bitmap: a claim (seacast-lite.md §4.2's on_validated,
+// claim = not mine[g].has(i)). Router goroutine, from Preprocess -- before any forwarding
+// decision for the message -- and from the publish paths.
+func (gs *GossipSubRouter) haveNoteArrival(mid string) (claim bool) {
 	h := gs.have
 	if h == nil {
-		return
+		return false
 	}
 	root, index, ok := h.index(mid)
 	if !ok || len(root) != haveRootLen {
-		return
+		return false
 	}
 	if h.tomb[root] > 0 {
-		return // past its active lifetime: only the tombstone is left (v0.5's D′)
+		return false // past its active lifetime: only the tombstone is left (v0.5's D′)
 	}
-	e := h.mine[root]
+	e := h.mine[seacastGID(root)]
 	if e == nil {
-		e = &haveEntry{}
-		h.mine[root] = e
+		e = &core.Holding{}
+		h.mine[seacastGID(root)] = e
 	}
-	e.bits.Set(index)
+	claim = !e.Bits.Has(index)
+	e.Bits.Set(index)
 	h.own.set(root, index)
-	e.ttl = h.holdTTL
+	e.TTL = h.holdTTL
 	gs.haveLearnID(mid)
+	return claim
 }
 
 // haveIDontWantIDs returns mids with every structured id replaced by one HAVE per group root,
@@ -325,7 +246,7 @@ func (gs *GossipSubRouter) haveIDontWantIDs(mids []string) []string {
 	var seen map[string]bool
 	for i, mid := range mids {
 		root, _, ok := h.index(mid)
-		if !ok || len(root) != haveRootLen || h.mine[root] == nil {
+		if !ok || len(root) != haveRootLen || h.mine[seacastGID(root)] == nil {
 			if out != nil {
 				out = append(out, mid)
 			}
@@ -374,18 +295,19 @@ func (gs *GossipSubRouter) haveAbsorb(p peer.ID, mid string) bool {
 	if gs.expired(root) {
 		return true // a HAVE for a group past its lifetime is ignored, without penalty (v0.5's D′)
 	}
-	roots := h.peers[p]
-	if roots == nil {
-		roots = make(map[string]*haveEntry)
-		h.peers[p] = roots
-	}
-	e := roots[root]
-	if e == nil {
-		e = &haveEntry{}
-		roots[root] = e
-	}
-	e.ttl = gs.params.IDontWantMessageTTL
-	newly := e.bits.Or(enc)
+	gs.haveTake(p, root, enc, false, false)
+	return true
+}
+
+// haveTake absorbs a holding of root from p that passed the intake's checks, v1's or v4's (claimAll
+// and complete are v4's claims): into p's entry with its lifetime refreshed, the holder counts, the
+// ledger and the writer's copy, and the indices whose message we already know into p's unwanted set.
+// The bitmap's trailing zero bytes go first (the wire drops them, core.Bits): a padded holding grows
+// neither the entry nor the writer's copy past its highest index.
+func (gs *GossipSubRouter) haveTake(p peer.ID, root string, enc []byte, claimAll, complete bool) {
+	enc = core.Bits(enc).Trim()
+	h := gs.have
+	newly := h.peers.Absorb(p, seacastGID(root), enc, claimAll, complete, gs.params.IDontWantMessageTTL)
 	gs.seacastOriginAckIndices(root, newly) // v0.9: a chunk we publish is acknowledged (seacast_origin.go)
 	if h.holders != nil {
 		h.holders.add(root, newly)
@@ -412,7 +334,6 @@ func (gs *GossipSubRouter) haveAbsorb(p peer.ID, mid string) bool {
 		}
 		gs.markUnwanted(p, computeChecksum(kmid))
 	}
-	return true
 }
 
 // haveHeartbeat ages the bitmaps out on the IDONTWANT TTL. With clearIDontWantCounters.
@@ -429,19 +350,15 @@ func (gs *GossipSubRouter) haveHeartbeat() {
 			h.tomb[root] = n
 		}
 	}
-	for root, e := range h.mine {
-		if e.ttl--; e.ttl <= 0 {
-			delete(h.mine, root)
+	for gid, e := range h.mine {
+		root := seacastGIDRoot(gid)
+		if e.TTL--; e.TTL <= 0 {
+			delete(h.mine, gid)
 			h.own.forget(root)
 			if gs.seacastRootOwner(root) != nil {
 				gs.expireGroup(root) // D′ on the path: a tombstone until the window passes it
 			}
-			if h.holders != nil {
-				h.holders.forget(root)
-			}
-			if h.originPaced != nil {
-				h.originPaced.forget(root)
-			}
+			// The holder counts stay: they are the peers' live holdings, which go at their own TTL.
 		}
 	}
 	for root, m := range h.mids {
@@ -449,38 +366,27 @@ func (gs *GossipSubRouter) haveHeartbeat() {
 			delete(h.mids, root)
 		}
 	}
-	for p, roots := range h.pushed {
-		for root, e := range roots {
-			if e.ttl--; e.ttl <= 0 {
-				delete(roots, root)
+	h.pushed.Age()
+	h.peers.Age(func(p peer.ID, g core.GroupID, held core.Bits) {
+		root := seacastGIDRoot(g)
+		h.holders.remove(root, held.Indices()) // p is no longer a live holder of what it held
+		if gs.p != nil {
+			if q, ok := gs.p.peers[p]; ok {
+				q.haveForgetRoot(root)
 			}
 		}
-		if len(roots) == 0 {
-			delete(h.pushed, p)
-		}
-	}
-	for p, roots := range h.peers {
-		for root, e := range roots {
-			if e.ttl--; e.ttl <= 0 {
-				delete(roots, root)
-				if gs.p != nil {
-					if q, ok := gs.p.peers[p]; ok {
-						q.haveForgetRoot(root)
-					}
-				}
-			}
-		}
-		if len(roots) == 0 {
-			delete(h.peers, p)
-		}
-	}
+	})
 }
 
-// haveForget drops what a departed peer told us, and what we pushed to it.
+// haveForget drops what a departed peer told us, and what we pushed to it: it leaves the holders of
+// what it held.
 func (gs *GossipSubRouter) haveForget(p peer.ID) {
 	if gs.have != nil {
-		delete(gs.have.peers, p)
-		delete(gs.have.pushed, p)
+		for g, e := range gs.have.peers[p] {
+			gs.have.holders.remove(seacastGIDRoot(g), e.Bits.Indices())
+		}
+		gs.have.peers.Forget(p)
+		gs.have.pushed.Forget(p)
 	}
 }
 
@@ -540,14 +446,6 @@ type queueHave struct {
 	ownPickCtr *atomic.Int64
 	// onDispatch, when set, sees every data frame the writer pops for this peer (the ledger).
 	onDispatch func(m *pb.Message)
-	// onOriginPop, when set, sees them too, for the paced origin HAVE (WithOriginHavePaced).
-	onOriginPop func(m *pb.Message)
-	// originSent, when set, names the frames of groups we publish (OriginHaveSent): each pop of
-	// one to a mesh peer of its topic (originMesh, as the router last saw it) carries our HAVE
-	// naming shared[root], the frames of the group this peer and we exchanged.
-	originSent func(m *pb.Message) (root string, index uint32, ok bool)
-	shared     map[string]*haveBits
-	originMesh map[string]bool
 	// ownHeld, when set, reports whether we hold the frame an ask id names: dispatch drops such
 	// asks (enableStaleAsks).
 	ownHeld func(mid string) bool
@@ -576,7 +474,7 @@ func WithHaveDispatch(cancel, attach bool) Option {
 // dispatch is off. Router goroutine.
 func (gs *GossipSubRouter) haveQueue(p peer.ID) *rpcQueue {
 	h := gs.have
-	if h == nil || (!h.cancel && !h.attach && h.projectNeed == 0 && h.originPaced == nil && gs.seacast == nil) || gs.p == nil {
+	if h == nil || (!h.cancel && !h.attach && h.projectNeed == 0 && gs.seacast == nil) || gs.p == nil {
 		return nil
 	}
 	q, ok := gs.p.peers[p]
@@ -608,9 +506,8 @@ func (gs *GossipSubRouter) haveQueue(p peer.ID) *rpcQueue {
 		}
 		q.queueMu.Unlock()
 	}
-	// Asks for frames held by now leave no more (§7.2); so does an ask whose announcer's offer was
-	// dropped (seacast_f13.go), per queue.
-	q.enableStaleAsks(func(mid string) bool { return h.ownHeldID(mid) || gs.seacastAskDropped(p, mid) })
+	// Asks for frames held by now leave no more (§7.2).
+	q.enableStaleAsks(h.ownHeldID)
 	if h.rarest {
 		q.enableRarest(h.haveHolders)
 	}
@@ -630,14 +527,6 @@ func (gs *GossipSubRouter) haveQueue(p peer.ID) *rpcQueue {
 				led.pop(p, root, i, sha256.Sum256(m.GetData()), time.Now())
 			}
 		})
-	}
-	if o := h.originPaced; o != nil {
-		switch o.mode {
-		case OriginHavePaced:
-			q.enableOriginPop(gs.haveOriginPopped)
-		case OriginHaveSent:
-			q.enableOriginSent(h.originOwn)
-		}
 	}
 	return q
 }
@@ -669,7 +558,7 @@ func (gs *GossipSubRouter) havePendAll(p peer.ID, ids []string) bool {
 			claimAll = ca
 		}
 		v4, flags := gs.seacastHaveFlags(root, b, claimAll)
-		pends = append(pends, &pendHave{bits: &haveBits{b: append([]byte(nil), b.Bytes()...)}, v4: v4, flags: flags})
+		pends = append(pends, &pendHave{bits: newHaveBits(append([]byte(nil), b.Bytes()...)), v4: v4, flags: flags})
 	}
 	q := gs.haveQueue(p)
 	if q == nil || !q.havePend(roots, pends) {
@@ -763,134 +652,23 @@ func (q *rpcQueue) enableDispatchHook(fn func(*pb.Message)) {
 	}
 }
 
-// enableOriginPop installs the paced origin HAVE's pop observer once.
-func (q *rpcQueue) enableOriginPop(fn func(*pb.Message)) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.have != nil && q.have.onOriginPop == nil {
-		q.have.onOriginPop = fn
-	}
-}
-
-// enableOriginSent installs OriginHaveSent's frame test once.
-func (q *rpcQueue) enableOriginSent(own func(*pb.Message) (string, uint32, bool)) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.have != nil && q.have.originSent == nil {
-		q.have.originSent = own
-		q.have.shared = make(map[string]*haveBits)
-		q.have.originMesh = make(map[string]bool)
-	}
-}
-
-// haveOriginMesh records, for OriginHaveSent, whether p is in the mesh of the topics out sends
-// frames of, as it enqueues: a HAVE to a peer outside the mesh, such as an asker we answer, is
-// one no relay sends. Router goroutine, from sendRPC.
-func (gs *GossipSubRouter) haveOriginMesh(p peer.ID, q *rpcQueue, out *RPC) {
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.have == nil || q.have.originMesh == nil {
-		return
-	}
-	for _, m := range out.Publish {
-		_, in := gs.mesh[m.GetTopic()][p]
-		q.have.originMesh[m.GetTopic()] = in
-	}
-}
-
-// shareLocked adds index to what this peer and we exchanged of root and returns our HAVE for it.
-// Under queueMu.
-func (h *queueHave) shareLocked(root string, index uint32) string {
-	b := h.shared[root]
-	if b == nil {
-		b = &haveBits{}
-		h.shared[root] = b
-	}
-	b.Set(index)
-	return encodeHave(root, b)
-}
-
-// attachSent returns rpc carrying our HAVE for each group we publish that it sends frames of to
-// a mesh peer, naming the frames sent this peer so far; nil when it sends none (OriginHaveSent).
-// Under queueMu.
-func (h *queueHave) attachSent(rpc *RPC) *RPC {
-	if h.originSent == nil || len(rpc.Publish) == 0 {
-		return nil
-	}
-	var ids []string
-	idx := make(map[string]int)
-	for _, m := range rpc.Publish {
-		if !h.originMesh[m.GetTopic()] {
-			continue
-		}
-		root, index, ok := h.originSent(m)
-		if !ok {
-			continue
-		}
-		id := h.shareLocked(root, index)
-		if at, seen := idx[root]; seen {
-			ids[at] = id
-			continue
-		}
-		idx[root] = len(ids)
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	out := mergedControl(rpc, &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Idontwant: []*pb.ControlIDontWant{{MessageIDs: ids}}}}})
-	out.solicited = rpc.solicited
-	out.own = rpc.own
-	return out
-}
-
-// haveOriginSentAck is, under OriginHaveSent, our HAVE for a frame of a group we publish that p
-// pushed back to us: the frame joins what p and we exchanged, as a relay's acknowledgement names
-// what it received. Empty otherwise. Router goroutine.
-func (gs *GossipSubRouter) haveOriginSentAck(p peer.ID, mid string) []string {
-	h := gs.have
-	if h == nil || h.originPaced == nil || h.originPaced.mode != OriginHaveSent {
-		return nil
-	}
-	root, index, ok := h.index(mid)
-	if !ok {
-		return nil
-	}
-	o := h.originPaced
-	o.mu.Lock()
-	own := o.roots[root] != nil
-	o.mu.Unlock()
-	if !own {
-		return nil
-	}
-	q := gs.haveQueue(p)
-	if q == nil {
-		return nil
-	}
-	q.queueMu.Lock()
-	defer q.queueMu.Unlock()
-	if q.have == nil || q.have.shared == nil {
-		return nil
-	}
-	return []string{q.have.shareLocked(root, index)}
-}
-
 // rarestIndex picks, among the data RPCs ahead of the next control-only RPC in the normal lane,
-// the one whose messages the fewest peers have announced; -1 when the choice is the head (FIFO,
-// or nothing to choose among). Under queueMu.
-func (h *queueHave) rarestIndex(normal []rankedRPC) int {
-	if h.holders == nil || len(normal) < 2 || len(normal[0].rpc.Publish) == 0 {
+// the one whose messages the fewest peers have announced (core.Rarest); -1 when the choice is the
+// head (FIFO, or nothing to choose among). An entry counts its fewest holders, since it can carry
+// several messages; one whose holders are all unknown (a stock message) is not a candidate. Under
+// queueMu.
+func (h *queueHave) rarestIndex(normal []*RPC) int {
+	if h.holders == nil || len(normal) < 2 || len(normal[0].Publish) == 0 {
 		return -1
 	}
-	best, bestHolders := -1, 0
 	lead := replayLead(normal, h.index)
-	for i := range normal {
-		rpc := normal[i].rpc
+	best := core.Rarest(len(normal), func(i int) (int, core.EntryKind) {
+		rpc := normal[i]
 		if len(rpc.Publish) == 0 {
-			break // control keeps its place: nothing behind it may overtake it
+			return 0, core.Stop // control keeps its place: nothing behind it may overtake it
 		}
 		if rpc.replay && i >= lead {
-			continue // an owed answer behind a stock entry or control waits for it (replayLead)
+			return 0, core.Skip // an owed answer behind a stock entry or control waits for it (replayLead)
 		}
 		holders, known := 0, false
 		for _, m := range rpc.Publish {
@@ -903,12 +681,10 @@ func (h *queueHave) rarestIndex(normal []rankedRPC) int {
 			}
 		}
 		if !known {
-			continue
+			return 0, core.Skip
 		}
-		if best < 0 || holders < bestHolders { // strictly fewer holders, FIFO within a tie
-			best, bestHolders = i, holders
-		}
-	}
+		return holders, core.Candidate
+	})
 	if best <= 0 {
 		return -1
 	}
@@ -926,8 +702,8 @@ func (gs *GossipSubRouter) havePeerHolds(p peer.ID, root string, index uint32) b
 	if h == nil {
 		return false
 	}
-	e := h.peers[p][root]
-	return e != nil && e.bits.Has(index)
+	e := h.peers.Of(p, seacastGID(root))
+	return e != nil && e.Bits.Has(index)
 }
 
 // ownView mirrors what we hold (haveState.mine) for the writers, which drop at dispatch the asks
@@ -1032,32 +808,28 @@ func (h *queueHave) probeAnswerSpent(m *pb.Message) {
 }
 
 // dropHeldAsks returns rpc without the ask ids held reports, and how many it dropped; nil when
-// nothing worth writing is left. Never mutates rpc.
+// nothing worth writing is left. held is asked once per id. Never mutates rpc.
 func dropHeldAsks(rpc *RPC, held func(string) bool) (*RPC, int) {
 	n := 0
+	var iwants []*pb.ControlIWant
 	for _, w := range rpc.Control.GetIwant() {
+		var kept []string
 		for _, mid := range w.GetMessageIDs() {
 			if held(mid) {
 				n++
+				continue
 			}
+			kept = append(kept, mid)
+		}
+		if len(kept) > 0 {
+			iwants = append(iwants, &pb.ControlIWant{MessageIDs: kept})
 		}
 	}
 	if n == 0 {
 		return rpc, 0
 	}
 	c := rpc.Control
-	ctl := &pb.ControlMessage{Ihave: c.Ihave, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
-	for _, w := range c.Iwant {
-		var kept []string
-		for _, mid := range w.GetMessageIDs() {
-			if !held(mid) {
-				kept = append(kept, mid)
-			}
-		}
-		if len(kept) > 0 {
-			ctl.Iwant = append(ctl.Iwant, &pb.ControlIWant{MessageIDs: kept})
-		}
-	}
+	ctl := &pb.ControlMessage{Ihave: c.Ihave, Iwant: iwants, Graft: c.Graft, Prune: c.Prune, Idontwant: c.Idontwant, Extensions: c.Extensions}
 	out := shallowRPCCopy(rpc)
 	out.Control = ctl
 	if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
@@ -1089,7 +861,6 @@ func (q *rpcQueue) haveForgetRoot(root string) {
 		delete(q.have.theirs, root)
 		delete(q.have.pending, root)
 		delete(q.have.popped, root)
-		delete(q.have.shared, root)
 	}
 }
 
@@ -1176,15 +947,26 @@ func (h *queueHave) held(m *pb.Message) bool {
 	return b != nil && b.Has(index)
 }
 
-// projectedComplete reports whether the peer is projected to complete m's group without m:
-// what it said it holds plus fan-in times what we have sent it beyond that reaches need.
+// projectedComplete reports whether the peer is projected to complete m's group without m
+// (core.Projected): what it said it holds plus fan-in times what we have sent it beyond that
+// reaches need.
 func (h *queueHave) projectedComplete(m *pb.Message) bool {
-	need, _ := h.projection(m)
+	need, fanIn := h.projection(m)
 	if need == 0 {
 		return false
 	}
-	n, ok := h.projectedCount(m)
-	return ok && uint32(n) >= need // lint:ignore uintcast -- a popcount over at most haveMaxBytes*8 bits.
+	root, _, ok := h.index(m)
+	if !ok {
+		return false
+	}
+	var theirs, ours haveBits
+	if b := h.theirs[root]; b != nil {
+		theirs = *b
+	}
+	if b := h.popped[root]; b != nil {
+		ours = *b
+	}
+	return core.Projected(theirs, ours, int(need), fanIn)
 }
 
 // projection is the threshold and fan-in that apply to m: its type's where the path projects per
@@ -1196,29 +978,6 @@ func (h *queueHave) projection(m *pb.Message) (need uint32, fanIn int) {
 		}
 	}
 	return h.projectNeed, h.projectFanIn
-}
-
-// projectedCount is what the projection takes the peer to hold of m's group: what it announced,
-// plus projectFanIn times what we popped to it beyond that.
-func (h *queueHave) projectedCount(m *pb.Message) (int, bool) {
-	root, _, ok := h.index(m)
-	if !ok {
-		return 0, false
-	}
-	theirs, ours := h.theirs[root], h.popped[root]
-	n := 0
-	if theirs != nil {
-		n = theirs.Count()
-	}
-	if ours != nil {
-		unacked := ours
-		if theirs != nil {
-			unacked = ours.AndNot(theirs)
-		}
-		_, fanIn := h.projection(m)
-		n += fanIn * unacked.Count()
-	}
-	return n, true
 }
 
 // notePopped records that the writer sent m to the peer, for the projection.
@@ -1323,308 +1082,16 @@ func WithHaveAnnounceBitmaps() Option {
 	}
 }
 
-// WithOriginHave makes the publisher send its HAVE for each group it batch-publishes, as a receiver's goes. Requires WithHaveBitmaps.
-func WithOriginHave() Option {
-	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*GossipSubRouter)
-		if !ok {
-			return fmt.Errorf("origin HAVE requires a gossipsub router")
-		}
-		if gs.have == nil {
-			return fmt.Errorf("origin HAVE requires WithHaveBitmaps first")
-		}
-		if gs.have.originPaced != nil {
-			return fmt.Errorf("origin HAVE and an origin HAVE mode are exclusive")
-		}
-		gs.have.originHave = true
-		return nil
-	}
-}
-
-// OriginHaveMode is what our HAVE says of a group we publish, in place of every frame at publish,
-// which marks the source to its mesh before any frame has left.
-type OriginHaveMode int
-
-const (
-	// OriginHavePaced grows the HAVE as our writers pop the group's frames, as a relay's grows as
-	// frames arrive (WithOriginHavePaced).
-	OriginHavePaced OriginHaveMode = iota + 1
-	// OriginHaveNone sends no HAVE for the group at all, acknowledgements of pushed-back frames
-	// included: mesh peers learn what we hold only from our pushes and announces.
-	OriginHaveNone
-	// OriginHaveSent tells each peer, on the RPC carrying each frame we send it, a HAVE naming the
-	// frames we have sent it and it has pushed back: a relay that holds exactly what it shared.
-	OriginHaveSent
-)
-
-// WithOriginHavePaced makes our HAVE for a group we publish grow as our writers pop its frames, as
-// a relay's grows as frames arrive, instead of naming every frame at publish: a HAVE that full
-// before any frame has left marks the source to its mesh. Each pop that adds a
-// frame tells the topic's mesh the frames popped so far, through the path a receiver's HAVE takes,
-// and a peer we push a frame gets our HAVE naming it just ahead of the first one; until then,
-// publishing sends none. Requires WithHaveBitmaps; exclusive with WithOriginHave.
-func WithOriginHavePaced() Option { return WithOriginHaveMode(OriginHavePaced) }
-
-// WithOriginHaveMode sets what our HAVE says of a group we publish (OriginHaveMode). Requires
-// WithHaveBitmaps; exclusive with WithOriginHave.
-func WithOriginHaveMode(mode OriginHaveMode) Option {
-	return func(ps *PubSub) error {
-		gs, ok := ps.rt.(*GossipSubRouter)
-		if !ok {
-			return fmt.Errorf("origin HAVE mode requires a gossipsub router")
-		}
-		if gs.have == nil {
-			return fmt.Errorf("origin HAVE mode requires WithHaveBitmaps first")
-		}
-		if mode < OriginHavePaced || mode > OriginHaveSent {
-			return fmt.Errorf("unknown origin HAVE mode %d", mode)
-		}
-		h := gs.have
-		if h.originHave {
-			return fmt.Errorf("origin HAVE and an origin HAVE mode are exclusive")
-		}
-		h.originPaced = &originPaced{mode: mode, roots: make(map[string]*originPacedRoot)}
-		if h.msgIndex == nil {
-			h.msgIndex = func(m *pb.Message) (string, uint32, bool) { return h.index(ps.idGen.RawID(m)) }
-		}
-		return nil
-	}
-}
-
-// originPaced is WithOriginHaveMode's state, shared by the router and the writers under mu: per
-// group we publish, the frames our writers have popped and those the mesh has been told of.
-type originPaced struct {
-	mode  OriginHaveMode
-	mu    sync.Mutex
-	roots map[string]*originPacedRoot
-	// queued says a tell is on its way to the router; pops meanwhile ride it.
-	queued bool
-}
-
-// originOwn reports the root and index of m when it is a frame of a group we publish.
-func (h *haveState) originOwn(m *pb.Message) (string, uint32, bool) {
-	o := h.originPaced
-	if !o.publishing() {
-		return "", 0, false // a relay: no id to compute
-	}
-	root, index, ok := h.msgIndex(m)
-	if !ok {
-		return "", 0, false
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return root, index, o.roots[root] != nil
-}
-
-type originPacedRoot struct {
-	topic  string
-	popped haveBits
-	told   haveBits
-	// led is the peers we have pushed a frame of the group to, each told our HAVE ahead of it.
-	led map[peer.ID]bool
-}
-
-// publishing reports whether we have published a group whose HAVE follows the mode.
-func (o *originPaced) publishing() bool {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return len(o.roots) > 0
-}
-
-// haveOriginOwn records mid, a message we publish on topic, as one whose group's HAVE follows the mode.
-// Router goroutine, from Preprocess.
-func (gs *GossipSubRouter) haveOriginOwn(mid, topic string) {
-	h := gs.have
-	if h == nil || h.originPaced == nil {
-		return
-	}
-	root, _, ok := h.index(mid)
-	if !ok || len(root) != haveRootLen {
-		return
-	}
-	o := h.originPaced
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.roots[root] == nil {
-		o.roots[root] = &originPacedRoot{topic: topic}
-	}
-}
-
-// haveBitsFor is the bitmap our HAVE carries for root: what we hold, or for a group we publish
-// a copy of what our writers have popped under OriginHavePaced, and nothing under the per-peer
-// or silent modes; nil when there is nothing.
+// haveBitsFor is the bitmap our HAVE carries for root: for a group we publish on the path the
+// chunks acknowledged so far, else what we hold; nil when there is nothing.
 func (h *haveState) haveBitsFor(root string) *haveBits {
 	if b, ok := h.originAcks.bits(root); ok {
 		return b // a group we publish on the path: the chunks acknowledged so far (v0.9)
 	}
-	if o := h.originPaced; o != nil {
-		o.mu.Lock()
-		r := o.roots[root]
-		var popped []byte
-		if r != nil && o.mode == OriginHavePaced {
-			popped = append(popped, r.popped.Bytes()...)
-		}
-		o.mu.Unlock()
-		if r != nil {
-			if len(popped) == 0 {
-				return nil
-			}
-			return &haveBits{b: popped}
-		}
-	}
-	if e := h.mine[root]; e != nil {
-		return &e.bits
+	if e := h.mine[seacastGID(root)]; e != nil {
+		return &e.Bits
 	}
 	return nil
-}
-
-// haveOriginPopped notes that a writer popped m: a frame of a group we publish joins our HAVE,
-// and the first such pop since the last tell queues one on the router. Writer goroutine.
-func (gs *GossipSubRouter) haveOriginPopped(m *pb.Message) {
-	h := gs.have
-	o := h.originPaced
-	root, index, ok := h.originOwn(m)
-	if !ok {
-		return
-	}
-	o.mu.Lock()
-	r := o.roots[root]
-	if r == nil || r.popped.Has(index) {
-		o.mu.Unlock()
-		return
-	}
-	r.popped.Set(index)
-	wake := !o.queued
-	o.queued = true
-	o.mu.Unlock()
-	if wake {
-		// Never block a writer on the router, which may be waiting on this queue's lock.
-		go func() {
-			select {
-			case gs.p.eval <- gs.haveOriginTell:
-			case <-gs.p.ctx.Done():
-			}
-		}()
-	}
-}
-
-// haveOriginOffered notes, under a source push quota, that we offered mid, a frame of a group we
-// publish: it joins our paced HAVE as a popped frame does, since a relay only offers what it holds
-// and names it to its whole mesh. Router goroutine, from the offer paths.
-func (gs *GossipSubRouter) haveOriginOffered(mid string) {
-	h := gs.have
-	if h == nil || h.originPaced == nil || h.originPaced.mode != OriginHavePaced || gs.phaseForward == nil || gs.phaseForward.srcPushQuota == 0 {
-		return
-	}
-	root, index, ok := h.index(mid)
-	if !ok {
-		return
-	}
-	o := h.originPaced
-	o.mu.Lock()
-	r := o.roots[root]
-	if r == nil || r.popped.Has(index) {
-		o.mu.Unlock()
-		return
-	}
-	r.popped.Set(index)
-	wake := !o.queued
-	o.queued = true
-	o.mu.Unlock()
-	if wake {
-		go func() {
-			select {
-			case gs.p.eval <- gs.haveOriginTell:
-			case <-gs.p.ctx.Done():
-			}
-		}()
-	}
-}
-
-// haveOriginTell sends the mesh our HAVE for each group we publish whose writers popped frames
-// since the last tell, naming the new frames' ids as Preprocess names a receiver's. Router goroutine.
-func (gs *GossipSubRouter) haveOriginTell() {
-	h := gs.have
-	o := h.originPaced
-	type tell struct {
-		topic, root string
-		mids        []string
-	}
-	var tells []tell
-	o.mu.Lock()
-	o.queued = false
-	roots := make([]string, 0, len(o.roots))
-	for root := range o.roots {
-		roots = append(roots, root)
-	}
-	sort.Strings(roots)
-	for _, root := range roots {
-		r := o.roots[root]
-		fresh := r.popped.AndNot(&r.told)
-		if len(fresh.Bytes()) == 0 {
-			continue
-		}
-		r.told.Or(fresh.Bytes())
-		known := h.mids[root]
-		if known == nil {
-			continue
-		}
-		var mids []string
-		for i := uint32(0); i < uint32(len(fresh.b))*8; i++ {
-			if mid, ok := known.ids[i]; ok && fresh.Has(i) {
-				mids = append(mids, mid)
-			}
-		}
-		if len(mids) > 0 {
-			tells = append(tells, tell{topic: r.topic, root: root, mids: mids})
-		}
-	}
-	o.mu.Unlock()
-	for _, t := range tells {
-		gs.idontwantMesh(t.topic, t.mids, "")
-	}
-}
-
-// haveOriginLead sends p, ahead of the first frame of a group we publish that rpc pushes it, our
-// HAVE naming what our writers have popped and that frame, alone in the urgent lane: a relay's
-// HAVE reaches its push target before the frame does, and a source whose first frame led its
-// first HAVE would stand out. Router goroutine, from the publish paths.
-func (gs *GossipSubRouter) haveOriginLead(p peer.ID, rpc *RPC) {
-	h := gs.have
-	if h == nil || h.originPaced == nil || h.originPaced.mode != OriginHavePaced || len(rpc.Publish) == 0 || !h.originPaced.publishing() {
-		return
-	}
-	o := h.originPaced
-	for _, m := range rpc.Publish {
-		root, index, ok := h.msgIndex(m)
-		if !ok {
-			continue
-		}
-		o.mu.Lock()
-		r := o.roots[root]
-		if r == nil || r.led[p] {
-			o.mu.Unlock()
-			continue
-		}
-		if r.led == nil {
-			r.led = make(map[peer.ID]bool)
-		}
-		r.led[p] = true
-		bits := &haveBits{b: append([]byte(nil), r.popped.Bytes()...)}
-		o.mu.Unlock()
-		bits.Set(index)
-		if gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) {
-			idontwant := []*pb.ControlIDontWant{{MessageIDs: []string{encodeHave(root, bits)}}}
-			gs.sendRPC(p, rpcWithControl(nil, nil, nil, nil, nil, idontwant), true)
-		}
-	}
-}
-
-// forget drops an aged-out group.
-func (o *originPaced) forget(root string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	delete(o.roots, root)
 }
 
 // haveNoteServable records a validated message we forward, or one of our own, as held: what
@@ -1652,22 +1119,16 @@ func (gs *GossipSubRouter) haveNotePushed(p peer.ID, mid string) {
 	if !ok || len(root) != haveRootLen {
 		return
 	}
-	roots := h.pushed[p]
-	if roots == nil {
-		roots = make(map[string]*haveEntry)
-		h.pushed[p] = roots
-	}
-	e := roots[root]
-	if e == nil {
-		e = &haveEntry{first: time.Now()}
-		roots[root] = e
-	} else if gs.v05OfferSkipped() && e.bits.Count() == 0 {
+	e, made := h.pushed.Entry(p, seacastGID(root))
+	if made {
+		e.First = time.Now()
+	} else if gs.v05OfferSkipped() && e.Bits.Count() == 0 {
 		// Every push counted to p was skipped or refused (v0.5's A′): the guard's clock starts
 		// again at this one, which p can receive.
-		e.first = time.Now()
+		e.First = time.Now()
 	}
-	e.bits.Set(index)
-	e.ttl = h.pushTTL
+	e.Bits.Set(index)
+	e.TTL = h.pushTTL
 	if gs.v05OfferSkipped() {
 		if q, ok := gs.p.peers[p]; ok {
 			q.unowe(root, index) // pushed now: no longer owed as an offer
@@ -1727,11 +1188,11 @@ func (gs *GossipSubRouter) haveIHaveIDs(p peer.ID, mids []string) []string {
 			continue
 		}
 		b := bits[root]
-		if pe := h.pushed[p]; pe != nil && pe[root] != nil {
-			b = b.AndNot(&pe[root].bits)
+		if pe := h.pushed.Of(p, seacastGID(root)); pe != nil {
+			b = b.AndNot(&pe.Bits)
 		}
-		if pe := h.peers[p]; pe != nil && pe[root] != nil {
-			b = b.AndNot(&pe[root].bits)
+		if pe := h.peers.Of(p, seacastGID(root)); pe != nil {
+			b = b.AndNot(&pe.Bits)
 		}
 		if len(b.Bytes()) == 0 {
 			continue
@@ -1751,8 +1212,8 @@ func (gs *GossipSubRouter) haveSeen(mid string) bool {
 		return false
 	}
 	if root, index, ok := decodeWant(mid); ok {
-		e := h.mine[root]
-		return e != nil && e.bits.Has(index)
+		e := h.mine[seacastGID(root)]
+		return e != nil && e.Bits.Has(index)
 	}
 	return false
 }
@@ -1766,12 +1227,12 @@ func (gs *GossipSubRouter) haveExpandIHave(root string, enc []byte) []string {
 	}
 	var theirs haveBits
 	theirs.Or(enc)
-	mine := h.mine[root]
+	mine := h.mine[seacastGID(root)]
 	known := h.mids[root]
 	var out []string
-	for i := 0; i < len(theirs.b)*8; i++ {
+	for i := 0; i < len(theirs)*8; i++ {
 		index := uint32(i) // lint:ignore uintcast -- bounded by haveMaxBytes*8.
-		if !theirs.Has(index) || (mine != nil && mine.bits.Has(index)) {
+		if !theirs.Has(index) || (mine != nil && mine.Bits.Has(index)) {
 			continue
 		}
 		if known != nil {
@@ -1786,17 +1247,18 @@ func (gs *GossipSubRouter) haveExpandIHave(root string, enc []byte) []string {
 }
 
 // haveResolveWant maps an ask by index to the id we hold at it. skip is true when the ask cannot
-// be served: the index is unknown or not held. An ordinary id comes back as itself.
+// be served: the index is unknown or not held. An ordinary id comes back as itself, except a
+// chunk's id on the path (haveResolveID).
 func (gs *GossipSubRouter) haveResolveWant(mid string) (real string, skip bool) {
 	root, index, ok := decodeWant(mid)
 	if !ok {
-		return mid, false
+		return gs.haveResolveID(mid), false
 	}
 	h := gs.have
 	if h == nil {
 		return "", true
 	}
-	if m := h.mine[root]; m == nil || !m.bits.Has(index) {
+	if m := h.mine[seacastGID(root)]; m == nil || !m.Bits.Has(index) {
 		return "", true
 	}
 	known := h.mids[root]
@@ -1805,6 +1267,32 @@ func (gs *GossipSubRouter) haveResolveWant(mid string) (real string, skip bool) 
 	}
 	real, ok = known.ids[index]
 	return real, !ok
+}
+
+// haveResolveID is an ask by a chunk's id on the path, resolved as an ask by its index is: to the id
+// we hold at that index, when we hold it (seacast-lite.md §4.5's resolve, [c7]: our chunk at that
+// index, received or rebuilt). Two ids can name one index when an id carries the content's hash, so
+// an ask under another id of the index, as a forged offer could have taught the asker, is answered
+// with our chunk. An id whose index we don't hold, any id off the path, and an id of no group come
+// back as themselves.
+func (gs *GossipSubRouter) haveResolveID(mid string) string {
+	h := gs.have
+	if h == nil || gs.seacast == nil {
+		return mid
+	}
+	root, index, ok := h.index(mid)
+	if !ok || len(root) != haveRootLen {
+		return mid
+	}
+	if m := h.mine[seacastGID(root)]; m == nil || !m.Bits.Has(index) {
+		return mid
+	}
+	if known := h.mids[root]; known != nil {
+		if id, ok := known.ids[index]; ok {
+			return id
+		}
+	}
+	return mid
 }
 
 // haveArrived closes the ask an arriving message was made under when it was made by index:
@@ -1867,10 +1355,36 @@ func dedupeHaveIHave(pending []*pb.ControlIHave, next *pb.ControlIHave) {
 // data ahead of the next control RPC -- so IHAVE's queueing delay is
 // untouched by construction.
 
-// holderCounts is peers known to hold each index of each root, from their HAVE bitmaps.
+// holderCounts is peers known to hold each index of each root, from their HAVE bitmaps: the live
+// holders (seacast-lite.md §4.3's holders). Each index a peer newly holds counts once (haveAbsorb),
+// and a peer leaves the counts when its holding of the group ages out or its connection closes
+// (haveHeartbeat, haveForget), so a root's counts are always its group's live holdings; the root
+// goes with its last holder. The router writes it, and the writer reads it at Pop under its own lock,
+// one count at a time.
 type holderCounts struct {
 	mu     sync.Mutex
 	counts map[string][]int32
+}
+
+// remove takes one holder out of each of indices of root, and the root once it has none left.
+func (c *holderCounts) remove(root string, indices []uint32) {
+	if c == nil || len(indices) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	arr := c.counts[root]
+	for _, i := range indices {
+		if int(i) < len(arr) && arr[i] > 0 {
+			arr[i]--
+		}
+	}
+	for _, n := range arr {
+		if n > 0 {
+			return
+		}
+	}
+	delete(c.counts, root)
 }
 
 func (c *holderCounts) add(root string, indices []uint32) {
@@ -1900,12 +1414,6 @@ func (c *holderCounts) get(root string, index uint32) int {
 		return 0
 	}
 	return int(arr[index])
-}
-
-func (c *holderCounts) forget(root string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.counts, root)
 }
 
 // WithHaveRarestDispatch makes each peer's writer pop, among the queued data frames ahead of
@@ -2071,53 +1579,33 @@ func fullHaveBits(count uint32) *haveBits {
 	return &b
 }
 
-// haveOriginPushed notes that a batch pushed mid to p, keyed by mid's root; nil pushed means origin HAVE is off.
-func (gs *GossipSubRouter) haveOriginPushed(pushed map[string]map[peer.ID]struct{}, mid string, p peer.ID) {
-	if pushed == nil {
-		return
-	}
-	root, _, ok := gs.have.index(mid)
-	if !ok || len(root) != haveRootLen {
-		return
-	}
-	if pushed[root] == nil {
-		pushed[root] = make(map[peer.ID]struct{})
-	}
-	pushed[root][p] = struct{}{}
-}
-
-// haveOrigin sends our HAVE for each group in a publish, once, to the topic's mesh, and under
-// WithOriginHave also to the peers the batch pushed it to: the HAVE a source sends before its data,
-// so no relay pushes its frames back (the spec's §5.1 before P4). Preprocess no longer sends one per
-// message as each is added to a batch, N growing HAVEs before the data. Not under an origin HAVE
-// mode, whose HAVE follows the pops (P4) or the mode's rule. Router goroutine.
-func (gs *GossipSubRouter) haveOrigin(msgs []*Message, pushed map[string]map[peer.ID]struct{}) {
+// haveOrigin sends our HAVE for each group in a publish, once, to the topic's mesh: the HAVE a
+// source sends before its data, so no relay pushes its frames back. Preprocess no longer sends one
+// per message as each is added to a batch, N growing HAVEs before the data. A group we publish on
+// the path is left out: its holding grows at each acknowledgement (seacast_origin.go). Router
+// goroutine.
+func (gs *GossipSubRouter) haveOrigin(msgs []*Message) {
 	h := gs.have
-	if h == nil || h.originPaced != nil {
+	if h == nil {
 		return
 	}
 	sent := make(map[string]bool)
 	for _, msg := range msgs {
-		if !h.originHave && len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
-			continue // by default only where stock IDONTWANT would have gone, above its threshold
+		if len(msg.GetData()) < gs.params.IDontWantMessageThreshold {
+			continue // only where stock IDONTWANT would have gone, above its threshold
 		}
 		root, _, ok := h.index(gs.p.idGen.ID(msg))
-		if !ok || len(root) != haveRootLen || sent[root] || h.mine[root] == nil {
+		if !ok || len(root) != haveRootLen || sent[root] || h.mine[seacastGID(root)] == nil {
 			continue
 		}
 		if _, own := h.originAcks.bits(root); own {
 			continue // the source's holding grows at each acknowledgement instead (seacast_origin.go)
 		}
 		sent[root] = true
-		mid := gs.seacastEncodeHave(root, &h.mine[root].bits, false) // v4 on the path's roots, v1 otherwise
-		to := make([]peer.ID, 0, len(gs.mesh[msg.GetTopic()])+len(pushed[root]))
+		mid := gs.seacastEncodeHave(root, &h.mine[seacastGID(root)].Bits, false) // v4 on the path's roots, v1 otherwise
+		to := make([]peer.ID, 0, len(gs.mesh[msg.GetTopic()]))
 		for p := range gs.mesh[msg.GetTopic()] {
 			to = append(to, p)
-		}
-		for p := range pushed[root] {
-			if _, inMesh := gs.mesh[msg.GetTopic()][p]; !inMesh {
-				to = append(to, p)
-			}
 		}
 		sort.Slice(to, func(i, j int) bool { return to[i] < to[j] })
 		for _, pid := range to {
@@ -2274,7 +1762,7 @@ func (gs *GossipSubRouter) rebuilt(topic string, data [][]byte, cfg RebuiltConfi
 			r.announcedTo.Add(1)
 			for _, id := range ids {
 				if _, b, ok := decodeHave(id); ok {
-					hb := haveBits{b: []byte(b)}
+					hb := haveBits([]byte(b))
 					r.announced.Add(int64(hb.Count()))
 				}
 			}
@@ -2282,11 +1770,11 @@ func (gs *GossipSubRouter) rebuilt(topic string, data [][]byte, cfg RebuiltConfi
 	case RebuiltPush:
 		for _, pid := range gs.pushOrder(gs.mesh[topic]) {
 			var known haveBits
-			if e := h.peers[pid][root]; e != nil {
-				known.Or(e.bits.Bytes())
+			if e := h.peers.Of(pid, seacastGID(root)); e != nil {
+				known.Or(e.Bits.Bytes())
 			}
-			if e := h.pushed[pid][root]; e != nil {
-				known.Or(e.bits.Bytes())
+			if e := h.pushed.Of(pid, seacastGID(root)); e != nil {
+				known.Or(e.Bits.Bytes())
 			}
 			short := cfg.Need - known.Count()
 			if short <= 0 {

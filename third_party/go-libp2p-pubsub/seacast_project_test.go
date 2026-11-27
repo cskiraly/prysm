@@ -69,7 +69,7 @@ func TestSeacastTypeProjection(t *testing.T) {
 		}
 		holds := func(gs *GossipSubRouter, root string, index uint32) (held bool) {
 			read(gs, func() {
-				if m := gs.have.mine[root]; m != nil && m.bits.Has(index) {
+				if m := gs.have.mine[seacastGID(root)]; m != nil && m.Bits.Has(index) {
 					held = true
 				}
 			})
@@ -223,9 +223,9 @@ func TestSeacastTypeProjectionFanIn(t *testing.T) {
 				time.Sleep(time.Second)
 				got, skipped := 0, int64(0)
 				read(gsA, func() {
-					if m := gsA.have.mine[rowRoot]; m != nil {
+					if m := gsA.have.mine[seacastGID(rowRoot)]; m != nil {
 						for _, i := range []uint32{100, 101, 102} {
-							if m.bits.Has(i) {
+							if m.Bits.Has(i) {
 								got++
 							}
 						}

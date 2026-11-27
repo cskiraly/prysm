@@ -3,6 +3,7 @@ module github.com/libp2p/go-libp2p-pubsub
 go 1.26.6
 
 require (
+	github.com/cskiraly/seacast-go v0.1.0
 	github.com/libp2p/go-buffer-pool v0.1.0
 	github.com/libp2p/go-libp2p v0.51.0
 	github.com/libp2p/go-libp2p-testing v0.12.0
@@ -24,6 +25,7 @@ require (
 	github.com/dunglas/httpsfv v1.1.1 // indirect
 	github.com/filecoin-project/go-clock v0.1.0 // indirect
 	github.com/flynn/noise v1.1.0 // indirect
+	github.com/golang/snappy v1.0.1-0.20260716114414-9ae09f520e93 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect

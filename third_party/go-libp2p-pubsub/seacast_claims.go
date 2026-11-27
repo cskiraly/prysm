@@ -41,19 +41,19 @@ type seacastProbe struct {
 // seacastKnownInScope is known_in_scope(g). Router goroutine.
 func (gs *GossipSubRouter) seacastKnownInScope(T ObjectType, root string) *haveBits {
 	known := &haveBits{}
-	if m := gs.have.mine[root]; m != nil {
-		known.Or(m.bits.Bytes())
+	if m := gs.have.mine[seacastGID(root)]; m != nil {
+		known.Or(m.Bits.Bytes())
 	}
 	topic, ok := T.TopicOf(root)
 	if !ok {
 		return known
 	}
 	for q := range gs.mesh[topic] {
-		e := gs.have.peers[q][root]
-		if e == nil || e.claimAll {
+		e := gs.have.peers.Of(q, seacastGID(root))
+		if e == nil || e.ClaimAll {
 			continue // (R5) a claim counts for nothing here
 		}
-		known.Or(e.bits.Bytes())
+		known.Or(e.Bits.Bytes())
 	}
 	return known
 }
@@ -69,20 +69,14 @@ func (gs *GossipSubRouter) seacastReceived(root string, index uint32) bool {
 
 // seacastHeld reports whether the node holds index of root (received or rebuilt). Router goroutine.
 func (gs *GossipSubRouter) seacastHeld(root string, index uint32) bool {
-	m := gs.have.mine[root]
-	return m != nil && m.bits.Has(index)
+	m := gs.have.mine[seacastGID(root)]
+	return m != nil && m.Bits.Has(index)
 }
 
 // seacastClaimants is the group's claims set: the peers whose holding claims every index. Router
 // goroutine.
 func (gs *GossipSubRouter) seacastClaimants(root string) []peer.ID {
-	var out []peer.ID
-	for q, roots := range gs.have.peers {
-		if e := roots[root]; e != nil && e.claimAll {
-			out = append(out, q)
-		}
-	}
-	return out
+	return gs.have.peers.Claimants(seacastGID(root))
 }
 
 // seacastNoteClaim is note_claim(p, g), from every v4 holding that claims (on_holding): on a group whose
@@ -93,12 +87,12 @@ func (gs *GossipSubRouter) seacastNoteClaim(p peer.ID, root string) {
 		return
 	}
 	sc.ctr.ClaimsNoted.Add(1)
-	g := sc.groups[root]
+	g := sc.group(root)
 	T := gs.seacastRootType(root)
-	if g == nil || T == nil || g.reconsiderAt.IsZero() || g.state != seacastComplete || g.probe != nil {
+	if g == nil || T == nil || g.ReconsiderAt.IsZero() || g.State != seacastComplete || g.Ext != nil {
 		return
 	}
-	if m := gs.have.mine[root]; m != nil && m.bits.Count() >= T.IndexCount(root) {
+	if m := gs.have.mine[seacastGID(root)]; m != nil && m.Bits.Count() >= T.IndexCount(root) {
 		return
 	}
 	gs.seacastDeferOnClaim(T, root)
@@ -141,9 +135,9 @@ func (gs *GossipSubRouter) seacastDeferOnClaim(T ObjectType, root string) {
 	q := cands[rand.IntN(len(cands))]
 	mid := encodeWantV2Probe(root, index) // (R5) marked: answered whatever we hold
 	asked := time.Now()
-	dutyAt := g.reconsiderAt // the duty's own time (duty_at): a probe with no verdict returns to it
+	dutyAt := g.ReconsiderAt // the duty's own time (duty_at): a probe with no verdict returns to it
 	gs.haveQueue(q)          // the queue's hooks, the write report's among them, before the probe is queued
-	g.probe = &seacastProbe{index: index, asked: q, mid: mid, at: asked, dutyAt: dutyAt}
+	g.Ext = &seacastProbe{index: index, asked: q, mid: mid, at: asked, dutyAt: dutyAt}
 	if sc.probeAsks == nil {
 		sc.probeAsks = map[string]struct{}{}
 	}
@@ -166,7 +160,7 @@ func (gs *GossipSubRouter) seacastDeferOnClaim(T ObjectType, root string) {
 	if !written {
 		// (R5, spec 43fe953) refused by a full queue, never written: no verdict, and our own repair is
 		// reconsidered at the duty's own time, at once if that has passed.
-		g.probe.verdict, g.probe.noVerdict = true, true
+		g.Ext.verdict, g.Ext.noVerdict = true, true
 		sc.ctr.ProbesRefused.Add(1)
 		sc.ctr.ProbesNoVerdict.Add(1)
 		gs.seacastProbeWait(q, mid, false)
@@ -184,8 +178,8 @@ func (gs *GossipSubRouter) seacastDeferOnClaim(T ObjectType, root string) {
 		window = time.Second
 	}
 	at := asked.Add(window)
-	if g.reconsiderAt.After(at) {
-		at = g.reconsiderAt
+	if g.ReconsiderAt.After(at) {
+		at = g.ReconsiderAt
 	}
 	gs.seacastArm(root, at)
 }
@@ -198,17 +192,17 @@ func (gs *GossipSubRouter) seacastDeferOnClaim(T ObjectType, root string) {
 func (gs *GossipSubRouter) seacastProbeDue(root, mid string, q peer.ID, index uint32, asked time.Time) {
 	sc := gs.seacast
 	delete(sc.probeAsks, mid)
-	if expired, _ := gs.seacastRootState(root); expired || sc.groups[root] == nil {
+	if expired, _ := gs.seacastRootState(root); expired || sc.group(root) == nil {
 		return // the group passed its lifetime or was dropped: no promise is owed any more
 	}
-	g := sc.groups[root]
-	if g.probe == nil || g.probe.mid != mid || g.probe.asked != q || !g.probe.at.Equal(asked) || g.probe.cancelled {
+	g := sc.group(root)
+	if g.Ext == nil || g.Ext.mid != mid || g.Ext.asked != q || !g.Ext.at.Equal(asked) || g.Ext.cancelled {
 		return // not this probe's promise any more, or its connection closed meanwhile (seacastProbeGone)
 	}
 	if _, connected := gs.peers[q]; !connected {
 		return // the connection closed: its promise goes with it
 	}
-	g.probe.judged = true
+	g.Ext.judged = true
 	if gs.seacastReceived(root, index) {
 		sc.ctr.ProbesAnswered.Add(1)
 		sc.event(SeacastEvProbeAnswered, root)
@@ -216,7 +210,7 @@ func (gs *GossipSubRouter) seacastProbeDue(root, mid string, q peer.ID, index ui
 		sc.ctr.ProbesBroken.Add(1)
 		sc.event(SeacastEvProbeBroken, root)
 	}
-	if !g.probe.own {
+	if !g.Ext.own {
 		gs.notePromiseBreak(mid, q) // (R5) only the claimant's own copy keeps its promise
 	}
 }
@@ -231,14 +225,14 @@ func (gs *GossipSubRouter) seacastReconsiderVerdict(T ObjectType, root string, g
 		sc.ctr.DutiesCancelled.Add(1)
 		return true // whole in the subnet's view: nothing to rebuild
 	}
-	if g.probe != nil && gs.seacastReceived(root, g.probe.index) {
+	if g.Ext != nil && gs.seacastReceived(root, g.Ext.index) {
 		sc.ctr.ClaimsVerified.Add(1)
 		sc.event(SeacastEvVerified, root)
 		return true // (R5) the claim held and its repair reached us
 	}
-	if g.probe == nil && len(gs.seacastClaimants(root)) > 0 {
+	if g.Ext == nil && len(gs.seacastClaimants(root)) > 0 {
 		gs.seacastDeferOnClaim(T, root)
-		if g.probe != nil {
+		if g.Ext != nil {
 			return true // (R5) a claim: the one deferral
 		}
 	}
@@ -271,9 +265,13 @@ func (gs *GossipSubRouter) seacastProbeGone(p peer.ID) {
 	for _, w := range sc.probeWaiting {
 		delete(w, p) // and its probes kept while we decoded
 	}
+	if sc.gm == nil {
+		return
+	}
 	now := time.Now()
-	for root, g := range sc.groups {
-		pr := g.probe
+	for gid, g := range sc.gm.All() {
+		root := seacastGIDRoot(gid)
+		pr := g.Ext
 		if pr == nil || pr.asked != p {
 			continue
 		}

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -117,20 +118,20 @@ func TestSeacastProbe(t *testing.T) {
 				var probeIndex uint32
 				read(func() {
 					// A's claim, as a v4 holding with claim_all would bring it: every index.
-					e := gsB.have.peers[A][root]
+					e := gsB.have.peers[A][seacastGID(root)]
 					if e == nil {
 						t.Fatal("B has no ledger entry for A")
 					}
-					e.bits.Or(fullHaveBits(8).Bytes())
+					e.Bits.Or(fullHaveBits(8).Bytes())
 					T := gsB.seacastRootType(root)
 					viewWithout = gsB.seacastKnownInScope(T, root).Count()
-					e.claimAll = true
+					e.ClaimAll = true
 					viewWith = gsB.seacastKnownInScope(T, root).Count()
 					gsB.seacastNoteClaim(A, root)
 					asked = time.Now()
 					other := byte(6)
-					if g := gsB.seacast.groups[root]; g != nil && g.probe != nil {
-						probeMid, probeIndex = g.probe.mid, g.probe.index
+					if g := gsB.seacast.group(root); g != nil && g.Ext != nil {
+						probeMid, probeIndex = g.Ext.mid, g.Ext.index
 						probeAllowed = gsB.requestAllowed(A, topic, probeMid)
 						// The positive control: the same id with neither exemption, its id's nor its cell's.
 						delete(gsB.seacast.probeAsks, probeMid)
@@ -170,7 +171,7 @@ func TestSeacastProbe(t *testing.T) {
 					gsC, B := c.rt.(*GossipSubRouter), hosts[1].ID()
 					done := make(chan struct{})
 					gsC.p.eval <- func() {
-						delete(gsC.have.peers[B], root)
+						delete(gsC.have.peers[B], seacastGID(root))
 						if q := gsC.p.peers[B]; q != nil && q.have != nil {
 							q.queueMu.Lock()
 							delete(q.have.theirs, root)
@@ -304,15 +305,15 @@ func TestSeacastProbeAllowance(t *testing.T) {
 					defer close(done)
 					claim := func(q peer.ID) {
 						if gsB.have.peers[q] == nil {
-							gsB.have.peers[q] = map[string]*haveEntry{}
+							gsB.have.peers[q] = map[core.GroupID]*core.PeerHolding{}
 						}
-						e := gsB.have.peers[q][root]
+						e := gsB.have.peers[q][seacastGID(root)]
 						if e == nil {
-							e = &haveEntry{}
-							gsB.have.peers[q][root] = e
+							e = &core.PeerHolding{}
+							gsB.have.peers[q][seacastGID(root)] = e
 						}
-						e.bits.Or(fullHaveBits(8).Bytes())
-						e.claimAll = true
+						e.Bits.Or(fullHaveBits(8).Bytes())
+						e.ClaimAll = true
 					}
 					claim(A)
 					if c.cClaims {
@@ -323,8 +324,8 @@ func TestSeacastProbeAllowance(t *testing.T) {
 					}
 					gsB.seacast.askedOf[root] = map[peer.ID]int{A: c.askedA}
 					gsB.seacastNoteClaim(A, root)
-					if g := gsB.seacast.groups[root]; g != nil && g.probe != nil {
-						probed, asked = true, g.probe.asked
+					if g := gsB.seacast.group(root); g != nil && g.Ext != nil {
+						probed, asked = true, g.Ext.asked
 					}
 				}
 				<-done
@@ -415,10 +416,10 @@ func TestSeacastClaimBeforeArming(t *testing.T) {
 			<-done
 		}
 		read(func() {
-			e := gsB.have.peers[C][root]
-			claimed = e != nil && e.claimAll
-			g := gsB.seacast.groups[root]
-			armed = g != nil && !g.reconsiderAt.IsZero()
+			e := gsB.have.peers[C][seacastGID(root)]
+			claimed = e != nil && e.ClaimAll
+			g := gsB.seacast.group(root)
+			armed = g != nil && !g.ReconsiderAt.IsZero()
 		})
 		if !claimed || armed || ctr.ClaimsNoted.Load() == 0 || ctr.ProbesAsked.Load() != 0 {
 			t.Fatalf("before K: C's claim seen %v, B armed %v, claims noted %d, probes %d; want true, false, at least 1, 0",
@@ -430,8 +431,8 @@ func TestSeacastClaimBeforeArming(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		var reconsiderAt time.Time
 		read(func() {
-			if g := gsB.seacast.groups[root]; g != nil {
-				reconsiderAt = g.reconsiderAt
+			if g := gsB.seacast.group(root); g != nil {
+				reconsiderAt = g.ReconsiderAt
 			}
 		})
 		if reconsiderAt.IsZero() || ctr.ProbesAsked.Load() != 0 {
@@ -440,8 +441,8 @@ func TestSeacastClaimBeforeArming(t *testing.T) {
 		time.Sleep(time.Until(reconsiderAt) + 10*time.Millisecond)
 		var probed peer.ID
 		read(func() {
-			if g := gsB.seacast.groups[root]; g != nil && g.probe != nil {
-				probed = g.probe.asked
+			if g := gsB.seacast.group(root); g != nil && g.Ext != nil {
+				probed = g.Ext.asked
 			}
 		})
 		if ctr.ProbesAsked.Load() != 1 || probed != C || ctr.LateDecodes.Load() != 0 {

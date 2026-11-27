@@ -12,6 +12,7 @@ package pubsub
 // and peers below the gossip threshold left out, max(D_lazy, GOSSIP_FACTOR × eligible) of them.
 
 import (
+	core "github.com/cskiraly/seacast-go"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -69,11 +70,7 @@ func (gs *GossipSubRouter) seacastEmitGossip(topics []string) {
 	for p := range cands {
 		peers = append(peers, p)
 	}
-	target := gs.params.Dlazy
-	if factor := int(gs.params.GossipFactor * float64(len(peers))); factor > target {
-		target = factor
-	}
-	if target < len(peers) {
+	if target := core.GossipCount(len(peers), gs.params.Dlazy, gs.params.GossipFactor); target < len(peers) {
 		shufflePeers(peers)
 		peers = peers[:target]
 	}
@@ -81,18 +78,41 @@ func (gs *GossipSubRouter) seacastEmitGossip(topics []string) {
 		var job []pacedTopicIDs
 		n := 0
 		for _, topic := range cands[p] {
-			mids := perTopic[topic]
-			if len(mids) > gs.params.MaxIHaveLength {
-				cp := make([]string, len(mids))
-				copy(cp, mids)
-				shuffleStrings(cp)
-				mids = cp[:gs.params.MaxIHaveLength]
-			}
-			job = append(job, pacedTopicIDs{topic: topic, mids: append([]string(nil), mids...)})
+			mids := gs.seacastGossipCap(perTopic[topic])
+			job = append(job, pacedTopicIDs{topic: topic, mids: mids})
 			n += len(mids)
 		}
 		gs.gossipToTyped(p, job)
 		sc.ctr.GossipJobs.Add(1)
 		sc.ctr.GossipIdsOffered.Add(int64(n))
 	}
+}
+
+// seacastGossipCap is a typed job's ids of one topic, cut to MaxIHaveLength as the stock gossip cuts
+// a topic's: the ids drawn, and a copy returned, since the job keeps it past the heartbeat. With HAVE
+// bitmaps announced, a group's ids go out as one bitmap, whose size the group's count bounds and which
+// the spec sends whole (seacast-lite.md §4.4), so only the ids that go out as ids count and are cut. An
+// index of MAX_PLAIN_CHUNKS or more is no chunk of a group (seacast-lite.md §1): no bitmap carries it,
+// and a receiver's offer guard drops it as an id, so it is not offered. Router goroutine.
+func (gs *GossipSubRouter) seacastGossipCap(mids []string) []string {
+	var grouped, plain []string
+	if h := gs.have; h != nil && h.ihaveOn {
+		for _, mid := range mids {
+			if root, index, ok := h.index(mid); ok && len(root) == haveRootLen {
+				if index >= core.MaxPlainChunks {
+					continue
+				}
+				grouped = append(grouped, mid)
+			} else {
+				plain = append(plain, mid)
+			}
+		}
+	} else {
+		plain = append([]string(nil), mids...)
+	}
+	if len(plain) > gs.params.MaxIHaveLength {
+		shuffleStrings(plain)
+		plain = plain[:gs.params.MaxIHaveLength]
+	}
+	return append(grouped, plain...)
 }

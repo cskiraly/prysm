@@ -28,27 +28,24 @@ type Decoder interface {
 	Decode(root string, held []uint32) func() (cells map[uint32]*Message, ok bool)
 }
 
-// seacastDecodeStart runs root's decode off the router's goroutine. Router goroutine.
-func (gs *GossipSubRouter) seacastDecodeStart(T ObjectType, root string) {
-	sc := gs.seacast
+// seacastDecodeStart runs root's decode, the core machine's token op, off the router's goroutine:
+// the snapshot here, the work on a worker, the result back through eval (Env.StartDecode). held is
+// the count the snapshot took; started is false for a type without a level 2. Router goroutine.
+func (gs *GossipSubRouter) seacastDecodeStart(T ObjectType, root string, op uint64) (held int, started bool) {
 	D, ok := T.(Decoder)
 	if !ok {
-		return // a type without a level 2: the claim alone
+		return 0, false // a type without a level 2: the claim alone
 	}
-	g := sc.groupOf(root)
-	g.decodeOp++
-	op := g.decodeOp
-	var held []uint32
-	if m := gs.have.mine[root]; m != nil {
+	var heldIdx []uint32
+	if m := gs.have.mine[seacastGID(root)]; m != nil {
 		for i := range T.IndexCount(root) {
-			if idx := uint32(i); m.bits.Has(idx) { // lint:ignore uintcast -- an index below the group's count.
-				held = append(held, idx)
+			if idx := uint32(i); m.Bits.Has(idx) { // lint:ignore uintcast -- an index below the group's count.
+				heldIdx = append(heldIdx, idx)
 			}
 		}
 	}
-	g.decodeHeld = len(held)
-	gs.seacastOrderDecode(T, root, len(held)) // the per-event conditions (seacast_order.go)
-	work := D.Decode(root, held)              // the snapshot, on the router's goroutine
+	gs.seacastOrderDecode(T, root, len(heldIdx)) // the per-event conditions (seacast_order.go)
+	work := D.Decode(root, heldIdx)              // the snapshot, on the router's goroutine
 	go func() {
 		cells, ok := work()
 		select {
@@ -56,37 +53,27 @@ func (gs *GossipSubRouter) seacastDecodeStart(T ObjectType, root string) {
 		case <-gs.p.ctx.Done():
 		}
 	}()
+	return len(heldIdx), true
 }
 
-// seacastDecodeInstall installs a decode's result. Router goroutine.
+// seacastDecodeInstall installs a decode's result. The core's machine judges it first
+// (Machine.Decoded): stale for another decode, another state or an expired group (v0.5 §8.1); a
+// failed decode is drop_group (v0.3 §4.6), the group's queued traffic, offers, promises and store
+// gone and its state INVALID, so a later chunk of it is not taken up (seacastAccepted). Router
+// goroutine.
 func (gs *GossipSubRouter) seacastDecodeInstall(T ObjectType, root string, op uint64, cells map[uint32]*Message, ok bool) {
 	sc := gs.seacast
-	g := sc.groups[root]
-	if g == nil || g.decodeOp != op || g.state != seacastDecoding {
-		sc.ctr.DecodesStale.Add(1)
+	env, gid := gs.seacastEnv(T), seacastGID(root)
+	if !sc.gm.Decoded(env, gid, op, ok) {
 		return
 	}
-	if expired, _ := gs.seacastRootState(root); expired {
-		sc.ctr.DecodesStale.Add(1)
-		return // the group passed its lifetime meanwhile (v0.5 §8.1)
-	}
-	if !ok {
-		// drop_group (v0.3 §4.6): the group's queued traffic, offers, promises and store go; the
-		// state stays INVALID, so a later chunk of it is not taken up (seacastAccepted).
-		sc.ctr.DecodesFailed.Add(1)
-		sc.event(SeacastEvDecodeFailed, root)
-		gs.seacastDropGroup(root)
-		gs.seacastClosePromises(root)
-		sc.groups[root] = &seacastGroup{state: seacastInvalid}
-		return
-	}
+	g := sc.gm.Lookup(gid)
 	idxs := make([]uint32, 0, len(cells))
 	for idx := range cells {
 		idxs = append(idxs, idx)
 	}
 	slices.Sort(idxs)
 	var rebuilt []uint32
-	g.decodedOK = g.decodeHeld >= T.Threshold(root) // a decode from K held installed (seacast_order.go)
 	for _, idx := range idxs {
 		msg := cells[idx]
 		if msg == nil || gs.seacastHeld(root, idx) {
@@ -97,18 +84,15 @@ func (gs *GossipSubRouter) seacastDecodeInstall(T ObjectType, root string, op ui
 		gs.seacastFillClose(root, idx, mid) // the fill's ledger: its promises, budget and offers closed (§4.2)
 		gs.haveNoteArrival(mid)             // held, and servable from now on
 		sc.markRebuilt(root, idx)
-		if g.decodedOK {
+		if g.DecodedOK {
 			sc.markRebuiltOK(root, idx)
 		}
 		gs.seacastServeStanding(T, root, idx, msg)
 		gs.seacastServeWaitingProbe(T, root, idx, msg) // (R5) a probe that reached us while we decoded
 		rebuilt = append(rebuilt, idx)
 	}
-	g.state = seacastComplete
-	sc.ctr.DecodesDone.Add(1)
-	sc.event(SeacastEvDecodeDone, root)
 	sc.ctr.CellsRebuilt.Add(int64(len(rebuilt)))
-	gs.seacastSendHolding(T, root)
+	sc.gm.Installed(env, gid) // COMPLETE, and the holding goes out
 	switch sc.fault {
 	case seacastFaultHoard: // pushes nothing it rebuilt (seacast_fault.go)
 	default:
@@ -131,9 +115,10 @@ func (gs *GossipSubRouter) seacastFillClose(root string, index uint32, mid strin
 }
 
 // seacastRepairType is the type of a group a rebuilt chunk fills: the root's registered type, or
-// else any of the node's types that places the root (TopicOf), without registering it. A row's
-// decoder fills and repairs columns outside its custody, whose topics it does not run and whose
-// roots it may never have seen (a withheld column's). Router goroutine.
+// else the one type of the node's that places the root (TopicOf), without registering it; none
+// when two types place it, as seacastRootType places none. A row's decoder fills and repairs
+// columns outside its custody, whose topics it does not run and whose roots it may never have
+// seen (a withheld column's). Router goroutine.
 func (gs *GossipSubRouter) seacastRepairType(root string) ObjectType {
 	if T := gs.seacastRootType(root); T != nil {
 		return T
@@ -141,12 +126,16 @@ func (gs *GossipSubRouter) seacastRepairType(root string) ObjectType {
 	if len(root) != haveRootLen || gs.seacastRootKnownOff(root) {
 		return nil
 	}
+	var placed ObjectType
 	for _, T := range gs.seacast.types {
 		if _, ok := T.TopicOf(root); ok {
-			return T
+			if placed != nil && placed != T {
+				return nil
+			}
+			placed = T
 		}
 	}
-	return nil
+	return placed
 }
 
 // markRebuilt records index of root as rebuilt here. Router goroutine.
@@ -223,14 +212,14 @@ func (gs *GossipSubRouter) seacastPushRebuilt(T ObjectType, root string, rebuilt
 				continue
 			}
 			known := &haveBits{}
-			if e := gs.have.peers[q][g2]; e != nil {
-				if e.complete {
+			if e := gs.have.peers.Of(q, seacastGID(g2)); e != nil {
+				if e.Complete {
 					continue
 				}
-				known.Or(e.bits.Bytes())
+				known.Or(e.Bits.Bytes())
 			}
-			if pe := gs.have.pushed[q][g2]; pe != nil {
-				known.Or(pe.bits.Bytes())
+			if pe := gs.have.pushed.Of(q, seacastGID(g2)); pe != nil {
+				known.Or(pe.Bits.Bytes())
 			}
 			short := k - known.Count()
 			if short <= 0 {

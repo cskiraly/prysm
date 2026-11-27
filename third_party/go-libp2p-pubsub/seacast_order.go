@@ -57,8 +57,8 @@ func (sc *seacast) ord(kind int) {
 
 // seacastHeldCount is how many indices of root the node holds. Router goroutine.
 func (gs *GossipSubRouter) seacastHeldCount(root string) int {
-	if m := gs.have.mine[root]; m != nil {
-		return m.bits.Count()
+	if m := gs.have.mine[seacastGID(root)]; m != nil {
+		return m.Bits.Count()
 	}
 	return 0
 }
@@ -115,7 +115,7 @@ func (gs *GossipSubRouter) seacastOrderSend(p peer.ID, out *RPC) {
 							if !gs.seacastHeaderValid(T, r, idx) {
 								sc.ord(ordBeforeHeader)
 							}
-							if m := gs.have.mine[r]; m == nil || !m.bits.Has(idx) {
+							if m := gs.have.mine[seacastGID(r)]; m == nil || !m.Bits.Has(idx) {
 								sc.ord(ordHoldingUnheld)
 							}
 						}
@@ -133,7 +133,7 @@ func (gs *GossipSubRouter) seacastOrderSend(p peer.ID, out *RPC) {
 // probe's own site (seacastDeferOnClaim): the probe's id is a WANT of the cell, the same id the
 // node's ordinary asks of it carry. Router goroutine.
 func (gs *GossipSubRouter) seacastOrderProbe(q peer.ID, root string) {
-	if e := gs.have.peers[q][root]; e == nil || !e.claimAll {
+	if e := gs.have.peers.Of(q, seacastGID(root)); e == nil || !e.ClaimAll {
 		gs.seacast.ord(ordProbeBeforeClaim)
 	}
 }
@@ -155,7 +155,7 @@ func (gs *GossipSubRouter) seacastOrderHolding(root string, claimAll bool) {
 		sc.ord(ordHoldingUnheld)
 	}
 	if claimAll && held < T.Threshold(root) {
-		if g := sc.groups[root]; g == nil || !g.decodedOK {
+		if g := sc.group(root); g == nil || !g.DecodedOK {
 			sc.ord(ordClaimShort)
 		}
 	}
@@ -196,9 +196,9 @@ func (gs *GossipSubRouter) seacastHeaderValidAny(T ObjectType, root string) bool
 	if T.HeaderKnown(root) {
 		return true
 	}
-	if m := gs.have.mine[root]; m != nil {
+	if m := gs.have.mine[seacastGID(root)]; m != nil {
 		for i := range T.IndexCount(root) {
-			if idx := uint32(i); m.bits.Has(idx) && gs.seacastHeaderValid(T, root, idx) { // lint:ignore uintcast -- an index below the group's count.
+			if idx := uint32(i); m.Bits.Has(idx) && gs.seacastHeaderValid(T, root, idx) { // lint:ignore uintcast -- an index below the group's count.
 				return true
 			}
 		}

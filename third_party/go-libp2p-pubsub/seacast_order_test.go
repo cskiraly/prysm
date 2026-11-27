@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -83,12 +84,12 @@ func TestSeacastOrdering(t *testing.T) {
 					return &pb.Message{Topic: &tp, Data: append([]byte(root+string(rune(i))), 'x')}
 				}
 				hold := func(i uint32) {
-					e := gs.have.mine[root]
+					e := gs.have.mine[seacastGID(root)]
 					if e == nil {
-						e = &haveEntry{}
-						gs.have.mine[root] = e
+						e = &core.Holding{}
+						gs.have.mine[seacastGID(root)] = e
 					}
-					e.bits.Set(i)
+					e.Bits.Set(i)
 				}
 				c := gs.seacast.ctr
 				got := func(k int) int64 { return c.ordCounter(k, faulty).Load() }
@@ -134,9 +135,9 @@ func TestSeacastOrdering(t *testing.T) {
 					gs.seacastOrderProbe(other, root)
 					expect("probe before the claim", ordProbeBeforeClaim, 1)
 					if gs.have.peers[other] == nil {
-						gs.have.peers[other] = map[string]*haveEntry{}
+						gs.have.peers[other] = map[core.GroupID]*core.PeerHolding{}
 					}
-					gs.have.peers[other][root] = &haveEntry{claimAll: true} // the claim received
+					gs.have.peers[other][seacastGID(root)] = &core.PeerHolding{ClaimAll: true} // the claim received
 					gs.seacastOrderProbe(other, root)
 					expect("probe after the claim", ordProbeBeforeClaim, 1)
 					// (i) the header closed: a fill, a holding and a sent cell each count; open again, none.

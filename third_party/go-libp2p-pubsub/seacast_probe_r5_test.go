@@ -167,7 +167,7 @@ func newR5SceneCross(t *testing.T, ctx context.Context, dispatch bool, cross fun
 	// TestSeacastProbe's third node): else the writer projects B at K and sends nothing.
 	clear := func(gs *GossipSubRouter) {
 		s.on(gs, func() {
-			delete(gs.have.peers[s.B], s.root)
+			delete(gs.have.peers[s.B], seacastGID(s.root))
 			if q := gs.p.peers[s.B]; q != nil && q.have != nil {
 				q.queueMu.Lock()
 				delete(q.have.theirs, s.root)
@@ -206,16 +206,16 @@ func newR5SceneCross(t *testing.T, ctx context.Context, dispatch bool, cross fun
 		f(s, psubs)
 	}
 	s.on(s.gsB, func() {
-		e := s.gsB.have.peers[s.A][s.root]
+		e := s.gsB.have.peers[s.A][seacastGID(s.root)]
 		if e == nil {
 			t.Fatal("B has no ledger entry for A")
 		}
-		e.bits.Or(fullHaveBits(8).Bytes())
-		e.claimAll = true
+		e.Bits.Or(fullHaveBits(8).Bytes())
+		e.ClaimAll = true
 		s.gsB.seacastNoteClaim(s.A, s.root)
 		s.asked = time.Now()
-		if g := s.gsB.seacast.groups[s.root]; g != nil && g.probe != nil {
-			s.index, s.mid = g.probe.index, g.probe.mid
+		if g := s.gsB.seacast.group(s.root); g != nil && g.Ext != nil {
+			s.index, s.mid = g.Ext.index, g.Ext.mid
 		}
 	})
 	if s.mid == "" || s.index < 4 {
@@ -457,8 +457,8 @@ func TestSeacastR5RandomIndex(t *testing.T) {
 		gsB.p.eval <- func() {
 			defer close(done)
 			for _, root := range roots {
-				e, g := gsB.have.peers[A][root], gsB.seacast.groups[root]
-				if e != nil && g != nil && g.state == seacastComplete && !g.reconsiderAt.IsZero() {
+				e, g := gsB.have.peers[A][seacastGID(root)], gsB.seacast.group(root)
+				if e != nil && g != nil && g.State == seacastComplete && !g.ReconsiderAt.IsZero() {
 					ready = root
 					break
 				}
@@ -466,15 +466,15 @@ func TestSeacastR5RandomIndex(t *testing.T) {
 			if ready == "" {
 				return
 			}
-			e, g := gsB.have.peers[A][ready], gsB.seacast.groups[ready]
-			e.bits.Or(fullHaveBits(8).Bytes())
-			e.claimAll = true
+			e, g := gsB.have.peers[A][seacastGID(ready)], gsB.seacast.group(ready)
+			e.Bits.Or(fullHaveBits(8).Bytes())
+			e.ClaimAll = true
 			for range draws {
-				g.probe = nil
-				g.reconsiderAt = time.Now().Add(time.Hour)
+				g.Ext = nil
+				g.ReconsiderAt = time.Now().Add(time.Hour)
 				gsB.seacastNoteClaim(A, ready)
-				if g.probe != nil {
-					seen[g.probe.index]++
+				if g.Ext != nil {
+					seen[g.Ext.index]++
 				}
 			}
 		}

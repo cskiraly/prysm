@@ -62,11 +62,10 @@ func newSeacastParkMissCell(t *testing.T, n int, v05 *SpecV05, ctr *SpecV05Count
 // cell of the group (an offer B asks for that is not answered within the 400 ms promise), so k = 1
 // parks both for the group. Then the cell: F1, faulty, offers it first and never answers; 1.2 s
 // later F2, faulty, offers it and is asked; 50 ms after that H1 and H2 offer it while F2's ask is
-// open. Every announcer of the cell is parked once F2's promise breaks.
-//   - The cells' options (no v0.5 rules): B asks F1 and F2 once each and never H1 or H2; the cell
-//     is not asked for again (the known answer: the trace's shape).
-//   - With B′ (WithSpecV05{LastResort}): the last resort asks a parked announcer once more, and
-//     one of H1, H2 is asked.
+// open. Every announcer of the cell is parked once F2's promise breaks. The last resort asks a parked
+// announcer once more (seacast_pull.go), and one of H1, H2 is asked. Before the chunk pull, with the
+// cells' options and no v0.5 rules, B asked F1 and F2 once each and never H1 or H2, and the cell was
+// not asked for again.
 func TestSeacastParkedHoldersMiss(t *testing.T) {
 	type result struct{ f1, f2, h1, h2, breaks, parks, armed, lrAsks, parkedAsked int64 }
 	run := func(t *testing.T, v05 *SpecV05) (r result) {
@@ -98,20 +97,13 @@ func TestSeacastParkedHoldersMiss(t *testing.T) {
 		})
 		return r
 	}
-	off := run(t, nil)
-	on := run(t, &SpecV05{LastResort: true})
-	for _, x := range []struct {
-		name string
-		r    result
-	}{{"cells' options (no v0.5)", off}, {"with B′", on}} {
-		t.Logf("%s: asks of the cell to F1 %d, F2 %d, H1 %d, H2 %d; breaks %d, parks %d; last resorts armed %d, asks %d, to parked %d",
-			x.name, x.r.f1, x.r.f2, x.r.h1, x.r.h2, x.r.breaks, x.r.parks, x.r.armed, x.r.lrAsks, x.r.parkedAsked)
+	r := run(t, &SpecV05{})
+	t.Logf("asks of the cell to F1 %d, F2 %d, H1 %d, H2 %d; breaks %d, parks %d; last resorts armed %d, asks %d, to parked %d",
+		r.f1, r.f2, r.h1, r.h2, r.breaks, r.parks, r.armed, r.lrAsks, r.parkedAsked)
+	if r.parks != 4 {
+		t.Fatalf("every announcer of the cell should be parked: %d parks, want 4", r.parks)
 	}
-	if off.f1 != 1 || off.f2 != 1 || off.h1 != 0 || off.h2 != 0 || off.parks != 4 {
-		t.Fatalf("known answer: with the cells' options F1 and F2 should be asked once each, H1 and H2 never, "+
-			"all four parked; got F1 %d F2 %d H1 %d H2 %d, parks %d", off.f1, off.f2, off.h1, off.h2, off.parks)
-	}
-	if on.h1+on.h2 == 0 || on.parkedAsked == 0 {
-		t.Fatalf("with B′ the last resort should ask H1 or H2, got H1 %d H2 %d, parked asks %d", on.h1, on.h2, on.parkedAsked)
+	if r.h1+r.h2 == 0 || r.parkedAsked == 0 {
+		t.Fatalf("the last resort should ask H1 or H2, got H1 %d H2 %d, parked asks %d", r.h1, r.h2, r.parkedAsked)
 	}
 }

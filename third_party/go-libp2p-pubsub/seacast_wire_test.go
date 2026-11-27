@@ -2,10 +2,13 @@ package pubsub
 
 import (
 	"context"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -144,12 +147,12 @@ func TestSeacastAbsorbMixed(t *testing.T) {
 			t.Fatalf("an entry fell through as an ordinary id: %q", mid[:5])
 		}
 	}
-	e := gs.have.peers[p][v2root]
-	if e == nil || !e.bits.Has(1) || !e.bits.Has(2) || !e.bits.Has(3) || !e.claimAll || !e.complete {
+	e := gs.have.peers[p][seacastGID(v2root)]
+	if e == nil || !e.Bits.Has(1) || !e.Bits.Has(2) || !e.Bits.Has(3) || !e.ClaimAll || !e.Complete {
 		t.Fatalf("the path's root: bits or flags not absorbed: %+v", e)
 	}
-	pe := gs.have.peers[p][payroot]
-	if pe != nil && (pe.bits.Count() != 0 || pe.claimAll) {
+	pe := gs.have.peers[p][seacastGID(payroot)]
+	if pe != nil && (pe.Bits.Count() != 0 || pe.ClaimAll) {
 		t.Fatalf("the phase path's root: the v3 or the v4 absorbed: %+v", pe)
 	}
 	if ctr.HoldingsV4.Load() != 1 || ctr.OffPath.Load() != 1 || ctr.Malformed.Load() != 2 {
@@ -194,15 +197,20 @@ func TestSeacastMalformedControls(t *testing.T) {
 		hosts := getDefaultHosts(t, 2)
 		params := DefaultGossipSubParams()
 		params.IDontWantMessageThreshold = 1
+		wantsB := &wantsSent{seq: map[peer.ID][]string{}}
 		psubs := getGossipsubsOptFn(ctx, hosts, func(i int, h host.Host) []Option {
 			T := &testObjectType{name: "col", params: TypeParams{RNode: 2}, topics: []string{topic}}
-			return []Option{
+			opts := []Option{
 				WithGossipSubParams(params),
 				WithMessageIdFn(seacastTestID),
 				WithHaveBitmaps(seacastTestIndex),
 				WithPhaseForwarding(func(t string) bool { return t != topic }, 2),
 				WithSeacast([]ObjectType{T}, nil),
 			}
+			if i == 1 {
+				opts = append(opts, WithRawTracer(wantsB)) // what B asks, as it queues it
+			}
+			return opts
 		})
 		// A hand-sends controls (a holding of an index it does not hold among them) to test B's parsing, an
 		// act the ordering checks count on purpose: every other honest count is asserted 0.
@@ -251,8 +259,8 @@ func TestSeacastMalformedControls(t *testing.T) {
 			t.Fatalf("malformed after the IDONTWANT: %d, want 3 (a short v4, a v4 and a v1 bit beyond IndexCount)", n)
 		}
 		read(gsB, func() {
-			e := gsB.have.peers[pA][root]
-			if e == nil || !e.bits.Has(1) || !e.bits.Has(2) || e.bits.Has(32) {
+			e := gsB.have.peers[pA][seacastGID(root)]
+			if e == nil || !e.Bits.Has(1) || !e.Bits.Has(2) || e.Bits.Has(32) {
 				t.Errorf("B's record of A's holding: %+v, want bits 1 and 2 and not 32", e)
 			}
 			if n := len(gsB.unwanted[pA]) - unwantedBefore; n != 3 {
@@ -260,24 +268,37 @@ func TestSeacastMalformedControls(t *testing.T) {
 			}
 		})
 
-		// The IHAVE: only the ordinary id is an announce. An announce learns its id under its root
-		// (haveLearnID); a pseudo id taken for one would learn a garbage root from its first bytes.
+		// The IHAVE: only the ordinary id is an announce, and B asks A for it. On the path an announce
+		// records no id (seacast-lite.md §4.4). A pseudo id taken for an announce would be asked too,
+		// and A counts an ask by an unknown pseudo id as malformed.
 		unknown := haveMagic + "\x09" + root + "\x01"
 		v4 := encodeHaveV2(root, &two, false, false)
-		var rootsBefore int
-		read(gsB, func() { rootsBefore = len(gsB.have.mids) })
+		malformedA := gsA.seacast.ctr.Malformed.Load()
 		send(&pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{v4, unknown, ordinary}}}})
 		if n := ctrB.Malformed.Load() - base; n != 5 {
 			t.Fatalf("malformed after the IHAVE: %d, want 5 (a v4 holding and an unknown version in an offer)", n)
 		}
 		read(gsB, func() {
-			if m := gsB.have.mids[root]; m == nil || m.ids[9] != ordinary {
-				t.Errorf("B did not take the ordinary id's announce (learned ids of the group: %v)", m)
+			if _, asked := gsB.seacast.asked[root][9][pA]; !asked {
+				t.Errorf("B did not take the ordinary id's announce: no ask of index 9 to A")
 			}
-			if n := len(gsB.have.mids); n != rootsBefore {
-				t.Errorf("B learned %d roots from the IHAVE, want 0: a pseudo id in an offer was taken as an announce", n-rootsBefore)
+			if m := gsB.have.mids[root]; m != nil && m.ids[9] != "" {
+				t.Errorf("B recorded %q for index 9 from the announce, want none", m.ids[9])
 			}
 		})
+		if n := gsA.seacast.ctr.Malformed.Load() - malformedA; n != 0 {
+			t.Fatalf("A counted %d malformed asks after B's reply to the IHAVE, want 0: a pseudo id in an offer was taken as an announce", n)
+		}
+		// A counts an ask by an unknown version, not one by a v4 holding: what B queued to A says it.
+		asked := wantsB.of(pA)
+		if len(asked) == 0 {
+			t.Fatal("B queued no ask to A after the IHAVE; want the ordinary id's")
+		}
+		for _, id := range asked {
+			if strings.HasPrefix(id, haveMagic) {
+				t.Fatalf("B asked A for a holding's pseudo id %x from the IHAVE; want only the ordinary id's ask", id)
+			}
+		}
 
 		// The IWANT: a WANT with hops is malformed (no routed request); the plain v4 WANT resolves.
 		// Of a cell A does not hold: A's writer drops its own asks for cells it holds, v4's as v1's
@@ -316,7 +337,7 @@ func TestSeacastHoldingWriters(t *testing.T) {
 	one.Set(1)
 	gs.haveAbsorb(p, encodeHaveV2(root, &one, true, true))
 	gs.haveAbsorb(p, encodeHaveV2(root, &one, false, false))
-	if e := gs.have.peers[p][root]; e == nil || !e.claimAll || !e.complete {
+	if e := gs.have.peers[p][seacastGID(root)]; e == nil || !e.ClaimAll || !e.Complete {
 		t.Fatalf("a later holding without the flags retracted them: %+v", e)
 	}
 
@@ -354,5 +375,279 @@ func TestSeacastHoldingWriters(t *testing.T) {
 	}
 	if _, _, ok := decodeHave(gs.seacastEncodeHave(payroot, &one, false)); !ok {
 		t.Fatalf("the origin holding on the phase path's root is not v1")
+	}
+}
+
+// TestSeacastWireCore is the codec to the core's messages, both ways against today's strings: a payload group's root is
+// GroupId(0, root, 0); a holding of either version, an offer, a v4 WANT with each flag and a v1
+// WANT read as the core's messages and, written back, give the strings today's encoders write; what
+// the binding ignores reads as malformed; an ordinary id is no message; a chunk's message comes
+// back as its Ref.
+func TestSeacastWireCore(t *testing.T) {
+	root := strings.Repeat("k", haveRootLen)
+	g, ok := seacastGroupID(root)
+	if !ok || string(g) != "\x00"+root+"\x00\x00" {
+		t.Fatalf("the payload's GroupId(0, root, 0): %q", g)
+	}
+	if back, ok := seacastRootOf(g); !ok || back != root {
+		t.Fatalf("the root back from the GroupID")
+	}
+	var key [32]byte
+	if _, ok := seacastRootOf(core.NewGroupID(core.TypeColumn, key, 3)); ok {
+		t.Fatalf("a column's group mapped: the strings for cell groups are open (bindings §4)")
+	}
+	var bits haveBits
+	bits.Set(0)
+	bits.Set(5)
+	bits.Set(17)
+
+	// Holdings, version 4, every flag pair: read, then written back byte for byte.
+	for _, f := range []struct{ claimAll, complete bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		mid := encodeHaveV2(root, &bits, f.claimAll, f.complete)
+		h, ok, mal := seacastHaveOf(mid, false)
+		if !ok || mal || h.Group != g || h.Offer || h.ClaimAll != f.claimAll || h.Complete != f.complete ||
+			!slices.Equal(h.Bits.Indices(), []uint32{0, 5, 17}) {
+			t.Fatalf("v4 holding %+v read as %+v (ok %v, malformed %v)", f, h, ok, mal)
+		}
+		if back, ok := seacastHaveID(h); !ok || back != mid {
+			t.Fatalf("v4 holding %+v written back as %q, want %q", f, back, mid)
+		}
+	}
+	// A holding of version 1 reads as a holding without flags; the codec writes holdings as
+	// version 4 (seacastEncodeHave on the path's roots), so it comes back as that.
+	v1 := encodeHave(root, &bits)
+	h, ok, mal := seacastHaveOf(v1, false)
+	if !ok || mal || h.Offer || h.ClaimAll || h.Complete || !slices.Equal(h.Bits.Indices(), []uint32{0, 5, 17}) {
+		t.Fatalf("v1 holding read as %+v", h)
+	}
+	if back, _ := seacastHaveID(h); back != encodeHaveV2(root, &bits, false, false) {
+		t.Fatalf("v1 holding not written back as v4 without flags")
+	}
+	// An offer: version 1 in an IHAVE, both ways.
+	o, ok, mal := seacastHaveOf(v1, true)
+	if !ok || mal || !o.Offer || o.Group != g {
+		t.Fatalf("v1 offer read as %+v", o)
+	}
+	if back, ok := seacastHaveID(o); !ok || back != v1 {
+		t.Fatalf("offer written back as %q, want today's v1", back)
+	}
+	if _, ok := seacastHaveID(core.Have{Group: g, Bits: core.Bits{1}, Offer: true, ClaimAll: true}); ok {
+		t.Fatalf("an offer with a holding's flag written")
+	}
+	// What the binding ignores: a v4 holding in an IHAVE, a reserved flag bit, an unknown version.
+	badFlag := []byte(encodeHaveV2(root, &bits, false, false))
+	badFlag[haveHeaderLen] |= 0x04
+	for _, c := range []struct {
+		mid   string
+		offer bool
+	}{{encodeHaveV2(root, &bits, true, false), true}, {string(badFlag), false}, {haveMagic + "\x03" + root, false}} {
+		if _, ok, mal := seacastHaveOf(c.mid, c.offer); !ok || !mal {
+			t.Fatalf("an entry the binding ignores read as a message: %q (offer %v)", c.mid[:5], c.offer)
+		}
+	}
+	if _, ok, _ := seacastHaveOf(encodeHave(root, &bits)+strings.Repeat("\xff", haveMaxBytes), false); ok {
+		t.Fatalf("a v1 holding over the cap read as a HAVE, not as the opaque id the binding reads")
+	}
+	if _, ok, _ := seacastHaveOf("an ordinary id", false); ok {
+		t.Fatalf("an ordinary id read as a HAVE")
+	}
+	if _, ok, _ := seacastHaveOf(wantMagic+"\x07"+root, false); ok {
+		t.Fatalf("a WANT of an unknown version read as a HAVE")
+	}
+
+	// WANTs, version 4: each flag, and hops; read, then written back.
+	for _, mid := range []string{
+		encodeWantV2(root, 9, false, 0),
+		encodeWantV2(root, 9, true, 0),
+		encodeWantV2(root, 9, true, 2),
+		encodeWantV2Probe(root, 9),
+	} {
+		w, ok, mal := seacastWantOf(mid)
+		if !ok || mal || w.Group != g || !slices.Equal(w.Bits.Indices(), []uint32{9}) {
+			t.Fatalf("v4 WANT read as %+v", w)
+		}
+		if back, ok := seacastWantIDs(w); !ok || len(back) != 1 || back[0] != mid {
+			t.Fatalf("v4 WANT %+v written back as %q, want %q", w, back, mid)
+		}
+	}
+	if w, _, _ := seacastWantOf(encodeWantV2Probe(root, 9)); !w.Probe || w.Standing || w.Hops != 0 {
+		t.Fatalf("the probe's WANT read as %+v", w)
+	}
+	// A WANT of several indices is one id per index, in order.
+	var many core.Want
+	many.Group, many.Standing = g, true
+	for _, i := range []uint32{12, 3, 40} {
+		many.Bits.Set(i)
+	}
+	ids, ok := seacastWantIDs(many)
+	if !ok || !slices.Equal(ids, []string{encodeWantV2(root, 3, true, 0), encodeWantV2(root, 12, true, 0), encodeWantV2(root, 40, true, 0)}) {
+		t.Fatalf("a WANT of three indices: %q", ids)
+	}
+	// Version 1, the plain ask by index, reads as a WANT without fields.
+	if w, ok, mal := seacastWantOf(encodeWant(root, 7)); !ok || mal || w.Standing || w.Probe || w.Hops != 0 ||
+		!slices.Equal(w.Bits.Indices(), []uint32{7}) {
+		t.Fatalf("v1 WANT read as %+v", w)
+	}
+	badW := []byte(encodeWantV2(root, 1, false, 0))
+	badW[len(badW)-2] |= 0x04
+	for _, mid := range []string{string(badW), encodeWantV2(root, 1, false, seacastMaxHops+1), wantMagic + "\x07" + root,
+		encodeWantV2(root, core.MaxHaveBytes*8, false, 0), encodeWant(root, 1<<31)} {
+		if _, ok, mal := seacastWantOf(mid); !ok || !mal {
+			t.Fatalf("a WANT the binding ignores read as a message: %x", mid)
+		}
+	}
+	if _, ok, _ := seacastWantOf(encodeWant(root, 7) + "x"); ok {
+		t.Fatalf("a v1 WANT of the wrong length read as a WANT, not as the opaque id the binding reads")
+	}
+	if _, ok, _ := seacastWantOf(haveMagic + "\x09" + root); ok {
+		t.Fatalf("a HAVE of an unknown version read as a WANT")
+	}
+	if _, ok := seacastWantIDs(core.Want{Group: g}); ok {
+		t.Fatalf("a WANT of no index written")
+	}
+
+	// A chunk: its group and index from the structured id, its bytes, and its message as Ref.
+	gs := &GossipSubRouter{p: &PubSub{idGen: newMsgIdGenerator()}}
+	gs.p.idGen.Default = func(m *pb.Message) string { return string(m.Data[:haveRootLen+1]) }
+	gs.have = newHaveState(func(mid string) (string, uint32, bool) {
+		if len(mid) <= haveRootLen {
+			return "", 0, false
+		}
+		return mid[:haveRootLen], uint32(mid[haveRootLen]), true
+	})
+	msg := &Message{Message: &pb.Message{Data: []byte(root + "\x06payload bytes")}}
+	c, ok := gs.seacastChunkOf(msg)
+	if !ok || c.Group != g || c.Index != 6 || string(c.Data) != root+"\x06payload bytes" {
+		t.Fatalf("the chunk read as %+v", c)
+	}
+	if m, ok := seacastMessageOf(c); !ok || m != msg {
+		t.Fatalf("the chunk's message not its Ref")
+	}
+	if _, ok := seacastMessageOf(core.Chunk{Group: g, Index: 6}); ok {
+		t.Fatalf("a rebuilt chunk (no Ref) gave a message")
+	}
+}
+
+// wantsSent records the ids of the IWANTs a router queues to each peer, in order.
+type wantsSent struct {
+	mockRawTracer
+	mu  sync.Mutex
+	seq map[peer.ID][]string
+}
+
+func (w *wantsSent) SendRPC(rpc *RPC, p peer.ID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, iw := range rpc.GetControl().GetIwant() {
+		w.seq[p] = append(w.seq[p], iw.GetMessageIDs()...)
+	}
+}
+
+// of is what was asked of p so far.
+func (w *wantsSent) of(p peer.ID) []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.seq[p])
+}
+
+// TestSeacastHoldingPaddingTrimmed: a holding padded with trailing zero bytes, of either version,
+// is kept as its bits alone. The peer's entry and the writer's copy of it grow no further than its
+// highest index, as for the same holding unpadded.
+func TestSeacastHoldingPaddingTrimmed(t *testing.T) {
+	root1, root4 := strings.Repeat("a", haveRootLen), strings.Repeat("b", haveRootLen)
+	p := peer.ID("p")
+	gs := testHaveRouter()
+	gs.seacast = &seacast{ctr: &SeacastCounters{}, expired: map[string]struct{}{}}
+	q := newRpcQueue(8)
+	gs.p = &PubSub{peers: map[peer.ID]*rpcQueue{p: q}}
+	var b3 haveBits
+	b3.Set(3)
+	pad := strings.Repeat("\x00", 1000)
+	if !gs.haveAbsorb(p, encodeHave(root1, &b3)+pad) || !gs.haveAbsorb(p, encodeHaveV2(root4, &b3, false, false)+pad) {
+		t.Fatal("a padded holding was not handled")
+	}
+	for _, root := range []string{root1, root4} {
+		e := gs.have.peers.Of(p, seacastGID(root))
+		if e == nil || len(e.Bits) != 1 || !slices.Equal(e.Bits.Indices(), []uint32{3}) {
+			if e == nil {
+				t.Fatalf("no entry of %q for the peer", root[:1])
+			}
+			t.Fatalf("the peer's entry of %q: indices %v in %d bytes; want index 3 in one byte", root[:1], e.Bits.Indices(), len(e.Bits))
+		}
+		q.queueMu.Lock()
+		theirs := q.have.theirs[root]
+		q.queueMu.Unlock()
+		if theirs == nil || len(*theirs) != 1 || !theirs.Has(3) {
+			if theirs == nil {
+				t.Fatalf("no writer's copy of %q", root[:1])
+			}
+			t.Fatalf("the writer's copy of %q: indices %v in %d bytes; want index 3 in one byte", root[:1], theirs.Indices(), len(*theirs))
+		}
+	}
+}
+
+// TestSeacastV4HoldingOfExpiredGroup is seacast-lite.md §4.3's on_have for a holding of either
+// version: one for an expired group is ignored. A v4 holding then makes no entry, sets no claim on
+// an entry the peer already has, leaves that entry's bits and lifetime, counts no holder, is not
+// counted as absorbed, and its claim is not noted. A live group's v4 holding, the control, is
+// absorbed with its two claims, its holder and its lifetime, and its claim is noted.
+func TestSeacastV4HoldingOfExpiredGroup(t *testing.T) {
+	dead, held, live := strings.Repeat("d", haveRootLen), strings.Repeat("h", haveRootLen), strings.Repeat("l", haveRootLen)
+	p := peer.ID("p")
+	gs := testHaveRouter()
+	gs.have.holders = &holderCounts{}
+	ctr := &SeacastCounters{}
+	gs.seacast = &seacast{ctr: ctr, machine: true, expired: map[string]struct{}{}}
+	var b3, b5 haveBits
+	b3.Set(3)
+	b5.Set(5)
+
+	// p's holding of held, made while its group was live.
+	gs.haveAbsorb(p, encodeHave(held, &b3))
+	gs.have.peers.Of(p, seacastGID(held)).TTL = 1
+	gs.seacast.expired[dead] = struct{}{}
+	gs.seacast.expired[held] = struct{}{}
+
+	if !gs.haveAbsorb(p, encodeHave(dead, &b5)) || gs.have.peers.Of(p, seacastGID(dead)) != nil {
+		t.Fatal("a v1 holding of an expired group made the peer's entry")
+	}
+	for _, root := range []string{dead, held, live} {
+		if !gs.haveAbsorb(p, encodeHaveV2(root, &b5, true, true)) {
+			t.Fatal("a v4 holding was not handled")
+		}
+	}
+	if gs.have.peers.Of(p, seacastGID(dead)) != nil {
+		t.Fatal("a v4 holding of an expired group made the peer's entry")
+	}
+	if e := gs.have.peers.Of(p, seacastGID(held)); e == nil || e.ClaimAll || e.Complete || e.TTL != 1 ||
+		!slices.Equal(e.Bits.Indices(), []uint32{3}) {
+		t.Fatalf("a v4 holding of an expired group changed the peer's entry: %+v", e)
+	}
+	for _, root := range []string{dead, held} {
+		if c := gs.have.peers.Claimants(seacastGID(root)); len(c) != 0 {
+			t.Fatalf("claimants of an expired group %v, want none", c)
+		}
+		if n := gs.have.holders.get(root, 5); n != 0 {
+			t.Fatalf("an expired group's index 5 has %d holders, want 0", n)
+		}
+	}
+
+	e := gs.have.peers.Of(p, seacastGID(live))
+	if e == nil || !e.ClaimAll || !e.Complete || e.TTL != gs.params.IDontWantMessageTTL ||
+		!slices.Equal(e.Bits.Indices(), []uint32{5}) {
+		t.Fatalf("a live group's v4 holding: entry %+v, want index 5 claimed whole and complete, TTL %d",
+			e, gs.params.IDontWantMessageTTL)
+	}
+	if c := gs.have.peers.Claimants(seacastGID(live)); !slices.Equal(c, []peer.ID{p}) {
+		t.Fatalf("claimants of the live group %v, want [p]", c)
+	}
+	if n := gs.have.holders.get(live, 5); n != 1 {
+		t.Fatalf("the live group's index 5 has %d holders, want 1", n)
+	}
+	if n := ctr.HoldingsV4.Load(); n != 1 {
+		t.Fatalf("v4 holdings absorbed %d, want 1 (the live group's)", n)
+	}
+	if n := ctr.ClaimsNoted.Load(); n != 1 {
+		t.Fatalf("claims noted %d, want 1 (the live group's)", n)
 	}
 }

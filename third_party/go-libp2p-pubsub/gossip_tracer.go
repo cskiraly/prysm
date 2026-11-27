@@ -34,7 +34,7 @@ type gossipTracer struct {
 	// never written and breaks no promise; one that waits in the queue has its follow-up time from
 	// the write.
 	atWrite     bool
-	pending     map[string]map[peer.ID]time.Time
+	pending     map[string]map[peer.ID]pendingAsk
 	peerPending map[peer.ID]map[string]struct{}
 
 	// wantOf maps a message's id to the id of an ask by index for it (havebitmap.go's encodeWant),
@@ -57,7 +57,7 @@ func newGossipTracer() *gossipTracer {
 		idGen:        newMsgIdGenerator(),
 		promises:     make(map[string]map[peer.ID]time.Time),
 		peerPromises: make(map[peer.ID]map[string]struct{}),
-		pending:      make(map[string]map[peer.ID]time.Time),
+		pending:      make(map[string]map[peer.ID]pendingAsk),
 		peerPending:  make(map[peer.ID]map[string]struct{}),
 	}
 }
@@ -98,7 +98,7 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 
 	if gt.atWrite {
 		if _, open := gt.promises[mid][p]; !open {
-			gt.pendLocked(mid, p, time.Now())
+			gt.pendLocked(mid, p, time.Now(), nextAskSeq())
 		}
 		return
 	}
@@ -121,18 +121,25 @@ func (gt *gossipTracer) AddPromise(p peer.ID, msgIDs []string) {
 	}
 }
 
-// pendLocked keeps mid's promise from p pending its write (E), from the dispatch at at; an earlier
-// pending dispatch keeps its time. Under the lock.
-func (gt *gossipTracer) pendLocked(mid string, p peer.ID, at time.Time) {
+// pendingAsk is a dispatch whose promise waits for its write (E): when, for the age limit, and its
+// number in askSeq's order (rpc_queue.go), for the write report.
+type pendingAsk struct {
+	at  time.Time
+	seq uint64
+}
+
+// pendLocked keeps mid's promise from p pending its write (E), from the dispatch at at, numbered seq; an
+// earlier pending dispatch keeps its own. Under the lock.
+func (gt *gossipTracer) pendLocked(mid string, p peer.ID, at time.Time, seq uint64) {
 	peers := gt.pending[mid]
 	if peers == nil {
-		peers = make(map[peer.ID]time.Time)
+		peers = make(map[peer.ID]pendingAsk)
 		gt.pending[mid] = peers
 	}
 	if _, ok := peers[p]; ok {
 		return
 	}
-	peers[p] = at
+	peers[p] = pendingAsk{at: at, seq: seq}
 	mids := gt.peerPending[p]
 	if mids == nil {
 		mids = make(map[string]struct{})
@@ -164,12 +171,14 @@ func (gt *gossipTracer) unpendLocked(mid string, p peer.ID) bool {
 	return true
 }
 
-// promisesWritten opens, for each of mids the writer wrote to p at the time at, the promise its
-// dispatch left pending (E): due the follow-up time after the write. An id with nothing pending
-// was not picked, or closed since (delivered, refused, its group ended, the peer gone or
-// throttled), and opens nothing; an open promise keeps its deadline. Returns how many it opened.
-// Router goroutine.
-func (gt *gossipTracer) promisesWritten(p peer.ID, mids []string, at time.Time) int {
+// promisesWritten opens, for each of mids the writer popped (popped, in askSeq's order) and wrote to p
+// at the time at,
+// the promise its dispatch left pending (E): due the follow-up time after the write. An id with
+// nothing pending was not picked, or closed since (delivered, refused, its group ended, the peer gone
+// or throttled), and opens nothing; so does one pending from a dispatch after the pop, a newer ask
+// this RPC did not carry, which stays pending for its own write. An open promise keeps its deadline.
+// Returns how many it opened. Router goroutine.
+func (gt *gossipTracer) promisesWritten(p peer.ID, mids []string, popped uint64, at time.Time) int {
 	if gt == nil || !gt.atWrite {
 		return 0
 	}
@@ -177,9 +186,10 @@ func (gt *gossipTracer) promisesWritten(p peer.ID, mids []string, at time.Time) 
 	defer gt.Unlock()
 	opened := 0
 	for _, mid := range mids {
-		if !gt.unpendLocked(mid, p) {
+		if d, ok := gt.pending[mid][p]; !ok || d.seq > popped {
 			continue
 		}
+		gt.unpendLocked(mid, p)
 		promises := gt.promises[mid]
 		if promises == nil {
 			promises = make(map[peer.ID]time.Time)
@@ -268,8 +278,8 @@ func (gt *gossipTracer) GetBrokenPromises() map[peer.ID]int {
 
 	// Pending promises whose write was never reported go uncharged past their age limit (E).
 	for mid, peers := range gt.pending {
-		for p, at := range peers {
-			if now.Sub(at) > promisePendingTTL {
+		for p, d := range peers {
+			if now.Sub(d.at) > promisePendingTTL {
 				gt.unpendLocked(mid, p)
 			}
 		}

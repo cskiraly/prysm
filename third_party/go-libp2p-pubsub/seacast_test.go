@@ -18,7 +18,7 @@ type testObjectType struct {
 	// The two-axis lookups (seacast_cross.go): K (IndexCount when zero), the other pair with its
 	// form's id (none when nil), the family (the type's name when nil).
 	threshold  int
-	indexCount int // the group's indices (32 when zero)
+	indexCount int // the group's indices (32 when zero; unknown, 0, when negative)
 	cross      func(root string, index uint32) (GroupIndex, string, bool)
 	family     func(root string) string
 }
@@ -49,6 +49,9 @@ func (t *testObjectType) HeaderKnown(string) bool { return !t.gateClosed }
 func (t *testObjectType) IndexCount(string) int {
 	if t.indexCount > 0 {
 		return t.indexCount
+	}
+	if t.indexCount < 0 {
+		return 0 // not known yet
 	}
 	return 32
 }

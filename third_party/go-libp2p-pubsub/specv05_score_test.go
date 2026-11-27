@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/libp2p/go-libp2p-pubsub/timecache"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -179,7 +180,7 @@ func scoreRouter(rules SpecV05) *GossipSubRouter {
 }
 
 // TestSpecV05ScorePromiseClosesWithConn: an ask of a chunk and a stock ask, each from the same
-// peer, whose connection then closes. Under CloseWithConn the chunk's promise closes with it; the
+// peer, whose connection then closes. Under the chunk pull the chunk's promise closes with it; the
 // stock ask's stays to be charged, as upstream keeps it. Under E an ask not yet written goes with
 // the queue, whatever its kind.
 func TestSpecV05ScorePromiseClosesWithConn(t *testing.T) {
@@ -189,18 +190,46 @@ func TestSpecV05ScorePromiseClosesWithConn(t *testing.T) {
 		time.Sleep(150 * time.Millisecond) // past the follow-up time
 		return gs.gossipTracer.GetBrokenPromises()[p]
 	}
-	t.Run("CloseWithConn: the chunk's written ask closes, the stock ask's stays", func(t *testing.T) {
+	// left says which of the two asks' promises are still open to p, before the follow-up time.
+	left := func(gs *GossipSubRouter) (chunkLeft, stockLeft bool) {
+		gs.gossipTracer.Lock()
+		defer gs.gossipTracer.Unlock()
+		_, chunkLeft = gs.gossipTracer.promises[chunk][p]
+		_, stockLeft = gs.gossipTracer.promises[stock][p]
+		return chunkLeft, stockLeft
+	}
+	t.Run("the chunk pull: the chunk's written ask closes, the stock ask's stays", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			gs := scoreRouter(SpecV05{CloseWithConn: true})
+			gs := scoreRouter(SpecV05{})
+			gs.offerTable = make(map[string]map[peer.ID]time.Time) // with the park per group: the core pulls chunks
 			if gs.parkScopeOf(chunk) == "" || gs.parkScopeOf(stock) != "" {
 				t.Fatal("fixture: the chunk's id should be grouped and the stock id not")
 			}
 			gs.gossipTracer.AddPromise(p, []string{chunk})
 			gs.gossipTracer.AddPromise(p, []string{stock})
 			gs.v05PeerGone(p)
+			if c, st := left(gs); c || !st {
+				t.Fatalf("open after the close: the chunk's %v, the stock ask's %v; want false, true", c, st)
+			}
 			if n := charged(gs); n != 1 || gs.v05.ctr.ClosedScorePromises.Load() != 1 {
 				t.Fatalf("charged %d and closed %d, want 1 and 1: the stock ask's charged, the chunk's closed",
 					n, gs.v05.ctr.ClosedScorePromises.Load())
+			}
+		})
+	})
+	t.Run("the chunk pull without WithSpecV05: the same", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			gs := scoreRouter(SpecV05{})
+			gs.v05 = nil
+			gs.offerTable = make(map[string]map[peer.ID]time.Time)
+			gs.gossipTracer.AddPromise(p, []string{chunk})
+			gs.gossipTracer.AddPromise(p, []string{stock})
+			gs.v05PeerGone(p)
+			if c, st := left(gs); c || !st {
+				t.Fatalf("open after the close: the chunk's %v, the stock ask's %v; want false, true", c, st)
+			}
+			if n := charged(gs); n != 1 {
+				t.Fatalf("charged %d, want 1: the stock ask's charged, the chunk's closed", n)
 			}
 		})
 	})
@@ -217,6 +246,32 @@ func TestSpecV05ScorePromiseClosesWithConn(t *testing.T) {
 				t.Fatalf("charged %d, want 0: neither ask was written", n)
 			}
 		})
+	})
+}
+
+// TestSeacastRepeatOfferWithoutPath: a router that pulls chunks through the core without the
+// SEACAST path (no WithSeacast) gets a second offer of a chunk whose ask to the same peer is open.
+// The offer is recorded and not asked, and nothing reads the path's counters.
+func TestSeacastRepeatOfferWithoutPath(t *testing.T) {
+	seen := timecache.NewTimeCache(time.Minute) // its sweeper runs outside the bubble
+	synctest.Test(t, func(t *testing.T) {
+		p := peer.ID("server")
+		mid := testMid(strings.Repeat("g", 32), 1)
+		gs := scoreRouter(SpecV05{})
+		gs.v05 = nil
+		gs.offerTable = make(map[string]map[peer.ID]time.Time)
+		gs.p.seenMessages = seen
+		_, g, i, ok := gs.pullChunk(mid)
+		if !ok || gs.seacast != nil {
+			t.Fatalf("fixture: chunk %v, the path %v; want a chunk without the path", ok, gs.seacast != nil)
+		}
+		gs.pull.promises.Open(g, i, p, time.Now())
+		iwant := map[string]string{}
+		var candidates []string
+		gs.considerAnnounced(p, "seg/col/0", mid, iwant, &candidates)
+		if !gs.pullOffered(p, mid) || len(iwant) != 0 || len(candidates) != 0 {
+			t.Fatalf("offered %v, asks %v %v; want true and none", gs.pullOffered(p, mid), iwant, candidates)
+		}
 	})
 }
 
@@ -241,7 +296,7 @@ func TestScorePromisePending(t *testing.T) {
 			if n := gt.GetBrokenPromises()[p]; n != 0 {
 				t.Fatalf("charged %d before the write", n)
 			}
-			if n := gt.promisesWritten(p, []string{mid, other}, time.Now()); n != 1 {
+			if n := gt.promisesWritten(p, []string{mid, other}, nextAskSeq(), time.Now()); n != 1 {
 				t.Fatalf("opened %d at the write, want 1 (the id not dispatched opens nothing)", n)
 			}
 			time.Sleep(90 * time.Millisecond)
@@ -269,7 +324,7 @@ func TestScorePromisePending(t *testing.T) {
 			gt.AddPromise(p, []string{mid})
 			gt.ThrottlePeer(p)
 			empty(t, gt)
-			if n := gt.promisesWritten(p, []string{mid}, time.Now()) + gt.promisesWritten(q, []string{other}, time.Now()); n != 0 {
+			if n := gt.promisesWritten(p, []string{mid}, nextAskSeq(), time.Now()) + gt.promisesWritten(q, []string{other}, nextAskSeq(), time.Now()); n != 0 {
 				t.Fatalf("opened %d at the write after the asks closed", n)
 			}
 			time.Sleep(150 * time.Millisecond)
@@ -342,7 +397,7 @@ func TestSpecV05AsksReportedAfterTheWrite(t *testing.T) {
 			q := newRpcQueue(8)
 			var reports atomic.Int32
 			var at atomic.Int64
-			q.onAsks = func(_ []string, when time.Time) {
+			q.onAsks = func(_ []string, _ uint64, when time.Time) {
 				reports.Add(1)
 				at.Store(when.UnixNano())
 			}
@@ -414,7 +469,7 @@ func TestScorePromiseByIndexFulfilled(t *testing.T) {
 		{"a copy of another index already seen", false, func(gt *gossipTracer) { gt.DuplicateMessage(reply(4)) }, 1},
 		{"under E, the reply begins validation before the write's report", true, func(gt *gossipTracer) {
 			gt.ValidateMessage(reply(3))
-			gt.promisesWritten(p, []string{want}, time.Now())
+			gt.promisesWritten(p, []string{want}, nextAskSeq(), time.Now())
 		}, 0},
 	}
 	for _, c := range cases {
@@ -523,7 +578,7 @@ func (a *askCounter) SendRPC(rpc *RPC, _ peer.ID) {
 // its reply begins validation, as an ask by id is upstream, so A is charged nothing; with the v0.5
 // rules Prysm runs and without.
 func TestSeacastScoreIgnoredReplyByIndex(t *testing.T) {
-	for _, rules := range []*SpecV05{nil, {PromiseAtWrite: true, LastResort: true, CloseWithConn: true}} {
+	for _, rules := range []*SpecV05{nil, {PromiseAtWrite: true}} {
 		var charged int
 		var seen atomic.Int32
 		asks := &askCounter{}
@@ -600,4 +655,80 @@ func TestSeacastScoreIgnoredReplyByIndex(t *testing.T) {
 			t.Fatalf("rules %+v: A, whose answers B ignored, was charged %d promises", rules, charged)
 		}
 	}
+}
+
+// TestScorePromiseWrittenAfterNewerDispatch: under E, an older RPC's ask of an id is popped, the ask
+// is refused (its offer dropped), and a newer ask of the id is dispatched, all at the same instant of
+// the clock. The older write's report, which carries its pop's number, opens no promise: the pending one
+// is the newer ask's, which that RPC did not carry. The newer ask's own write opens it.
+func TestScorePromiseWrittenAfterNewerDispatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := peer.ID("server")
+		mid := testMid(strings.Repeat("n", 32), 1)
+		gt := scoreRouter(SpecV05{PromiseAtWrite: true}).gossipTracer
+		start := time.Now()
+		gt.AddPromise(p, []string{mid})
+		popped := nextAskSeq() // the writer pops the older ask
+		gt.asksRefused(p, []string{mid})
+		gt.AddPromise(p, []string{mid}) // the newer ask
+		if !time.Now().Equal(start) {
+			t.Fatal("the clock moved: the pop and the newer dispatch must share an instant")
+		}
+		if n := gt.promisesWritten(p, []string{mid}, popped, time.Now()); n != 0 || len(gt.pending[mid]) != 1 {
+			t.Fatalf("the older write: opened %d, pending %d; want 0 1", n, len(gt.pending[mid]))
+		}
+		if n := gt.promisesWritten(p, []string{mid}, nextAskSeq(), time.Now()); n != 1 {
+			t.Fatalf("the newer write: opened %d; want 1", n)
+		}
+	})
+}
+
+// TestSeacastHeldIndexNotOffered: a router on the path holds index 7 of a group under one id; another
+// id of the same group and index (another content) is offered. It is held (seacast-lite.md §4.4's held:
+// the chunk is in mine), so it is neither recorded as an offer nor a candidate to ask, whose ask the
+// writer would drop with nothing to close its record. An id of an index not held is both. A router with
+// the same HAVE bitmaps and no path keeps its intake: the other id is offered and a candidate.
+func TestSeacastHeldIndexNotOffered(t *testing.T) {
+	p := peer.ID("server")
+	root := strings.Repeat("v", 32)
+	held, other, free := testMid(root, 7), root+string([]byte{7})+"#another", testMid(root, 8)
+	router := func(path bool, seen timecache.TimeCache) *GossipSubRouter {
+		gs := scoreRouter(SpecV05{})
+		gs.v05 = nil
+		gs.offerTable = make(map[string]map[peer.ID]time.Time)
+		gs.p.seenMessages = seen
+		if path {
+			gs.seacast = &seacast{ctr: &SeacastCounters{}}
+		}
+		gs.haveNoteArrival(held)
+		return gs
+	}
+	t.Run("on the path", func(t *testing.T) {
+		seen := timecache.NewTimeCache(time.Minute) // its sweeper runs outside the bubble
+		synctest.Test(t, func(t *testing.T) {
+			gs := router(true, seen)
+			iwant := map[string]string{}
+			var candidates []string
+			gs.considerAnnounced(p, "seg/col/0", other, iwant, &candidates)
+			if gs.pullOffered(p, other) || len(candidates) != 0 {
+				t.Fatalf("another id of a held index: offered %v, candidates %q; want false, none", gs.pullOffered(p, other), candidates)
+			}
+			gs.considerAnnounced(p, "seg/col/0", free, iwant, &candidates)
+			if !gs.pullOffered(p, free) || len(candidates) != 1 {
+				t.Fatalf("an index not held: offered %v, candidates %d; want true 1", gs.pullOffered(p, free), len(candidates))
+			}
+		})
+	})
+	t.Run("HAVE bitmaps without the path", func(t *testing.T) {
+		seen := timecache.NewTimeCache(time.Minute)
+		synctest.Test(t, func(t *testing.T) {
+			gs := router(false, seen)
+			iwant := map[string]string{}
+			var candidates []string
+			gs.considerAnnounced(p, "seg/col/0", other, iwant, &candidates)
+			if !gs.pullOffered(p, other) || len(candidates) != 1 {
+				t.Fatalf("another id of a held index: offered %v, candidates %q; want true, the id", gs.pullOffered(p, other), candidates)
+			}
+		})
+	})
 }

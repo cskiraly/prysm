@@ -133,7 +133,7 @@ func askedWithin(in *injector, id string, d time.Duration) bool {
 	return ok
 }
 
-// TestSeacastCloseWithConn (CloseWithConn): a promise closes, and parks nobody, when "the peer's
+// TestSeacastCloseWithConn: a promise closes, and parks nobody, when "the peer's
 // connection closes. The ask or its answer went with the connection, and the retry, whose timer is
 // per ask, moves on to the other announcers." (seacast-lite.md §6.1). The injector offers a chunk, A
 // writes its ask, and the injector closes the connection before the promise falls due. Without the
@@ -177,14 +177,34 @@ func TestSeacastLastResort(t *testing.T) {
 		synctest.Wait()
 
 		in.mu.Lock()
-		asks := in.asks[id]
+		asks, total := in.asks[id], in.total
 		in.mu.Unlock()
 		parks, lastResort, parkedAsked := a.m.Parks.Load(), a.m.V05.LastResortAsks.Load(), a.m.V05.ParkedAsked.Load()
-		t.Logf("the only announcer, never answering: asked %d times; %d parks; last-resort asks %d, to a parked peer %d",
-			asks, parks, lastResort, parkedAsked)
+		t.Logf("the only announcer, never answering: asked %d times, %d under the offered id; %d parks; last-resort asks %d, to a parked peer %d",
+			total, asks, parks, lastResort, parkedAsked)
 		require.Equal(t, true, parks > 0, "the case needs the announcer parked")
-		// Once more, and only once: "at most one ask per announcer and chunk" by the last resort.
-		require.Equal(t, 2, asks, "the parked announcer was not asked exactly once more")
+		// Once more, and only once: "at most one ask per announcer and chunk" by the last resort. The
+		// first ask names the offered id; the last resort's asks by index, since on the path an offer
+		// records no id (seacast-lite.md §4.4). The injector offers nothing else, so every ask it
+		// receives is of this chunk.
+		require.Equal(t, 1, asks, "the first ask, under the offered id")
+		require.Equal(t, 2, total, "the parked announcer was not asked exactly once more")
+		// The last resort's ask is by the offered chunk's index: WANT ‖ version ‖ root ‖ index,
+		// little-endian (seacast-lite.md §2's WantIndex), with v4's flags and hops after it if any.
+		// The id is the root's 32 bytes, then the index's 4.
+		var other []string
+		in.mu.Lock()
+		for asked := range in.asks {
+			if asked != id {
+				other = append(other, asked)
+			}
+		}
+		in.mu.Unlock()
+		require.Equal(t, 1, len(other), "asks under another id than the offered one")
+		w := other[0]
+		require.Equal(t, true, len(w) >= 41 && strings.HasPrefix(w, "WANT"), fmt.Sprintf("the last resort's ask is not an ask by index: %x", w))
+		require.Equal(t, fmt.Sprintf("%x", id[:32]), fmt.Sprintf("%x", w[5:37]), "the last resort's ask names another group")
+		require.Equal(t, fmt.Sprintf("%x", id[32:36]), fmt.Sprintf("%x", w[37:41]), "the last resort's ask names another index")
 		require.Equal(t, int64(1), lastResort, "last-resort asks")
 		require.Equal(t, int64(1), parkedAsked, "last-resort asks to a parked announcer")
 	})
@@ -260,12 +280,12 @@ func TestSeacastFanIn(t *testing.T) {
 
 // TestSeacastV05StockUnchanged: the v0.5 rules are SEACAST's, and leave the topics that share the
 // node's router as they were. The same script of stock-topic traffic runs at the base's options
-// (the promise at the write alone) and at the node's (OfferSkipped, LastResort and CloseWithConn
-// too), and every outcome on A must agree: the asks each announcer got, the messages delivered, the
-// broken promises and parks, and every v0.5 counter. The script reaches the rules' stock paths that
-// are easy to miss: the retry past an announcer that doesn't answer, a parked
-// announcer's offer again (LastResort's parked branch), and a connection closing with an ask outstanding
-// (CloseWithConn). Then a full queue (OfferSkipped's owed answers): the v0.5 counters are compared
+// (the promise at the write alone) and at the node's (OfferSkipped too), and every outcome on A must
+// agree: the asks each announcer got, the messages delivered, the broken promises and parks, and
+// every v0.5 counter. The script reaches the paths a chunk's pull takes that a stock id must not:
+// the retry past an announcer that doesn't answer, a parked announcer's offer again (the last
+// resort's parked branch), and a connection closing with an ask outstanding (the close with the
+// connection). Then a full queue (OfferSkipped's owed answers): the v0.5 counters are compared
 // before this step, which owes chunk answers at the node by design, and the step compares the stock
 // message's copies at X. P, Q and X are injectors on the stock topic only, so A's payload publish
 // pushes to nobody; every stock id is a block's, 20 bytes, as prysm makes one. A's queue to each

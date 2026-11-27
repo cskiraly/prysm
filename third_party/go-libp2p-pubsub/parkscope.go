@@ -95,6 +95,9 @@ func (gs *GossipSubRouter) noteGroupBreak(mid string, p peer.ID) {
 
 // peerParkedFor reports whether p's announcement of mid is ineligible for pull selection.
 func (gs *GossipSubRouter) peerParkedFor(p peer.ID, mid string) bool {
+	if g, ok := gs.pullParkGroup(mid); ok {
+		return gs.pull.promises.Parked(p, g, time.Now()) // a chunk's group: the core's park (seacast_pull.go)
+	}
 	if gs.parkGroups == nil {
 		return gs.peerParked(p)
 	}
@@ -142,12 +145,16 @@ func (gs *GossipSubRouter) haveHolds(mid string) bool {
 			return false
 		}
 	}
-	e := h.mine[root]
-	return e != nil && e.bits.Has(index)
+	e := h.mine[seacastGID(root)]
+	return e != nil && e.Bits.Has(index)
 }
 
 // absolvePromise closes p's promise for mid without a charge, as a delivery would.
 func (gs *GossipSubRouter) absolvePromise(mid string, p peer.ID) {
+	if root, g, i, ok := gs.pullChunk(mid); ok {
+		gs.pullAbsolve(p, root, g, i) // a chunk: its promise in the core (seacast_pull.go)
+		return
+	}
 	gs.seacastAskClosed(p, mid) // nothing of ours is open to p for mid any more (seacast_ask.go)
 	if peers := gs.iwantPromised[mid]; peers != nil {
 		delete(peers, p)

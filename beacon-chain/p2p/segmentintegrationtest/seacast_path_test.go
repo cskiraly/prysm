@@ -459,6 +459,17 @@ func TestSeacastPayloadPath(t *testing.T) {
 			require.Equal(t, count, held, "node %d holds %d of %d", i+1, held, count)
 			require.Equal(t, true, bytes.Equal(want, got), "node %d's envelope is not the source's", i+1)
 		}
+		if cfg.path {
+			// seacast.md §4.1's join_push runs at every GRAFT on the path's topic. §4.12's choose is
+			// checked where the router is built: whether the source's own chunks ever pass a queue's
+			// head depends on another frame, such as an answer, being queued ahead of them, which a
+			// run may not have.
+			for i, n := range nodes {
+				c := &n.m.Seacast
+				require.Equal(t, true, c.JoinPushOwn.Load()+c.JoinPushAccepted.Load() > 0, "node %d ran no join_push", i)
+			}
+			t.Logf("the source's own chunks went ahead of a queue's head %d times", nodes[0].ps.ChooseStats())
+		}
 		requireRecoveries(t, nodes)
 	})
 }

@@ -34,9 +34,11 @@ import (
 type injector struct {
 	h  host.Host
 	mu sync.Mutex
-	// asked is when each id was first asked of the injector by IWANT; asks how many times it was.
+	// asked is when each id was first asked of the injector by IWANT; asks how many times it was;
+	// total every id asked, in any form (an ask by index too, which names no chunk id).
 	asked map[string]time.Time
 	asks  map[string]int
+	total int
 	// serve is the message to answer an ask with, by id.
 	serve map[string]*pubsubpb.Message
 	// got counts the frames the injector received, by message id.
@@ -78,6 +80,7 @@ func (in *injector) read(s network.Stream) {
 					in.asked[id] = time.Now()
 				}
 				in.asks[id]++
+				in.total++
 				if m, ok := in.serve[id]; ok {
 					answer = append(answer, m)
 				}
@@ -287,8 +290,10 @@ func TestSeacastInjectedOffers(t *testing.T) {
 		synctest.Wait()
 		require.Equal(t, string(m1.Data), <-got)
 
-		// Stop-pull: B publishes a group, A completes it, and the injector offers one of its indices
-		// under a content id A has not seen.
+		// After completion: B publishes a group, A completes it, and the injector offers two of its
+		// indices under content ids A has not seen. Neither is asked, and neither reaches stop-pull's
+		// gate: A holds every index below the group's count, and held answers first; an index at
+		// the count is no valid id once the count is known, and is ignored.
 		env := pathEnvelope(t, 32, 4096)
 		segs, err := segmentauth.SegmentMessagesForEnvelope(env, segmentauth.DefaultParams())
 		require.NoError(t, err)
@@ -297,16 +302,25 @@ func TestSeacastInjectedOffers(t *testing.T) {
 		time.Sleep(pathSettle)
 		synctest.Wait()
 		require.Equal(t, int64(1), a.m.Seacast.GroupsCompleted.Load(), "A did not complete B's group")
-		declined := a.m.Seacast.StopPullDeclined.Load()
-		idx := make([]byte, 4)
-		binary.LittleEndian.PutUint32(idx, 1)
-		late := key + string(idx) + string(bytes.Repeat([]byte{2}, 20))
-		in.offer(segTopic, late)
-		time.Sleep(3 * pathHeartbeat)
-		synctest.Wait()
-		_, asked := in.askedAt(late)
-		t.Logf("after completion: stop-pull declined %d more", a.m.Seacast.StopPullDeclined.Load()-declined)
-		require.Equal(t, false, asked, "an index of a completed group was asked")
-		require.Equal(t, true, a.m.Seacast.StopPullDeclined.Load() > declined, "stop-pull counted no decline")
+		offerLate := func(index uint32) (asked bool, declined int64) {
+			before := a.m.Seacast.StopPullDeclined.Load()
+			idx := make([]byte, 4)
+			binary.LittleEndian.PutUint32(idx, index)
+			late := key + string(idx) + string(bytes.Repeat([]byte{2}, 20))
+			in.offer(segTopic, late)
+			time.Sleep(3 * pathHeartbeat)
+			synctest.Wait()
+			_, asked = in.askedAt(late)
+			return asked, a.m.Seacast.StopPullDeclined.Load() - before
+		}
+		asked, declined := offerLate(1)
+		t.Logf("a held index after completion: stop-pull declined %d more", declined)
+		require.Equal(t, false, asked, "a held index of a completed group was asked")
+		require.Equal(t, int64(0), declined, "a held index reached the gate")
+		count := a.typ.IndexCount(key)
+		asked, declined = offerLate(uint32(count))
+		t.Logf("index %d, at the group's count: stop-pull declined %d more", count, declined)
+		require.Equal(t, false, asked, "an index at a completed group's count was asked")
+		require.Equal(t, int64(0), declined, "an index at the group's count reached the gate")
 	})
 }

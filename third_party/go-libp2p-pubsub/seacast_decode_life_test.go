@@ -15,7 +15,7 @@ import (
 // mirror, so that a copy gs sends p now is one in flight before p's holding came (a test's way to
 // get a chunk to a peer projected at K). Router goroutine.
 func forgetPeerViews(gs *GossipSubRouter, p peer.ID, root string) {
-	delete(gs.have.peers[p], root)
+	delete(gs.have.peers[p], seacastGID(root))
 	if q := gs.p.peers[p]; q != nil && q.have != nil {
 		q.queueMu.Lock()
 		delete(q.have.theirs, root)
@@ -104,7 +104,7 @@ func TestSeacastDecodeLifecycle(t *testing.T) {
 				}
 				time.Sleep(50 * time.Millisecond) // B at K: DECODING, its decode running (100 ms)
 				ctr := gsB.seacast.ctr
-				var state uint8
+				state := seacastCollecting
 				switch name {
 				case during:
 					late(5)
@@ -125,11 +125,11 @@ func TestSeacastDecodeLifecycle(t *testing.T) {
 				read := func() {
 					on(gsB, func() {
 						heldB, state = 0, 0
-						if m := gsB.have.mine[root]; m != nil {
-							heldB = m.bits.Count()
+						if m := gsB.have.mine[seacastGID(root)]; m != nil {
+							heldB = m.Bits.Count()
 						}
-						if g := gsB.seacast.groups[root]; g != nil {
-							state = g.state
+						if g := gsB.seacast.group(root); g != nil {
+							state = g.State
 						}
 					})
 				}
@@ -244,8 +244,8 @@ func TestSeacastDecodedStanding(t *testing.T) {
 		var heldA bool
 		done = make(chan struct{})
 		gsA.p.eval <- func() {
-			if m := gsA.have.mine[root]; m != nil {
-				heldA = m.bits.Has(6)
+			if m := gsA.have.mine[seacastGID(root)]; m != nil {
+				heldA = m.Bits.Has(6)
 			}
 			close(done)
 		}

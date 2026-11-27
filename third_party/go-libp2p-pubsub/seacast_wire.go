@@ -19,8 +19,9 @@ package pubsub
 
 import (
 	"fmt"
-	"math/bits"
+	"strings"
 
+	core "github.com/cskiraly/seacast-go"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -53,7 +54,7 @@ func encodeHaveV2(root string, bits *haveBits, claimAll, complete bool) string {
 	if complete {
 		flags |= seacastFlagComplete
 	}
-	out := make([]byte, 0, seacastHaveHeadLen+len(bits.b))
+	out := make([]byte, 0, seacastHaveHeadLen+len(*bits))
 	out = append(out, haveMagic...)
 	out = append(out, seacastVersion)
 	out = append(out, root...)
@@ -158,16 +159,7 @@ func (gs *GossipSubRouter) seacastBitsBeyond(root string, enc []byte) bool {
 	if T == nil {
 		return false
 	}
-	n := T.IndexCount(root)
-	if n <= 0 {
-		return false
-	}
-	for i := len(enc) - 1; i >= 0; i-- {
-		if enc[i] != 0 {
-			return i*8+bits.Len8(enc[i])-1 >= n
-		}
-	}
-	return false
+	return !core.BitsWithin(enc, T.IndexCount(root))
 }
 
 // seacastOfferIgnored classifies an IHAVE entry for handleIHave: offers keep version 1,
@@ -193,18 +185,37 @@ func (gs *GossipSubRouter) seacastOfferIgnored(mid string) bool {
 		}
 		return false
 	}
-	// A chunk's id must be a valid one (seacast-lite.md §4.4's valid_id): an index at or beyond its group's
-	// known count is ignored, without penalty. Only an ordinary id is read so: a pseudo id is the
-	// bitmap's above or an ask's, never parsed as a chunk's.
-	if _, _, isWant := decodeWant(mid); isWant || gs.have == nil {
+	// A chunk's id must be a valid one (seacast-lite.md §4.4's valid_id): an index at or beyond
+	// MAX_PLAIN_CHUNKS, or at or beyond its group's known count, is ignored, without penalty. The id is
+	// read as the pull reads it (groupIndex: the client's parser, then an ask by index's own form), so
+	// the guard and the pull name the same chunk.
+	root, index, ok := gs.groupIndex(mid)
+	if !ok {
 		return false
 	}
-	if root, index, ok := gs.have.index(mid); ok && gs.seacastCountKnown(root) {
+	if index >= core.MaxPlainChunks {
+		return true
+	}
+	if gs.seacastCountKnown(root) {
 		if n := gs.seacastRootType(root).IndexCount(root); n > 0 && int64(index) >= int64(n) {
 			return true
 		}
 	}
 	return false
+}
+
+// seacastOfferedRoot is the root an offered id names, read as seacastNoteRoot reads it, when the id
+// passes seacastOfferIgnored's form checks (not a pseudo id, its index below MAX_PLAIN_CHUNKS): the
+// root handleIHave places before the checks that look it up. ok is false for any other id.
+func (gs *GossipSubRouter) seacastOfferedRoot(mid string) (string, bool) {
+	if gs.seacast == nil || gs.have == nil || seacastPseudoUnknown(mid) || seacastIsV4Have(mid) {
+		return "", false
+	}
+	root, index, ok := gs.have.index(mid)
+	if !ok || index >= core.MaxPlainChunks {
+		return "", false
+	}
+	return root, true
 }
 
 // seacastCountKnown says whether root's index count is known: a path root whose header is known.
@@ -233,12 +244,39 @@ func (gs *GossipSubRouter) seacastNoteRoot(topic, mid string) {
 	if gs.seacast == nil || gs.have == nil {
 		return
 	}
-	T := gs.seacast.types[topic]
-	if T == nil {
+	root, _, ok := gs.have.index(mid)
+	if !ok {
 		return
 	}
-	root, _, ok := gs.have.index(mid)
-	if !ok || len(root) != haveRootLen {
+	gs.seacastPlaceRoot(topic, root)
+}
+
+// seacastPlaceAccepted places root again on the topic its type answers for it (TopicOf), at an
+// accepted chunk of the group: an offer or a copy on another of the type's topics (a fork's topics
+// overlapping) may have placed it first, and the group's joins, ties and gossip follow its topic. A
+// topic the type does not own, or a root placed under another type, keeps its placement. Router
+// goroutine, from seacastAccepted.
+func (gs *GossipSubRouter) seacastPlaceAccepted(T ObjectType, root string) {
+	sc := gs.seacast
+	topic, ok := T.TopicOf(root)
+	if !ok || sc.types[topic] != T || sc.roots[root] != T || sc.rootTopic[root] == topic {
+		return
+	}
+	sc.rootTopic[root] = topic
+	sc.ctr.RootsReplaced.Add(1)
+}
+
+// seacastPlaceRoot records that root belongs to the type owning topic, where the router first meets
+// the group on the topic: a message of it, or an offer of it, before any check looks the root up (a
+// lookup would place it by the types' TopicOf instead, seacastRootType). A root already placed keeps
+// its type and topic, until an accepted chunk places it on its type's (seacastPlaceAccepted). Nothing
+// for an unowned topic.
+func (gs *GossipSubRouter) seacastPlaceRoot(topic, root string) {
+	if gs.seacast == nil || len(root) != haveRootLen {
+		return
+	}
+	T := gs.seacast.types[topic]
+	if T == nil {
 		return
 	}
 	if gs.seacast.roots == nil {
@@ -277,7 +315,10 @@ func (gs *GossipSubRouter) seacastRootOwner(root string) ObjectType {
 
 // seacastRootType is the type owning root, nil when the root is unknown or the phase path's. A
 // root no chunk has reached the node yet (a WANT names it first: a sampler's at block arrival, a
-// routed request at a forwarder, §4.10) is placed by the types' TopicOf and registered.
+// routed request at a forwarder, §4.10) is placed by the types' TopicOf and registered, when one
+// type places it. Where two do, the root alone doesn't tell their groups apart (two types whose
+// TopicOf answers for any root they haven't seen, say): the root stays unplaced until the router
+// meets it on a topic (seacastPlaceRoot).
 func (gs *GossipSubRouter) seacastRootType(root string) ObjectType {
 	sc := gs.seacast
 	if sc == nil {
@@ -289,20 +330,35 @@ func (gs *GossipSubRouter) seacastRootType(root string) ObjectType {
 	if len(root) != haveRootLen || gs.seacastRootKnownOff(root) {
 		return nil
 	}
-	for topic, T := range sc.types {
+	T, topic := gs.seacastTopicOfPlaces(root)
+	if T == nil {
+		return nil
+	}
+	if sc.roots == nil {
+		sc.roots = map[string]ObjectType{}
+		sc.rootTopic = map[string]string{}
+	}
+	sc.roots[root] = T
+	sc.rootTopic[root] = topic
+	sc.noteRegSlot(root)
+	sc.noteKnown(root) // known_at: a WANT or an offer naming it first (seacast_known.go)
+	return T
+}
+
+// seacastTopicOfPlaces is the one type whose TopicOf places root on a topic the type owns, with that
+// topic; nil when no type does, or when two do.
+func (gs *GossipSubRouter) seacastTopicOfPlaces(root string) (ObjectType, string) {
+	var placed ObjectType
+	var placedOn string
+	for topic, T := range gs.seacast.types {
 		if t, ok := T.TopicOf(root); ok && t == topic {
-			if sc.roots == nil {
-				sc.roots = map[string]ObjectType{}
-				sc.rootTopic = map[string]string{}
+			if placed != nil && placed != T {
+				return nil, ""
 			}
-			sc.roots[root] = T
-			sc.rootTopic[root] = topic
-			sc.noteRegSlot(root)
-			sc.noteKnown(root) // known_at: a WANT or an offer naming it first (seacast_known.go)
-			return T
+			placed, placedOn = T, topic
 		}
 	}
-	return nil
+	return placed, placedOn
 }
 
 // seacastRootKnownOff says whether root is known and not the path's: a group the router has seen
@@ -345,13 +401,22 @@ func (gs *GossipSubRouter) seacastHaveFlags(root string, bits *haveBits, claimAl
 		return false, 0
 	}
 	if sc := gs.seacast; sc != nil && sc.machine {
+		if gs.have != nil && gs.have.originAcks.has(root) {
+			// A group the node publishes claims only what has arrived (holding_of at the source,
+			// core.OriginClaims): both once bits names every chunk, neither before, whatever its
+			// machine state says (a single Publish accepts the source's own chunk).
+			if all, complete := core.OriginClaims(*bits, T.IndexCount(root)); all && complete {
+				flags = seacastFlagClaimAll | seacastFlagComplete
+			}
+			return true, flags
+		}
 		// The machine's two claims (seacast_complete.go, §4.2's holding_of): claim_all for a group
 		// being decoded or held whole, complete for a group whose asks stopped.
-		g := sc.groups[root]
-		if claimAll || bits.Count() >= T.IndexCount(root) || (g != nil && g.state == seacastDecoding) {
+		g := sc.group(root)
+		if claimAll || bits.Count() >= T.IndexCount(root) || (g != nil && g.State == seacastDecoding) {
 			flags |= seacastFlagClaimAll
 		}
-		if g != nil && g.stopPull {
+		if g != nil && g.StopPull {
 			flags |= seacastFlagComplete
 		}
 		return true, flags
@@ -376,6 +441,7 @@ func (gs *GossipSubRouter) seacastEncodeHave(root string, bits *haveBits, claimA
 			}
 		}
 	}
+	bits = gs.seacastOriginBelowCount(root, bits)
 	v4, flags := gs.seacastHaveFlags(root, bits, claimAll)
 	if !v4 {
 		return encodeHave(root, bits)
@@ -385,9 +451,9 @@ func (gs *GossipSubRouter) seacastEncodeHave(root string, bits *haveBits, claimA
 
 // seacastAbsorbV2 absorbs a v4 holding from p into the ledger: the bits as a holding (as v1's),
 // the flags into the entry. Called for an id carrying the HAVE magic with version 4; such an id is
-// the path's whatever follows, so handled is true in every case (absorbed, refused, or malformed:
-// too short for the header, a reserved bit, over the cap, a bit beyond the type's IndexCount), and
-// the caller is done with it: it is never stored as an ordinary id.
+// the path's whatever follows, so handled is true in every case (absorbed, refused, ignored for an
+// expired group, or malformed: too short for the header, a reserved bit, over the cap, a bit beyond
+// the type's IndexCount), and the caller is done with it: it is never stored as an ordinary id.
 func (gs *GossipSubRouter) seacastAbsorbV2(p peer.ID, mid string) (handled bool) {
 	ctr := gs.seacastCounters()
 	root, claimAll, complete, enc, ok, malformed := decodeHaveV2(mid)
@@ -403,29 +469,17 @@ func (gs *GossipSubRouter) seacastAbsorbV2(p peer.ID, mid string) (handled bool)
 		ctr.Malformed.Add(1)
 		return true
 	}
-	h := gs.have
-	if h == nil {
+	if gs.have == nil {
 		return true
 	}
-	roots := h.peers[p]
-	if roots == nil {
-		roots = make(map[string]*haveEntry)
-		h.peers[p] = roots
+	if gs.expired(root) {
+		return true // ignored as v1's (seacast-lite.md §4.3's on_have): neither its bits nor its claims kept
 	}
-	e := roots[root]
-	if e == nil {
-		e = &haveEntry{}
-		roots[root] = e
-	}
-	e.claimAll = e.claimAll || claimAll // [c10] a later holding never retracts a claim (draft §4.3)
-	e.complete = e.complete || complete
+	// The bits as a v1 holding's, with the claims: one absorption, so every consumer (the entry,
+	// holders, the ledger, the writer's copy, the known ids) sees it once. [c10] a later holding
+	// never retracts a claim (draft §4.3).
+	gs.haveTake(p, root, enc, claimAll, complete)
 	ctr.HoldingsV4.Add(1)
-	// The bits as a v1 holding would be absorbed: through haveAbsorb's holding branch on the v1
-	// encoding of the same bitmap, so every consumer (holders, the ledger, the writer's copy,
-	// the known ids) sees it once.
-	var bits haveBits
-	bits.Or(enc)
-	gs.haveAbsorb(p, encodeHave(root, &bits))
 	if claimAll {
 		// (R5) under the machine: a deferral on the claim. On every claiming holding, not only a peer's first
 		// claim of the group (seacast.md §4.3's on_holding, spec 43fe953): a claim that came before our duty
@@ -483,4 +537,161 @@ func (gs *GossipSubRouter) seacastWantIn(mid string) (resolved string, standing 
 
 func (sc *seacast) String() string {
 	return fmt.Sprintf("seacast{types %d, roots %d}", len(sc.types), len(sc.roots))
+}
+
+// --- the codec to the core's messages
+//
+// The binding's strings to the core's types (package seacast) and back. Bindings §4 names a group
+// by 32 bytes, "seacast-lite.md §2's group key, which is the whole id of a payload group"; the core
+// names it by its GroupId (§1.2), the payload's GroupId(0, key, 0). How the strings name a column's
+// or a row's group is open there (§4's first open point), so the codec maps the payload's groups
+// only. A holding travels in an IDONTWANT and an offer in an IHAVE, so the reader takes the carrier.
+
+// seacastGroupID is the core's GroupID of a payload group the binding names by root.
+func seacastGroupID(root string) (core.GroupID, bool) {
+	if len(root) != haveRootLen {
+		return "", false
+	}
+	var key [32]byte
+	copy(key[:], root)
+	return core.NewGroupID(core.TypePayload, key, 0), true
+}
+
+// seacastRootOf is the binding's name of g: the payload group's key.
+func seacastRootOf(g core.GroupID) (string, bool) {
+	if !g.Valid() || g.Type() != core.TypePayload || g.Index() != 0 {
+		return "", false
+	}
+	key := g.Key()
+	return string(key[:]), true
+}
+
+// seacastHaveOf reads a HAVE pseudo id as the core's Have. In an IDONTWANT (offer false) it is a
+// holding, of version 1 or 4; in an IHAVE (offer true) an offer, of version 1 only ("An offer keeps
+// version 1"). ok is false for an ordinary id, and for a version-1 entry over the cap, which the
+// binding reads as one (decodeHave; seacast-bindings.md §4: any other entry "is an opaque id"); malformed is
+// true, with ok, for what the binding ignores: a v4 holding the codec refuses, a version it
+// doesn't write, and anything but version 1 in an offer (seacastOfferIgnored).
+func seacastHaveOf(mid string, offer bool) (h core.Have, ok, malformed bool) {
+	if strings.HasPrefix(mid, haveMagic) && seacastPseudoUnknown(mid) {
+		return core.Have{}, true, true
+	}
+	if root, claimAll, complete, bitmap, isV4, mal := decodeHaveV2(mid); isV4 {
+		g, mapped := seacastGroupID(root)
+		if offer || mal || !mapped {
+			return core.Have{}, true, true
+		}
+		return core.Have{Group: g, Bits: bitmap, ClaimAll: claimAll, Complete: complete}, true, false
+	}
+	root, bitmap, isV1 := decodeHave(mid)
+	if !isV1 {
+		return core.Have{}, false, false
+	}
+	g, mapped := seacastGroupID(root)
+	if !mapped {
+		return core.Have{}, true, true
+	}
+	return core.Have{Group: g, Bits: bitmap, Offer: offer}, true, false
+}
+
+// seacastHaveID writes the core's Have as the binding's string: an offer as version 1, a holding as
+// version 4 with its flags, as seacastEncodeHave writes a holding of the path's roots. ok is false
+// for a group the codec doesn't map, an offer with a holding's flag, or a bitmap over the cap.
+func seacastHaveID(h core.Have) (string, bool) {
+	root, mapped := seacastRootOf(h.Group)
+	if !mapped || len(h.Bits.Trim()) > haveMaxBytes || (h.Offer && (h.ClaimAll || h.Complete)) {
+		return "", false
+	}
+	bits := newHaveBits(h.Bits)
+	if h.Offer {
+		return encodeHave(root, bits), true
+	}
+	return encodeHaveV2(root, bits, h.ClaimAll, h.Complete), true
+}
+
+// seacastWantOf reads a WANT pseudo id as the core's Want: version 4 with its flags and hops, or
+// version 1, the plain ask by index (which seacast-bindings.md §4 leaves open for a seacast.md node; the
+// port reads it as an ask, as today). One id names one index. ok is false for an ordinary id, and
+// for a version-1 WANT of the wrong length, which the binding reads as one (decodeWant); malformed
+// is true, with ok, for a WANT the codec refuses and a version the binding doesn't write.
+// The hops bound per type (ROUTE_HOPS) is the receiver's (seacastWantIn), not the codec's.
+func seacastWantOf(mid string) (w core.Want, ok, malformed bool) {
+	if strings.HasPrefix(mid, wantMagic) && seacastPseudoUnknown(mid) {
+		return core.Want{}, true, true
+	}
+	if root, index, standing, hops, isV4, mal := decodeWantV2(mid); isV4 {
+		g, mapped := seacastGroupID(root)
+		if mal || !mapped {
+			return core.Want{}, true, true
+		}
+		w = core.Want{Group: g, Standing: standing, Probe: wantV2Probe(mid), Hops: hops}
+		if index >= core.MaxHaveBytes*8 {
+			return core.Want{}, true, true // beyond any group's indices: the core's Bits can't name it
+		}
+		w.Bits.Set(index)
+		return w, true, false
+	}
+	root, index, isV1 := decodeWant(mid)
+	if !isV1 {
+		return core.Want{}, false, false
+	}
+	g, mapped := seacastGroupID(root)
+	if !mapped {
+		return core.Want{}, true, true
+	}
+	if index >= core.MaxHaveBytes*8 {
+		return core.Want{}, true, true
+	}
+	w = core.Want{Group: g}
+	w.Bits.Set(index)
+	return w, true, false
+}
+
+// seacastWantIDs writes the core's Want as the binding's strings: one version 4 id per index, in
+// order, with the flags and hops. ok is false for a group the codec doesn't map, hops over the
+// codec's bound, or no index.
+func seacastWantIDs(w core.Want) ([]string, bool) {
+	root, mapped := seacastRootOf(w.Group)
+	idx := w.Bits.Indices()
+	if !mapped || w.Hops > seacastMaxHops || len(idx) == 0 {
+		return nil, false
+	}
+	var flags byte
+	if w.Standing {
+		flags |= seacastFlagStanding
+	}
+	if w.Probe {
+		flags |= seacastFlagProbe
+	}
+	out := make([]string, len(idx))
+	for k, i := range idx {
+		out[k] = encodeWantV2Flags(root, i, flags, w.Hops)
+	}
+	return out, true
+}
+
+// seacastChunkOf is the core's Chunk for a message of the path: its group and index from the
+// structured id, its bytes as Data, and the message itself as Ref, so that forwarding sends the
+// same bytes under the same id. The binding doesn't split the bytes: the object type reads its
+// proof, header and context from them. ok is false for a message whose id names no payload group.
+// Router goroutine.
+func (gs *GossipSubRouter) seacastChunkOf(msg *Message) (core.Chunk, bool) {
+	if gs.have == nil || msg == nil {
+		return core.Chunk{}, false
+	}
+	root, index, ok := gs.have.index(gs.p.idGen.ID(msg))
+	if !ok {
+		return core.Chunk{}, false
+	}
+	g, mapped := seacastGroupID(root)
+	if !mapped {
+		return core.Chunk{}, false
+	}
+	return core.Chunk{Group: g, Index: index, Data: msg.GetData(), Ref: msg}, true
+}
+
+// seacastMessageOf is the message a Chunk came in (its Ref); ok is false for a rebuilt chunk.
+func seacastMessageOf(c core.Chunk) (*Message, bool) {
+	m, ok := c.Ref.(*Message)
+	return m, ok && m != nil
 }

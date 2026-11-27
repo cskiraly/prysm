@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -59,6 +61,25 @@ type phaseForwarding struct {
 	// connected topic peer, so a fast source spreads distinct frames over all its first-hop
 	// uplinks; the announce stays mesh-scoped.
 	srcConnections bool
+
+	// senderInForward keeps a relayed message's sender a candidate of SEACAST's forward, where it
+	// can take a place of the budget and is then skipped at the push (WithSeacastSenderInForward).
+	senderInForward bool
+}
+
+// WithSeacastSenderInForward keeps the sender of a relayed chunk a candidate of SEACAST's forward:
+// the choice can give it a place of the push budget, and the push to it is then skipped, so the
+// chunk reaches one peer fewer. Without it, as seacast-lite.md §5.2's forward does, the sender is
+// never a candidate. Must follow WithPhaseForwarding.
+func WithSeacastSenderInForward() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok || gs.phaseForward == nil {
+			return fmt.Errorf("the sender in the forward requires WithPhaseForwarding first")
+		}
+		gs.phaseForward.senderInForward = true
+		return nil
+	}
 }
 
 // WithPhaseSourceConnections makes the publisher rank its own messages over every connected
@@ -179,60 +200,42 @@ func WithPhaseSelectFewestTolerant(mode PhaseSelectTolerance, frames int) Option
 	}
 }
 
-// tolerantOrder reorders cands, in sel=fewest order with the slow class last, so its first budget
-// entries are the tolerant draw; whatever the draw leaves keeps its fewest order behind them, so
-// a short draw fills from there and the announce order is the fewest order. Event loop.
-func (pf *phaseForwarding) tolerantOrder(gs *GossipSubRouter, cands []peer.ID, known map[peer.ID]int, slow map[peer.ID]bool, budget int) []peer.ID {
+// tolerantOrder reorders cands, in sel=fewest order with the slow class last, by the proportional
+// draw (PhaseSelectProportional): its first budget entries are the draw, and whatever the draw
+// leaves keeps its fewest order behind them, so a short draw fills from there. The lower-half
+// draw is the core's (core.ChoosePush). Event loop.
+func (pf *phaseForwarding) tolerantOrder(cands []peer.ID, known map[peer.ID]int, slow map[peer.ID]bool, budget int) []peer.ID {
 	fast := 0
 	for fast < len(cands) && !slow[cands[fast]] {
 		fast++
 	}
 	pool := cands[:fast]
-	if pf.selTolerance == PhaseSelectLowerHalf && fast > 0 {
-		median := known[cands[(fast-1)/2]]
-		e := 0
-		for e < fast && known[cands[e]] <= median {
-			e++
-		}
-		pool = cands[:e]
-	}
 	if len(pool) == 0 || budget <= 0 {
 		return cands
 	}
 	pool = append([]peer.ID(nil), pool...)
-	intn := rand.Intn
 	k := min(budget, len(pool))
 	chosen := make(map[peer.ID]bool, k)
 	out := make([]peer.ID, 0, len(cands))
-	switch pf.selTolerance {
-	case PhaseSelectLowerHalf:
-		for i := range k {
-			j := i + intn(len(pool)-i)
-			pool[i], pool[j] = pool[j], pool[i]
-			chosen[pool[i]] = true
-			out = append(out, pool[i])
+	w := make([]int, len(pool))
+	total := 0
+	for i, p := range pool {
+		w[i] = max(0, pf.selFrames-known[p])
+		total += w[i]
+	}
+	for range k {
+		if total <= 0 {
+			break // nobody appears to lack anything: the fewest order fills the rest
 		}
-	case PhaseSelectProportional:
-		w := make([]int, len(pool))
-		total := 0
-		for i, p := range pool {
-			w[i] = max(0, pf.selFrames-known[p])
-			total += w[i]
+		r, j := rand.Intn(total), 0
+		for r >= w[j] {
+			r -= w[j]
+			j++
 		}
-		for range k {
-			if total <= 0 {
-				break // nobody appears to lack anything: the fewest order fills the rest
-			}
-			r, j := intn(total), 0
-			for r >= w[j] {
-				r -= w[j]
-				j++
-			}
-			chosen[pool[j]] = true
-			out = append(out, pool[j])
-			total -= w[j]
-			w[j] = 0
-		}
+		chosen[pool[j]] = true
+		out = append(out, pool[j])
+		total -= w[j]
+		w[j] = 0
 	}
 	for _, p := range cands {
 		if !chosen[p] {
@@ -242,25 +245,20 @@ func (pf *phaseForwarding) tolerantOrder(gs *GossipSubRouter, cands []peer.ID, k
 	return out
 }
 
-// unproven reports whether the proof guard demotes p for root at now. Event loop.
-func (pf *phaseForwarding) unproven(gs *GossipSubRouter, p peer.ID, root string, now time.Time) bool {
-	if pf.selGrace <= 0 {
-		return false
+// pushChoice is the core's choose_push settings for mid of root under this forwarding: the rank
+// hash, the draw, and the proof guard at now.
+func (pf *phaseForwarding) pushChoice(mid, root string, now time.Time) core.PushChoice[peer.ID] {
+	c := core.PushChoice[peer.ID]{
+		Rank:        func(p peer.ID) uint64 { return phaseRank(mid, p) },
+		Intn:        rand.Intn,
+		Now:         now,
+		GuardGrace:  pf.selGrace,
+		GuardPushes: pf.degree,
 	}
-	pe := gs.have.pushed[p][root]
-	if pe == nil || pe.bits.Count() < pf.degree || now.Sub(pe.first) <= pf.selGrace {
-		return false
+	if pf.selDemoted != nil {
+		c.Demoted = func(p peer.ID) { pf.selDemoted(p, root) }
 	}
-	if gs.have.peers[p][root] != nil {
-		return false // a HAVE, a claim or a hose ack for the group is the proof
-	}
-	if !pe.demoted {
-		pe.demoted = true
-		if pf.selDemoted != nil {
-			pf.selDemoted(p, root)
-		}
-	}
-	return true
+	return c
 }
 
 // fewestRoot is the group root sel=fewest ranks mid's candidates by; false when sel=fewest is
@@ -271,19 +269,6 @@ func (pf *phaseForwarding) fewestRoot(gs *GossipSubRouter, mid string) (string, 
 	}
 	root, _, ok := gs.have.index(mid)
 	return root, ok
-}
-
-// knownFrames is how many frames of root p is known to hold or to have in flight from us: the
-// union of its HAVE bitmap and what we pushed it. Called on the event loop.
-func (h *haveState) knownFrames(p peer.ID, root string) int {
-	var u haveBits
-	if pe := h.peers[p]; pe != nil && pe[root] != nil {
-		u.Or(pe[root].bits.b)
-	}
-	if pe := h.pushed[p]; pe != nil && pe[root] != nil {
-		u.Or(pe[root].bits.b)
-	}
-	return u.Count()
 }
 
 // WithPhaseSourcePushQuota caps what the publisher pushes of one group to each mesh peer at quota
@@ -417,31 +402,18 @@ func (pf *phaseForwarding) trimDegree(gs *GossipSubRouter, mid string, csum chec
 		return nil
 	}
 	if root, ok := pf.fewestRoot(gs, mid); ok {
-		known := make(map[peer.ID]int, len(cands))
-		slow := make(map[peer.ID]bool, len(cands))
 		var now time.Time
 		if pf.selGrace > 0 {
 			now = time.Now()
 		}
-		for _, p := range cands {
-			known[p] = gs.have.knownFrames(p, root)
-			slow[p] = pf.unproven(gs, p, root, now)
-		}
-		sort.Slice(cands, func(i, j int) bool {
-			if si, sj := slow[cands[i]], slow[cands[j]]; si != sj {
-				return sj
-			}
-			if ki, kj := known[cands[i]], known[cands[j]]; ki != kj {
-				return ki < kj
-			}
-			ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
-			if ri != rj {
-				return ri > rj
-			}
-			return cands[i] > cands[j]
-		})
-		if pf.selTolerance != PhaseSelectArgmax && !fromSelf {
-			cands = pf.tolerantOrder(gs, cands, known, slow, budget)
+		c := pf.pushChoice(mid, root, now)
+		if pf.selTolerance == PhaseSelectProportional && !fromSelf {
+			order, known, slow := core.RankPush(gs.have.peers, gs.have.pushed, seacastGID(root), cands, c)
+			cands = pf.tolerantOrder(order, known, slow, budget)
+		} else {
+			// The publisher's own messages and the argmax keep the ranking; the lower half draws.
+			atSource := fromSelf || pf.selTolerance == PhaseSelectArgmax
+			cands = core.ChoosePush(gs.have.peers, gs.have.pushed, seacastGID(root), cands, budget, atSource, c)
 		}
 	} else {
 		// sel=rank: per (message, peer) hash so different messages spread their pushes across
@@ -465,6 +437,107 @@ func (pf *phaseForwarding) trimDegree(gs *GossipSubRouter, mid string, csum chec
 		announce = append(announce, p)
 	}
 	return announce
+}
+
+// seacastForwardedChunk is the group and index of a message SEACAST's forward handles: a chunk
+// of a path root. Any other message on the path's topics keeps trimDegree.
+func (gs *GossipSubRouter) seacastForwardedChunk(mid string) (root string, index uint32, ok bool) {
+	if gs.have == nil {
+		return "", 0, false
+	}
+	root, index, ok = gs.have.index(mid)
+	return root, index, ok && len(root) == haveRootLen
+}
+
+// seacastTrim is trimDegree on SEACAST's path, for chunk index of root (seacast-lite.md §5.2 and
+// §5.3, through the core). The core says who is a candidate and the budget; the fork's selection
+// options order the candidates, as trimDegree does.
+//   - At a relay, core.ForwardCandidates over cand, the mesh: each peer whose holding names the
+//     chunk takes one from base (R_NODE), and the candidates are the others that want the chunk,
+//     but the sender (unless WithSeacastSenderInForward) and the peers that claimed the group
+//     complete. A peer wants the chunk when it has not asked us not to send it (IDONTWANT) and its
+//     interest has the index.
+//   - At the source, the candidates are cand's peers that want the chunk from the node
+//     (core.WantsFromMe: not complete, and neither holding the chunk nor pushed it) and have not
+//     asked us not to send it, and the budget is base, less no holder; the order is the ranking
+//     (no draw).
+//
+// Every peer of cand not chosen leaves tosend. It returns the peers chosen, in order (the pushes
+// leave in it, rankedPushOrder), and those past the budget, in order, to be offered. With the source's
+// push quota (WithPhaseSourcePushQuota) the quota chooses, and the order is tosend's (push nil).
+func (pf *phaseForwarding) seacastTrim(gs *GossipSubRouter, mid, root string, index uint32, csum checksum, from peer.ID, cand, tosend map[peer.ID]struct{}, fromSelf bool, base int) (push, announce []peer.ID) {
+	h, g := gs.have, seacastGID(root)
+	pushers := make([]peer.ID, 0, len(cand))
+	for p := range cand {
+		pushers = append(pushers, p)
+	}
+	slices.Sort(pushers) // the pool's order, fixed: the order a choice that covers every candidate keeps
+	interest := func(p peer.ID) *haveBits {
+		if gs.seacast == nil || gs.seacast.roles == nil {
+			return nil
+		}
+		return gs.seacastInterestOfPeer(p, root)
+	}
+	wants := func(p peer.ID) bool {
+		if _, unwanted := gs.unwanted[p][csum]; unwanted {
+			return false
+		}
+		in := interest(p)
+		return in == nil || in.Has(index)
+	}
+	var cands []peer.ID
+	budget := max(0, base) // a type's negative R_NODE pushes nothing, as trimDegree's clamp did
+	if fromSelf {
+		for _, p := range pushers {
+			if wants(p) && core.WantsFromMe(h.peers, h.pushed, p, g, index, nil) {
+				cands = append(cands, p)
+			}
+		}
+	} else {
+		sender := from
+		if pf.senderInForward {
+			sender = ""
+		}
+		cands, budget = core.ForwardCandidates(h.peers, g, index, sender, pushers, base, wants)
+	}
+	for p := range cand {
+		delete(tosend, p)
+	}
+	if fromSelf && pf.srcPushQuota > 0 {
+		for _, p := range cands {
+			tosend[p] = struct{}{}
+		}
+		return nil, pf.quotaTrim(root, mid, cands, budget, tosend)
+	}
+	if budget < len(cands) {
+		var now time.Time
+		if pf.selGrace > 0 {
+			now = time.Now()
+		}
+		c := pf.pushChoice(mid, root, now)
+		switch {
+		case pf.selFewest && pf.selTolerance == PhaseSelectProportional && !fromSelf:
+			order, known, slow := core.RankPush(h.peers, h.pushed, g, cands, c)
+			cands = pf.tolerantOrder(order, known, slow, budget)
+		case pf.selFewest:
+			// The publisher's own messages and the argmax keep the ranking; the lower half draws.
+			atSource := fromSelf || pf.selTolerance == PhaseSelectArgmax
+			cands = core.ChoosePush(h.peers, h.pushed, g, cands, budget, atSource, c)
+		default:
+			sort.SliceStable(cands, func(i, j int) bool {
+				ri, rj := phaseRank(mid, cands[i]), phaseRank(mid, cands[j])
+				if ri != rj {
+					return ri > rj
+				}
+				return cands[i] > cands[j]
+			})
+		}
+	}
+	n := min(budget, len(cands))
+	for _, p := range cands[:n] {
+		tosend[p] = struct{}{}
+	}
+	return cands[:n], cands[n:]
 }
 
 // --- Withholding injection ---
@@ -604,12 +677,14 @@ func (gs *GossipSubRouter) applyClassLoss(rpc *RPC, dst peer.ID) *RPC {
 		if ctl == nil {
 			return rpc
 		}
+		var lost []string
 		filterIDs := func(ids []string) ([]string, int64) {
 			var n int64
 			kept := make([]string, 0, len(ids))
 			for _, id := range ids {
 				if gs.lossDecide(id, dst) {
 					n++
+					lost = append(lost, id)
 					continue
 				}
 				kept = append(kept, id)
@@ -668,6 +743,13 @@ func (gs *GossipSubRouter) applyClassLoss(rpc *RPC, dst peer.ID) *RPC {
 		out.Subscriptions = rpc.Subscriptions
 		out.Publish = rpc.Publish
 		out.Control = newCtl
+		if gs.lossClass == lossClassIWant && gs.pullOn() {
+			// An ask lost on the wire was written: a chunk's promise opens and its queued record closes,
+			// as at the writer under E (here E is off: under it the loss is drawn there). Router
+			// goroutine: only doSendRPC draws this class.
+			// Never queued: popped and written at once, after the asks were recorded.
+			gs.promisesFromWrite(dst, lost, nextAskSeq(), time.Now())
+		}
 	}
 	if gs.lossDropped != nil {
 		gs.lossDropped.Add(dropped)
@@ -781,6 +863,10 @@ func WithSendDelay(d time.Duration) Option {
 
 // iwantDelivered clears an id's ask state on its arrival.
 func (gs *GossipSubRouter) iwantDelivered(mid string) {
+	if root, g, i, ok := gs.pullChunk(mid); ok {
+		gs.pullClose(root, g, i) // a chunk: close_promises in the core's tables (seacast_pull.go)
+		return
+	}
 	// Delivery keeps the promise: the asked peer served within the window, so the later
 	// expiry of the iwantAsked entry (which delivery deliberately does not clear) must not
 	// count as a break. Without this line every honest serve would eventually park its
@@ -790,7 +876,6 @@ func (gs *GossipSubRouter) iwantDelivered(mid string) {
 	}
 	gs.seacastAsksClosed(mid) // delivered: no ask of it is open any more
 	gs.clearOffers(mid)
-	gs.v05ChunkDelivered(mid)
 }
 
 // iwantAllowed reports whether an IWANT for mid may be issued now, recording it if so.
@@ -798,6 +883,9 @@ func (gs *GossipSubRouter) iwantDelivered(mid string) {
 func (gs *GossipSubRouter) iwantAllowed(mid string, from peer.ID) bool {
 	if gs.iwantAsked == nil {
 		return true
+	}
+	if _, g, i, ok := gs.pullChunk(mid); ok {
+		return gs.pullMayAsk(from, g, i) // a chunk: may_ask in the core (seacast_pull.go)
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		return false
@@ -875,6 +963,14 @@ func (gs *GossipSubRouter) notePromiseBreak(mid string, p peer.ID) {
 	if gs.iwantPromised == nil {
 		return
 	}
+	if g, ok := gs.pullParkGroup(mid); ok {
+		// A chunk's or a direct ask's group: parked in the core's park, which a chunk's asks read.
+		if _, _, i, chunk := gs.pullChunk(mid); chunk {
+			gs.pull.promises.CloseFrom(g, i, p)
+		}
+		gs.pullPark(p, g)
+		return
+	}
 	if peers := gs.iwantPromised[mid]; peers != nil {
 		delete(peers, p)
 		if len(peers) == 0 {
@@ -929,7 +1025,7 @@ func (gs *GossipSubRouter) clearIWantAsked() {
 		}
 	}
 	gs.sweepOffers()
-	gs.sweepV05()
+	gs.pullSweep()
 	gs.sweepGroupParks()
 }
 
@@ -1009,6 +1105,10 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 	if gs.offerTable == nil || gs.haveSeen(mid) {
 		return
 	}
+	if _, g, i, ok := gs.pullChunk(mid); ok {
+		gs.pullAddOffer(p, g, i) // a chunk: add_offer in the core (seacast_pull.go)
+		return
+	}
 	if gs.offerByPeer[p] >= offerPerPeer {
 		return
 	}
@@ -1024,9 +1124,6 @@ func (gs *GossipSubRouter) recordOffer(mid, topic string, p peer.ID) {
 	}
 	if _, known := peers[p]; !known {
 		gs.offerByPeer[p]++
-		if gs.v05LastResortFor(mid) {
-			gs.noteOrder(mid, p)
-		}
 	}
 	peers[p] = time.Now()
 }
@@ -1044,7 +1141,6 @@ func (gs *GossipSubRouter) clearOffers(mid string) {
 	delete(gs.offerTable, mid)
 	delete(gs.offerTried, mid)
 	delete(gs.offerTopic, mid)
-	gs.v05ClearList(mid)
 }
 
 // sweepOffers ages out stale offers; called from the heartbeat sweep.
@@ -1059,9 +1155,6 @@ func (gs *GossipSubRouter) sweepOffers() {
 				delete(peers, p)
 				if gs.offerByPeer[p] > 0 {
 					gs.offerByPeer[p]--
-				}
-				if gs.v05LastResort() {
-					gs.dropOrder(mid, p)
 				}
 				if gs.seacastOfferDropped(p, mid) {
 					retry = append(retry, mid) // its ask went with the offer (F13): ask another announcer
@@ -1082,10 +1175,13 @@ func (gs *GossipSubRouter) sweepOffers() {
 // retryOfferedPull runs on the router goroutine one window after an ask was granted. If the id
 // is still missing and no ask is in flight, it re-asks the best remembered announcer:
 // untried first, then least-recently tried, in deterministic peer order.
-// It returns the peer asked, and whether an ask went out (seacastRetryHeldBack reads the latter).
+// It returns the peer asked, and whether an ask went out (seacastHeartbeatLimits reads the latter).
 func (gs *GossipSubRouter) retryOfferedPull(mid string) (pick peer.ID, sent bool) {
 	if gs.offerTable == nil {
 		return "", false
+	}
+	if _, g, i, ok := gs.pullChunk(mid); ok {
+		return gs.pullRetry(g, i) // a chunk: retry_offer in the core (seacast_pull.go)
 	}
 	if gs.haveSeen(mid) {
 		gs.clearOffers(mid)
@@ -1099,9 +1195,6 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) (pick peer.ID, sent bool
 	}
 	if at, ok := gs.iwantAsked[mid]; ok && time.Since(at) < gs.iwantWindow {
 		return "", false // an ask is in flight; its own retry timer will fire
-	}
-	if gs.v05LastResortFor(mid) {
-		return gs.retryV05(mid) // a chunk: every announcer in announcement order, and the last resort
 	}
 	offers := gs.offerTable[mid]
 	if len(offers) == 0 {
@@ -1129,19 +1222,7 @@ func (gs *GossipSubRouter) retryOfferedPull(mid string) (pick peer.ID, sent bool
 		return "", false
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
-	tried := gs.offerTried[mid]
-	found := false
-	var oldest time.Time
-	for _, p := range cands {
-		t, was := tried[p]
-		if !was {
-			pick, found = p, true
-			break
-		}
-		if !found || t.Before(oldest) {
-			pick, found, oldest = p, true, t
-		}
-	}
+	pick, found := gs.pickAnnouncer(mid, cands)
 	if !found || !gs.iwantAllowed(mid, pick) {
 		return "", false
 	}

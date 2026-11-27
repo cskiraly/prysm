@@ -11,6 +11,7 @@ package pubsub
 // rpc.solicited). The table and the counts go with the group at its expiry.
 
 import (
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -57,7 +58,7 @@ func (gs *GossipSubRouter) seacastServeLimited(p peer.ID, root string) bool {
 		return false
 	}
 	limit := T.Params().ServeLimit
-	if limit <= 0 || sc.served[root][p] < limit {
+	if !sc.served.Limited(seacastGID(root), p, limit) {
 		return false
 	}
 	sc.ctr.ServeLimited.Add(1)
@@ -85,14 +86,9 @@ func (gs *GossipSubRouter) seacastNoteServed(p peer.ID, root string) {
 
 func (sc *seacast) noteServed(p peer.ID, root string) {
 	if sc.served == nil {
-		sc.served = map[string]map[peer.ID]int{}
+		sc.served = core.Served[peer.ID]{}
 	}
-	g := sc.served[root]
-	if g == nil {
-		g = map[peer.ID]int{}
-		sc.served[root] = g
-	}
-	g[p]++
+	sc.served.Note(seacastGID(root), p)
 }
 
 // seacastStand keeps p's request for (root, index) until the chunk is here (§4.5:
@@ -155,7 +151,7 @@ func (gs *GossipSubRouter) seacastServeStanding(T ObjectType, root string, index
 		if gs.havePeerHolds(q, root, index) {
 			continue // it has it: nothing to answer (§4.5)
 		}
-		if limit > 0 && sc.served[root][q] >= limit {
+		if sc.served.Limited(seacastGID(root), q, limit) {
 			sc.ctr.StandingLimited.Add(1)
 			continue
 		}
@@ -182,6 +178,6 @@ func (sc *seacast) standingForget(root string) {
 		sc.ctr.StandingExpired.Add(int64(len(peers)))
 	}
 	delete(sc.standing, root)
-	delete(sc.served, root)
+	sc.served.Forget(seacastGID(root))
 	delete(sc.probeWaiting, root) // (R5) the probes kept while we decoded go with the group
 }

@@ -18,39 +18,17 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"sync"
 	"sync/atomic"
 	"time"
+
+	core "github.com/cskiraly/seacast-go"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// TypeParams is an object type's parameters (seacast.md §6.3), the toy's configuration table.
-// Only what this step reads is here; the rest is added with its part. The fork
-// runs the payload's values of the others (§6.1): EAGER, its rebuilt chunks to the push
-// relation (REPAIR_TO), and the heartbeat's gossip beyond the relations (ANNOUNCE_EXTRA SAMPLE).
-type TypeParams struct {
-	// RNode is the per-chunk push budget of a forwarding node for this type (v0.3's R_NODE; the
-	// fast class's larger value is the node's own instance's).
-	RNode int
-	// ServeLimit is the chunks served per peer and group (§6.3's SERVE_LIMIT, [R6]; §4.5): an ask
-	// at the limit is refused without penalty, and a standing request is not answered past it.
-	// Zero: no limit (the columns' ∞ in the toy's table).
-	ServeLimit int
-	// DecodeAtK and DecodeLater are §6.3's DECODE_AT_K and DECODE_LATER ([D4]; seacast_complete.go,
-	// under WithSeacastMachine): whether this node decodes a group the moment K of it are in, and
-	// whether, and how long after known_at, it decodes a group still short then. Nil: never.
-	DecodeAtK   func(root string) bool
-	DecodeLater func(root string) (time.Duration, bool)
-	// DeferWindow is §6.3's DEFER_WINDOW (1 s when zero): a claim's deferral and its probe's
-	// promise.
-	DeferWindow time.Duration
-	// ProjectFanIn is the window's projection fan-in for the type's groups (§4.9, [c12];
-	// seacast_project.go): the other pushers taken to have delivered as much unacknowledged as
-	// this node; 1 when zero. The projection applies to a type with a code only (K < N).
-	ProjectFanIn int
-}
+// TypeParams is an object type's parameters (seacast.md §6.3): the core's.
+type TypeParams = core.TypeParams
 
 // ChunkSlotter is an ObjectType that reads, from a chunk's id, the slot its copy names (seacast-lite.md §4.2's
 // f.slot; spec f6c19db). What waits for a root the application cannot place yet (SlotOf unknown) goes
@@ -68,7 +46,10 @@ type ObjectType interface {
 	Params() TypeParams
 	Topics() []string
 	// HeaderKnown says whether the group's header is validated (the gate, §4.2): a chunk of a
-	// group whose header is not yet validated waits in the pending store (seacast_accept.go).
+	// group whose header is not yet validated waits in the pending store (seacast_accept.go). Once
+	// true it stays true while the group lives (seacast-lite.md's authenticable: an installed
+	// block); the path asks for nothing of a group before, and a gate that closed again would not
+	// stop an ask the retry had already scheduled.
 	HeaderKnown(root string) bool
 	// IndexCount is the group's number of indices (the claim_all flag counts against it).
 	IndexCount(root string) int
@@ -103,11 +84,8 @@ type ObjectType interface {
 	Family(root string) string
 }
 
-// GroupIndex names one (group, index) pair of the path (§1.1's project and cross).
-type GroupIndex struct {
-	Root  string
-	Index uint32
-}
+// GroupIndex names one (group, index) pair (§1.1's project and cross): the core's.
+type GroupIndex = core.GroupIndex
 
 // SeacastCounters counts what the path did, for the harness's lines and its positive controls.
 type SeacastCounters struct {
@@ -125,6 +103,7 @@ type SeacastCounters struct {
 	Arrived, Own, Accepted, Rejected, Ignored              atomic.Int64
 	Pending, PendingDup, PendingRefused, Released, Expired atomic.Int64
 	UnknownRefused                                         atomic.Int64 // copies of a group beyond the sender's MAX_PENDING_GROUPS: neither kept nor tied
+	SeenAtGate                                             atomic.Int64 // copies of a seen id meeting a closed gate: duplicates, not kept
 	StaleWaits                                             atomic.Int64 // kept copies and ties dropped as their copy's slot left the live window
 	DroppedBeyond                                          atomic.Int64 // ids beyond a group's count dropped once it is known (drop_beyond)
 	OriginAcked                                            atomic.Int64 // own chunks acknowledged at the source (origin_acked): a peer's HAVE, or the first copy's window timeout
@@ -151,13 +130,12 @@ type SeacastCounters struct {
 	WriteBytes, WantsStanding atomic.Int64
 	// The live window (seacast_window.go): chunks of a later slot ignored; groups expired because
 	// their slot left the window; tombstones dropped once the window passed their slot; advances to
-	// a lower slot ignored.
-	Future, WindowExpired, TombstonesDropped, SlotRegress atomic.Int64
+	// a lower slot ignored. Roots placed again on their type's topic at an accepted chunk
+	// (seacastPlaceAccepted).
+	Future, WindowExpired, TombstonesDropped, SlotRegress, RootsReplaced atomic.Int64
 	// Ties (seacast_tie.go): senders tied for an index by a copy that waits; offers passed over
-	// for a tied sender; pending copies dropped at the header as forgeries (an index beyond the
-	// type's count); ties of refused copies turned into offers at the header; pending copies gone
-	// with their sender's connection.
-	Tied, TiedPassedOver, Forged, TiesToOffers, PendingGone atomic.Int64
+	// for a tied sender; ties turned into offers at the gate's opening.
+	Tied, TiedPassedOver, TiesToOffers atomic.Int64
 	// No second ask of a peer at once (seacast_ask.go): offers passed over because an ask of the
 	// chunk to the offering peer is outstanding; retries deferred because every announcer was.
 	AskOutstanding, RetryDeferred atomic.Int64
@@ -258,10 +236,16 @@ type seacast struct {
 	// registry holds no root beyond the window (seacast_window.go).
 	regSlot map[string]uint64
 	// The accepted-chunk path's state (seacast_accept.go).
-	limits    SeacastLimits
-	pending   map[string]*seacastPending
-	pendingOf map[peer.ID]int
-	rejected  map[string]struct{}
+	limits   SeacastLimits
+	rejected map[string]struct{}
+	// waits is the deferred store, the core's (seacast_tie.go): the copies kept while their gate is
+	// closed, by root; waitMsg is each kept copy's message, by id, which the gate's opening resumes.
+	waits   core.Pending[peer.ID]
+	waitMsg map[string]*Message
+	// gateMet is the roots whose closed gate something met: a copy kept or refused, a tie, an offer
+	// recorded and not asked. Only their gate opens (seacastOpenGate); a type whose gate never closes
+	// has none.
+	gateMet map[string]struct{}
 	// serveTx is the one count of the answers to a peer per (root, index), whichever of the message
 	// cache and the type's store answered (seacast_store.go; the draft's serve_count, §4.5).
 	serveTx map[string]map[uint32]map[peer.ID]int
@@ -283,38 +267,34 @@ type seacast struct {
 	// moves forward. The window applies from the first advance.
 	slot      uint64
 	slotKnown bool
-	// tied is the ties (seacast_tie.go): per root and sender, the indices whose copy waits for the
-	// root, each with the copy's id.
-	tied map[string]map[peer.ID]map[uint32]string
-	// tieSlot is the slot each sender's first copy under a root named (seacast-lite.md §4.2's tie_slot), where
-	// the type reads it (ChunkSlotter): when it leaves the live window the sender's ties to the root go.
-	tieSlot map[string]map[peer.ID]uint64
+	// ties is the ties, the core's (seacast_tie.go): per root and sender, the indices whose copy waits
+	// for the root, and the slot each sender's first copy under the root named (tie_slot).
+	ties core.Ties[peer.ID]
 	// origin is the source's state per group it publishes on the path (seacast_origin.go).
 	origin map[string]*seacastOrigin
 	// askQueued is the asks dispatched and not yet written or dropped (seacast_ask.go), per chunk
 	// the peers asked, with when each was dispatched: a write reported later matches only an ask
 	// dispatched before that write.
-	askQueued map[string]map[peer.ID]time.Time
-	// askDropped marks the queued asks the writer is to leave out, per peer (seacast_f13.go);
-	// written on the router goroutine, read on the writers, under dropMu.
-	dropMu     sync.Mutex
-	askDropped map[peer.ID]map[string]struct{}
-	// heldBack is the chunks whose ask a limit held back to the next heartbeat, with the peers
-	// that offered them (seacast_ihave.go): the retry asks one of them where the offer table,
-	// bounded per peer, kept no entry.
+	askQueued map[string]map[peer.ID]uint64
+	// ihave is ihave_frames and ihave_asked, the IHAVE limits' counts per peer this heartbeat
+	// (seacast_ihave.go).
+	ihave core.IHaveLimits[peer.ID]
+	// heldBack is the ids outside the core's pull whose ask a limit held back to the next heartbeat,
+	// with the peers that offered them (seacast_ihave.go): the retry asks one of them where the offer
+	// table, bounded per peer, kept no entry. A chunk's are the pull's (chunkPull.held).
 	heldBack map[string]map[peer.ID]struct{}
 	// standing is the standing table (seacast_standing.go, §4.5's standing[g][i]): per root and
-	// index, the peers whose request waits for the chunk; served is served[p][g] keyed root first,
-	// the chunks answered to each peer per group against the type's ServeLimit.
+	// index, the peers whose request waits for the chunk; served is the core's served[p][g], keyed
+	// by group first, the chunks answered to each peer per group against the type's ServeLimit.
 	standing map[string]map[uint32]map[peer.ID]struct{}
-	served   map[string]map[peer.ID]int
+	served   core.Served[peer.ID]
 	// knownAt is known_at[g] (seacast_known.go): the earliest the node knew each root, by its
 	// first sight on the path or the application's word.
 	knownAt map[string]time.Time
 	// machine is WithSeacastMachine (seacast_complete.go): groups the state per root, probeAsks
 	// the probe's ask ids, exempt from stop_pull.
 	machine   bool
-	groups    map[string]*seacastGroup
+	gm        *core.Machine[*seacastProbe]
 	probeAsks map[string]struct{}
 	// probeCells is the probe's ask exemption by cell (seacast.md §4.6's probe_asks, R5): per root,
 	// the probed indices, whatever id an ask of them carries; kept until the group expires, or the
@@ -395,11 +375,11 @@ func WithSeacast(types []ObjectType, ctr *SeacastCounters) Option {
 		}
 		// The gate at admission, ahead of any admission the application set.
 		prevAdmit := ps.admitMsg
-		ps.admitMsg = func(m *Message) bool {
-			if !gs.seacastAdmit(m) {
+		ps.admitMsg = func(m *Message, validated bool) bool {
+			if !gs.seacastAdmit(m, validated) {
 				return false
 			}
-			return prevAdmit == nil || prevAdmit(m)
+			return prevAdmit == nil || prevAdmit(m, validated)
 		}
 		// A chunk on a topic we have not subscribed to enters when its (group, index) was asked of
 		// the sender (seacast_want.go).
@@ -464,28 +444,29 @@ func (gs *GossipSubRouter) seacastJoinPush(p peer.ID, topic string, own bool) {
 		sc.ctr.JoinPushAccepted.Add(1)
 	}
 	roots := make([]string, 0, len(gs.have.mine))
-	for root := range gs.have.mine {
+	for gid := range gs.have.mine {
+		root := seacastGIDRoot(gid)
 		if sc.rootTopic[root] == topic && !gs.expired(root) {
 			roots = append(roots, root)
 		}
 	}
 	sort.Strings(roots) // the order offers leave in, deterministic under a seeded run
 	for _, root := range roots {
-		e, ids := gs.have.mine[root], gs.have.mids[root]
+		e, ids := gs.have.mine[seacastGID(root)], gs.have.mids[root]
 		if e == nil || ids == nil {
 			continue
 		}
 		interest := gs.seacastInterestOfPeer(p, root) // nil: no JOIN known, the mesh is the relation
-		theirs, pushed := gs.have.peers[p][root], gs.have.pushed[p][root]
-		if theirs != nil && theirs.complete {
+		theirs, pushed := gs.have.peers.Of(p, seacastGID(root)), gs.have.pushed.Of(p, seacastGID(root))
+		if theirs != nil && theirs.Complete {
 			continue // p's interest in the group is satisfied
 		}
 		var mids []string
-		for i := uint32(0); i < uint32(len(e.bits.b))*8; i++ { // lint:ignore uintcast -- a bitmap's length in bits.
-			if !e.bits.Has(i) || (interest != nil && !interest.Has(i)) {
+		for i := uint32(0); i < uint32(len(e.Bits))*8; i++ { // lint:ignore uintcast -- a bitmap's length in bits.
+			if !e.Bits.Has(i) || (interest != nil && !interest.Has(i)) {
 				continue
 			}
-			if (theirs != nil && theirs.bits.Has(i)) || (pushed != nil && pushed.bits.Has(i)) {
+			if (theirs != nil && theirs.Bits.Has(i)) || (pushed != nil && pushed.Bits.Has(i)) {
 				continue // wants_from_me: not what p holds or was pushed (§4.1), whichever side is a bitmap
 			}
 			if mid, ok := ids.ids[i]; ok && mid != "" {
@@ -505,13 +486,30 @@ func (gs *GossipSubRouter) seacastJoinPush(p peer.ID, topic string, own bool) {
 	}
 }
 
+// seacastJoinPushGrafted runs join_push for the heartbeat's own GRAFTs (tograft, by peer), once
+// sendGraftPrune has queued them: each offer enters the peer's queue after the GRAFT that put the
+// peer in the relation, so it never takes the queue's last place ahead of it. A peer no longer in
+// the topic's mesh is skipped. Router goroutine.
+func (gs *GossipSubRouter) seacastJoinPushGrafted(tograft map[peer.ID][]string) {
+	if gs.seacast == nil || !gs.seacast.joinPush {
+		return
+	}
+	for p, topics := range tograft {
+		for _, topic := range topics {
+			if _, in := gs.mesh[topic][p]; in {
+				gs.seacastJoinPush(p, topic, true) // our own GRAFT, at the heartbeat
+			}
+		}
+	}
+}
+
 // seacastIDsNamed is how many chunks an announce's ids name: a holding's indices, one for any
 // other id.
 func seacastIDsNamed(ids []string) int {
 	n := 0
 	for _, mid := range ids {
 		if _, bitmap, ok := decodeHave(mid); ok {
-			n += (&haveBits{b: bitmap}).Count()
+			n += (newHaveBits(bitmap)).Count()
 		} else {
 			n++
 		}
@@ -539,6 +537,22 @@ func (gs *GossipSubRouter) seacastDegree(topic string) (degree int, ok bool) {
 		return 0, false
 	}
 	return T.Params().RNode, true
+}
+
+// seacastPushBudget is the push budget the path gives a message on topic that this node sends:
+// for our own chunk (own: published here and not rebuilt, ownPublication) the type's RSource when
+// set, else its R_NODE (seacastDegree); ok is false off the path. A chunk we rebuilt and publish is
+// not our own: it gets R_NODE.
+func (gs *GossipSubRouter) seacastPushBudget(topic string, own bool) (budget int, ok bool) {
+	T := gs.seacastType(topic)
+	if T == nil {
+		return 0, false
+	}
+	p := T.Params()
+	if own && p.RSource != 0 {
+		return p.RSource, true
+	}
+	return p.RNode, true
 }
 
 // seacastJoinRefused says whether a Join of topic is refused: the topic is owned by a type and

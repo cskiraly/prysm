@@ -105,6 +105,8 @@ func (gs *GossipSubRouter) seacastStoreOwn(messages []*Message) {
 		mid := gs.p.idGen.ID(msg)
 		gs.seacastNoteRoot(msg.GetTopic(), mid)
 		if root, index, ok := gs.have.index(mid); ok && len(root) == haveRootLen {
+			gs.seacastPlaceAccepted(T, root) // the group on its type's topic, as an accepted chunk places it
+			gs.seacastDropFilledWait(root, mid)
 			gs.seacastStorePut(T, root, index, msg)
 			gs.seacastServeStanding(T, root, index, msg) // §4.5: a standing request answered from the node's own publication
 		}

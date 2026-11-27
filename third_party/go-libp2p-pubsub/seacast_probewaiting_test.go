@@ -18,7 +18,7 @@ func TestSeacastProbeWaitingAtDecoder(t *testing.T) {
 		s := newR5SceneCross(t, ctx, false, nil, func(s *r5Scene, psubs []*PubSub) {
 			s.on(s.gsA, func() {
 				g := s.gsA.seacast.groupOf(s.root)
-				g.state = seacastDecoding // A claims every index while it decodes (holding_of's claim_all)
+				g.State = seacastDecoding // A claims every index while it decodes (holding_of's claim_all)
 			})
 		})
 		time.Sleep(300 * time.Millisecond) // B's probe reaches A, which does not hold the cell

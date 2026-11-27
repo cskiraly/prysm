@@ -3,6 +3,7 @@ package segmentgossip
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 )
@@ -14,6 +15,9 @@ const (
 	pushBudgetFast = 6
 	fastUplinkMbps = 500
 	projectFanIn   = 2 // FAN_IN
+	// maxUplinkMbps is the largest uplink, in Mbps, whose bits per second fit an int64: the router
+	// takes the uplink in bits per second (RouterOptions' ask window).
+	maxUplinkMbps = math.MaxInt64 / 1_000_000
 )
 
 // PayloadParams is the payload type's parameters on SEACAST's path (seacast.md §6.1). The
@@ -28,6 +32,10 @@ func PayloadParams(uplinkMbps int) pubsub.TypeParams {
 	}
 	return pubsub.TypeParams{
 		RNode: r,
+		// The source's budget: seacast-lite.md §5.1 has the source push each chunk to R peers
+		// whatever its uplink. This port keeps the source at its class's budget, R_FAST at
+		// FAST_UPLINK or more, until that rule is measured.
+		RSource: r,
 		// FAN_IN (seacast-lite.md §8): one other pusher assumed as fast as this node, so the projection
 		// counts what was sent to a peer and not yet confirmed twice (§7.2). A push it skips is
 		// offered instead (OfferSkipped, RouterOptions).
@@ -69,6 +77,9 @@ type Setting struct {
 func CheckSetting(s Setting) error {
 	if s.UplinkMbps <= 0 {
 		return fmt.Errorf("seacast: --seacast-uplink-mbps is %d; the window and the push budget need the node's uplink", s.UplinkMbps)
+	}
+	if s.UplinkMbps > maxUplinkMbps {
+		return fmt.Errorf("seacast: --seacast-uplink-mbps is %d; above %d, the uplink in bits per second overflows an int64", s.UplinkMbps, maxUplinkMbps)
 	}
 	if len(s.SegmentTopics) == 0 {
 		return errors.New("seacast condition 1 (every link joined): no segment topic in the fork schedule")

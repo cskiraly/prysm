@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/protobuf/proto"
@@ -20,15 +21,8 @@ var (
 	ErrQueuePushOnClosed = errors.New("push on closed rpc queue")
 )
 
-// rankedRPC is a normal-lane entry with its drain rank. Rank 0 is the neutral default, so a
-// queue where nothing sets ranks drains in exact FIFO order (first minimal wins the scan).
-type rankedRPC struct {
-	rpc  *RPC
-	rank int
-}
-
 type priorityQueue struct {
-	normal   []rankedRPC
+	normal   []*RPC
 	priority []*RPC
 }
 
@@ -37,22 +31,21 @@ func (q *priorityQueue) Len() int {
 }
 
 func (q *priorityQueue) NormalPush(rpc *RPC) {
-	q.RankedPush(rpc, 0)
-}
-
-func (q *priorityQueue) RankedPush(rpc *RPC, rank int) {
-	q.normal = append(q.normal, rankedRPC{rpc: rpc, rank: rank})
+	q.normal = append(q.normal, rpc)
 }
 
 func (q *priorityQueue) PriorityPush(rpc *RPC) {
 	q.priority = append(q.priority, rpc)
 }
 
-// PopAt removes and returns the normal-lane entry at i. Under the queue's mutex.
+// PopAt removes and returns the normal-lane entry at i. The lane keeps its array, with the slot it
+// gives up cleared. Under the queue's mutex.
 func (q *priorityQueue) PopAt(i int) *RPC {
-	rpc := q.normal[i].rpc
-	q.normal[i] = rankedRPC{}
-	q.normal = append(q.normal[:i], q.normal[i+1:]...)
+	rpc := q.normal[i]
+	n := len(q.normal) - 1
+	copy(q.normal[i:], q.normal[i+1:])
+	q.normal[n] = nil
+	q.normal = q.normal[:n]
 	return rpc
 }
 
@@ -64,20 +57,7 @@ func (q *priorityQueue) Pop() *RPC {
 		q.priority[0] = nil
 		q.priority = q.priority[1:]
 	} else if len(q.normal) > 0 {
-		// Lowest rank first; FIFO within a rank (the scan keeps the first minimum). With
-		// every rank 0 this is plain FIFO, so an unranked queue is byte-identical to the
-		// old behaviour, and reordering can only ever happen where messages were already
-		// waiting — the uncontended path is untouched by construction. Linear scan: the
-		// queue is bounded (default 600) and normally holds a handful.
-		best := 0
-		for i := 1; i < len(q.normal); i++ {
-			if q.normal[i].rank < q.normal[best].rank {
-				best = i
-			}
-		}
-		rpc = q.normal[best].rpc
-		q.normal[best] = rankedRPC{}
-		q.normal = append(q.normal[:best], q.normal[best+1:]...)
+		rpc = q.PopAt(0)
 	}
 
 	return rpc
@@ -140,7 +120,7 @@ type rpcQueue struct {
 	// RPC out or leave alone; owedAnswers the answers a full queue refused, one per chunk, requeued
 	// as soon as there is room. owedFilter, when set, is the class loss the owed offers must pass;
 	// owedSent counts the indices they carried. Under queueMu.
-	onAsks      func(mids []string, at time.Time)
+	onAsks      func(mids []string, popped uint64, at time.Time)
 	askLoss     func(ids []string) (kept, lost []string)
 	onSkipped   func(msgs []*pb.Message)
 	owed        map[string]*owedGroup
@@ -214,35 +194,24 @@ func (q *rpcQueue) dispatch(rpc *RPC) *RPC {
 		q.attached.Add(1)
 		kept = out
 	}
-	if out := q.have.attachSent(kept); out != nil {
-		kept = out
-	}
 	for _, m := range kept.Publish {
 		q.have.notePopped(m)
 		if q.have.onDispatch != nil {
 			q.have.onDispatch(m)
-		}
-		if q.have.onOriginPop != nil {
-			q.have.onOriginPop(m)
 		}
 	}
 	return kept
 }
 
 func (q *rpcQueue) Push(rpc *RPC, block bool) error {
-	return q.push(rpc, false, block, 0)
-}
-
-// RankedPush enqueues on the normal lane with a drain rank; lower ranks drain first.
-func (q *rpcQueue) RankedPush(rpc *RPC, rank int, block bool) error {
-	return q.push(rpc, false, block, rank)
+	return q.push(rpc, false, block)
 }
 
 func (q *rpcQueue) UrgentPush(rpc *RPC, block bool) error {
-	return q.push(rpc, true, block, 0)
+	return q.push(rpc, true, block)
 }
 
-func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool, rank int) error {
+func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool) error {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
 
@@ -269,7 +238,7 @@ func (q *rpcQueue) push(rpc *RPC, urgent bool, block bool, rank int) error {
 		default:
 		}
 	} else {
-		q.queue.RankedPush(rpc, rank)
+		q.queue.NormalPush(rpc)
 	}
 	q.queuedBytes += int64(rpc.size)
 	if q.queuedBytes > q.peakQueued {
@@ -417,23 +386,33 @@ func (q *rpcQueue) finishPopLocked(out *RPC) *RPC {
 					if out = withAsks(out, kept); out == nil {
 						// All lost on the wire: written all the same, at the write (after any send
 						// delay), and then nothing goes out.
-						return &RPC{asks: mids, lostOnly: true}
+						return &RPC{asks: mids, lostOnly: true, popped: nextAskSeq()}
 					}
 				}
 			}
 			// The asks are reported when the writer writes the RPC (noteWrite), after any send delay;
 			// an RPC carrying asks is per peer, but it is copied before it is marked.
 			out = shallowRPCCopy(out)
-			out.asks = mids
+			out.asks, out.popped = mids, nextAskSeq()
 		}
 	}
 	return out
 }
 
+// askSeq orders the dispatches of asks and the writer's pops, so that a write report names the asks its
+// RPC carried (E). The router records an ask's number before it pushes the ask, and the writer numbers
+// a pop under queueMu, after the push it takes: an ask the popped RPC carries has the lower number. A
+// clock can read the same at a pop and at a later dispatch (a coarse clock, a test's fake one), and the
+// newer ask would then read as carried.
+var askSeq atomic.Uint64
+
+// nextAskSeq is the next number in askSeq's order. Any goroutine.
+func nextAskSeq() uint64 { return askSeq.Add(1) }
+
 // noteAsksWritten reports rpc's asks as written now (E). The writer goroutine, at the write.
 func (q *rpcQueue) noteAsksWritten(rpc *RPC) {
 	if q.onAsks != nil && len(rpc.asks) > 0 {
-		q.onAsks(rpc.asks, time.Now())
+		q.onAsks(rpc.asks, rpc.popped, time.Now())
 	}
 	if rpc.Control == nil || len(rpc.Control.Iwant) == 0 {
 		return
@@ -547,7 +526,7 @@ func (q *rpcQueue) oweAnswer(m *pb.Message) {
 		}
 	}
 	for _, e := range q.queue.normal {
-		if e.rpc.replay && len(e.rpc.Publish) == 1 && (e.rpc.Publish[0] == m || q.sameChunk(e.rpc.Publish[0], m)) {
+		if e.replay && len(e.Publish) == 1 && (e.Publish[0] == m || q.sameChunk(e.Publish[0], m)) {
 			return // moved into the queue and not yet sent: it keeps its place
 		}
 	}
@@ -603,7 +582,7 @@ func (q *rpcQueue) fullLocked() bool {
 		return false
 	}
 	for _, e := range q.queue.normal {
-		if e.rpc.replay {
+		if e.replay {
 			n--
 		}
 	}
@@ -616,9 +595,9 @@ func (q *rpcQueue) fullLocked() bool {
 // rarest). One past it waits for it, whatever the dispatch-time selection would choose
 // (choose.go, rarestIndex), so an owed answer never moves ahead of a stock topic's entry or a
 // control RPC that the queue without A′ would have sent before it. Under queueMu.
-func replayLead(normal []rankedRPC, index func(*pb.Message) (string, uint32, bool)) int {
+func replayLead(normal []*RPC, index func(*pb.Message) (string, uint32, bool)) int {
 	for i, e := range normal {
-		if !e.rpc.replay && !payloadFrame(e.rpc, index) {
+		if !e.replay && !payloadFrame(e, index) {
 			return i
 		}
 	}
@@ -644,9 +623,9 @@ func payloadFrame(rpc *RPC, index func(*pb.Message) (string, uint32, bool)) bool
 // its frames, offers and asks in every queued RPC; its HAVEs stay. ofMsg and ofID tell a frame and
 // an id of the group. Returns how many frames and ids it dropped. Queued RPCs are shared across
 // peers, so a changed one is replaced by a copy. Router goroutine.
-// discardAsks drops the queued IWANT ids drop accepts and returns them: a group's ordinary asks at
-// its completion (stop_pull; seacast_complete.go), the rest of the queue untouched. Router goroutine,
-// under the queue's lock.
+// discardAsks drops the queued IWANT ids drop accepts, in both lanes, and returns them: a group's
+// ordinary asks at its completion (stop_pull; seacast_complete.go), or a tied peer's asks of a chunk
+// (seacast_tie.go), the rest of the queue untouched. Router goroutine, under the queue's lock.
 func (q *rpcQueue) discardAsks(drop func(string) bool) []string {
 	q.queueMu.Lock()
 	defer q.queueMu.Unlock()
@@ -695,11 +674,11 @@ func (q *rpcQueue) discardAsks(drop func(string) bool) []string {
 	q.queue.priority = priority
 	normal := q.queue.normal[:0]
 	for _, e := range q.queue.normal {
-		out := filter(e.rpc)
-		q.queuedBytes -= int64(e.rpc.size)
+		out := filter(e)
+		q.queuedBytes -= int64(e.size)
 		if out != nil {
 			q.queuedBytes += int64(out.size)
-			normal = append(normal, rankedRPC{rpc: out, rank: e.rank})
+			normal = append(normal, out)
 		}
 	}
 	q.queue.normal = normal
@@ -707,6 +686,67 @@ func (q *rpcQueue) discardAsks(drop func(string) bool) []string {
 		q.spaceAvailable.Signal()
 	}
 	return dropped
+}
+
+// stripAsk removes the asks of mid from the IWANTs still queued, and an RPC left with nothing to send,
+// and returns how many it removed. An ask the writer has popped already is beyond it. Router goroutine.
+func (q *rpcQueue) stripAsk(mid string) int {
+	q.queueMu.Lock()
+	defer q.queueMu.Unlock()
+	n := 0
+	strip := func(rpc *RPC) *RPC {
+		ctl := rpc.GetControl()
+		var iwant []*pb.ControlIWant
+		k := 0
+		for _, iw := range ctl.GetIwant() {
+			var ids []string
+			for _, id := range iw.GetMessageIDs() {
+				if id == mid {
+					k++
+					continue
+				}
+				ids = append(ids, id)
+			}
+			if len(ids) > 0 {
+				iwant = append(iwant, &pb.ControlIWant{MessageIDs: ids})
+			}
+		}
+		if k == 0 {
+			return rpc
+		}
+		n += k
+		out := shallowRPCCopy(rpc)
+		out.Control = &pb.ControlMessage{Ihave: ctl.Ihave, Iwant: iwant, Graft: ctl.Graft, Prune: ctl.Prune, Idontwant: ctl.Idontwant, Extensions: ctl.Extensions}
+		if len(out.Publish) == 0 && rpcOtherwiseEmpty(out) {
+			return nil
+		}
+		out.size = proto.Size(&out.RPC)
+		return out
+	}
+	priority := q.queue.priority[:0]
+	for _, rpc := range q.queue.priority {
+		out := strip(rpc)
+		q.queuedBytes -= int64(rpc.size)
+		if out != nil {
+			q.queuedBytes += int64(out.size)
+			priority = append(priority, out)
+		}
+	}
+	q.queue.priority = priority
+	normal := q.queue.normal[:0]
+	for _, e := range q.queue.normal {
+		out := strip(e)
+		q.queuedBytes -= int64(e.size)
+		if out != nil {
+			q.queuedBytes += int64(out.size)
+			normal = append(normal, out)
+		}
+	}
+	q.queue.normal = normal
+	if n > 0 {
+		q.spaceAvailable.Signal()
+	}
+	return n
 }
 
 func (q *rpcQueue) discardGroup(root string, ofMsg func(*pb.Message) bool, ofID func(string) bool) int {
@@ -797,11 +837,11 @@ func (q *rpcQueue) discardGroup(root string, ofMsg func(*pb.Message) bool, ofID 
 	q.queue.priority = priority
 	normal := q.queue.normal[:0]
 	for _, e := range q.queue.normal {
-		out := filter(e.rpc)
-		q.queuedBytes -= int64(e.rpc.size)
+		out := filter(e)
+		q.queuedBytes -= int64(e.size)
 		if out != nil {
 			q.queuedBytes += int64(out.size)
-			normal = append(normal, rankedRPC{rpc: out, rank: e.rank})
+			normal = append(normal, out)
 		}
 	}
 	q.queue.normal = normal
@@ -825,19 +865,24 @@ func (q *rpcQueue) withOwedLocked(out *RPC) *RPC {
 	for _, root := range roots {
 		g := q.owed[root]
 		delete(q.owed, root)
-		b := &g.bits
+		// What is owed less what the peer holds and what out carries (core.OwedOffer). What was
+		// pushed to the peer left what is owed at the push (unowe), so nothing is pushed here.
+		var theirs haveBits
+		var carried []uint32
 		if h := q.have; h != nil {
 			if t := h.theirs[root]; t != nil {
-				b = b.AndNot(t)
+				theirs = *t
 			}
 			if out != nil {
 				for _, m := range out.Publish {
 					if r, i, ok := h.index(m); ok && r == root {
-						b.Clear(i)
+						carried = append(carried, i)
 					}
 				}
 			}
 		}
+		offer := core.OwedOffer(g.bits, nil, theirs, carried)
+		b := &offer
 		n := b.Count()
 		if n == 0 {
 			continue

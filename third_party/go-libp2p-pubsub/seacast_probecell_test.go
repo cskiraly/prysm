@@ -13,9 +13,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// probeCellIndex is seacastTestIndex held to the chunk id's exact length, as the harness's parser
-// (haveIndexOf: magic, version and length) is: seacastTestIndex reads any longer id, a WANT pseudo
-// id included, as a chunk of another group, and seacastGated, which asks the parser before
+// probeCellIndex is seacastTestIndex held to the chunk id's exact length, as an application's
+// parser that checks the length is: seacastTestIndex reads any longer id, a WANT pseudo id
+// included, as a chunk of another group, and seacastGated, which asks the parser before
 // decodeWant, then finds no group and lets the ask through.
 func probeCellIndex(mid string) (string, uint32, bool) {
 	if len(mid) != haveRootLen+1 {
@@ -171,18 +171,18 @@ func TestSeacastProbeCellOffer(t *testing.T) {
 				var stopPull, probed bool
 				var declined0 int64
 				read(func() {
-					e := gsB.have.peers[A][root]
+					e := gsB.have.peers[A][seacastGID(root)]
 					if e == nil {
 						t.Fatal("B has no ledger entry for A")
 					}
-					e.bits.Or(fullHaveBits(8).Bytes())
-					e.claimAll = true
+					e.Bits.Or(fullHaveBits(8).Bytes())
+					e.ClaimAll = true
 					gsB.seacastNoteClaim(A, root)
 					asked = time.Now()
-					g := gsB.seacast.groups[root]
-					stopPull = g != nil && g.stopPull
-					if g != nil && g.probe != nil {
-						probed, index = true, g.probe.index
+					g := gsB.seacast.group(root)
+					stopPull = g != nil && g.StopPull
+					if g != nil && g.Ext != nil {
+						probed, index = true, g.Ext.index
 						if narrow {
 							gsB.seacast.probeCells[root].Clear(index) // the package's earlier rule: the probe's id alone
 						}

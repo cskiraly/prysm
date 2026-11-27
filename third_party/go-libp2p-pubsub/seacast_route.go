@@ -24,7 +24,7 @@ func (gs *GossipSubRouter) seacastMayBeAsked(p peer.ID, root string, index uint3
 		return true // not a group of the path
 	}
 	if gs.have != nil {
-		if e := gs.have.peers[p][root]; e != nil && (e.claimAll || e.bits.Has(index)) {
+		if e := gs.have.peers.Of(p, seacastGID(root)); e != nil && (e.ClaimAll || e.Bits.Has(index)) {
 			return true // offered us, or holds it by its own word
 		}
 	}

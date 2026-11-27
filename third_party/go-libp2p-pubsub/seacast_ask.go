@@ -15,39 +15,43 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// seacastAskQueued records an ask of mid dispatched to p, until the writer reports it (promised)
-// or drops it. Router goroutine, from noteIWantSent.
+// seacastAskQueued records an ask of mid dispatched to p, numbered in askSeq's order (rpc_queue.go)
+// before its push, until the writer reports it (promised) or drops it. Router goroutine, from
+// noteIWantSent.
 func (gs *GossipSubRouter) seacastAskQueued(p peer.ID, mids []string) {
 	sc := gs.seacast
 	if sc == nil {
 		return
 	}
 	if sc.askQueued == nil {
-		sc.askQueued = map[string]map[peer.ID]time.Time{}
+		sc.askQueued = map[string]map[peer.ID]uint64{}
 	}
-	now := time.Now()
+	seq := nextAskSeq()
 	for _, mid := range mids {
+		if _, g, i, ok := gs.pullChunk(mid); ok {
+			gs.pullAskForm(g, i, mid) // found by this id while queued, whatever the chunk's learned id
+		}
 		peers := sc.askQueued[mid]
 		if peers == nil {
-			peers = map[peer.ID]time.Time{}
+			peers = map[peer.ID]uint64{}
 			sc.askQueued[mid] = peers
 		}
-		peers[p] = now
+		peers[p] = seq
 	}
 }
 
-// seacastAskWritten takes the writer's report that an ask of mid to p was written at at: it closes
-// the queued ask and reports true when that ask was dispatched by then. A report for an ask that
-// closed before it (delivered, tied, its offer dropped, completed, expired) finds no record, or the
-// record of a newer ask of the same chunk dispatched after the write, which it leaves to that ask's
-// own report: false. Router goroutine.
-func (gs *GossipSubRouter) seacastAskWritten(p peer.ID, mid string, at time.Time) bool {
+// seacastAskWritten takes the writer's report that an ask of mid to p, popped (the pop's number in
+// askSeq's order), was written: it closes the queued ask and reports true when that ask was dispatched
+// before the pop. A report for an ask that closed before it (delivered, tied, its offer dropped,
+// completed, expired) finds no record, or the record of a newer ask of the same chunk dispatched after
+// the pop, whose RPC this was not and which it leaves to that ask's own report: false. Router goroutine.
+func (gs *GossipSubRouter) seacastAskWritten(p peer.ID, mid string, popped uint64) bool {
 	sc := gs.seacast
 	if sc == nil {
 		return false
 	}
 	dispatched, queued := sc.askQueued[mid][p]
-	if !queued || dispatched.After(at) {
+	if !queued || dispatched > popped {
 		return false
 	}
 	gs.seacastAskClosed(p, mid)
@@ -65,6 +69,7 @@ func (gs *GossipSubRouter) seacastAskClosed(p peer.ID, mid string) {
 		delete(peers, p)
 		if len(peers) == 0 {
 			delete(sc.askQueued, mid)
+			gs.pullAskFormGone(mid)
 		}
 	}
 }
@@ -73,6 +78,7 @@ func (gs *GossipSubRouter) seacastAskClosed(p peer.ID, mid string) {
 func (gs *GossipSubRouter) seacastAsksClosed(mid string) {
 	if sc := gs.seacast; sc != nil && sc.askQueued != nil {
 		delete(sc.askQueued, mid)
+		gs.pullAskFormGone(mid)
 	}
 }
 
@@ -98,12 +104,15 @@ func (gs *GossipSubRouter) seacastGroupStopped(mid string) bool {
 	if root == "" {
 		return false
 	}
-	g := sc.groups[root]
-	return g != nil && g.stopPull
+	g := sc.group(root)
+	return g != nil && g.StopPull
 }
 
 // seacastAskOutstanding says whether an ask of mid to p is open: queued to p, or promised by p.
 func (gs *GossipSubRouter) seacastAskOutstanding(p peer.ID, mid string) bool {
+	if root, g, i, ok := gs.pullChunk(mid); ok {
+		return gs.pullOutstanding(p, root, g, i) // a chunk: its promise in the core, its ask under either id
+	}
 	sc := gs.seacast
 	if sc == nil {
 		return false

@@ -17,15 +17,15 @@ func TestSeacastNoteClaimEveryHolding(t *testing.T) {
 		var armed, probed bool
 		newR5SceneCross(t, ctx, false, nil, func(s *r5Scene, _ []*PubSub) {
 			s.on(s.gsB, func() {
-				e := s.gsB.have.peers[s.A][s.root]
+				e := s.gsB.have.peers[s.A][seacastGID(s.root)]
 				if e == nil {
 					return
 				}
-				e.claimAll = true // A's earlier claim, noted before B's duty was armed
-				g := s.gsB.seacast.groups[s.root]
-				armed = g != nil && !g.reconsiderAt.IsZero() && g.state == seacastComplete && g.probe == nil
+				e.ClaimAll = true // A's earlier claim, noted before B's duty was armed
+				g := s.gsB.seacast.group(s.root)
+				armed = g != nil && !g.ReconsiderAt.IsZero() && g.State == seacastComplete && g.Ext == nil
 				s.gsB.seacastAbsorbV2(s.A, encodeHaveV2(s.root, fullHaveBits(8), true, true))
-				probed = g != nil && g.probe != nil
+				probed = g != nil && g.Ext != nil
 			})
 		})
 		if !armed {

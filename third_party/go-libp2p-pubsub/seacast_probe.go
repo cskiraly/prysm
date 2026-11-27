@@ -43,8 +43,8 @@ func (gs *GossipSubRouter) seacastClaimsIndex(root string, index uint32) bool {
 	if gs.seacastHeld(root, index) {
 		return true
 	}
-	g := gs.seacast.groups[root]
-	return g != nil && g.state == seacastDecoding
+	g := gs.seacast.group(root)
+	return g != nil && g.State == seacastDecoding
 }
 
 // seacastServeProbe is serve_probe(p, g, f): the cap for p's marked asks of root is taken, and our
@@ -105,18 +105,18 @@ func (gs *GossipSubRouter) seacastProbeWait(p peer.ID, mid string, on bool) {
 // accepted duplicate: the claimant's own copy passes the probe of that cell. Router goroutine.
 func (gs *GossipSubRouter) seacastProbeCopy(root string, index uint32, from peer.ID) {
 	sc := gs.seacast
-	if sc == nil || !sc.machine || len(sc.groups) == 0 {
+	if sc == nil || !sc.machine || sc.gm == nil || sc.gm.Len() == 0 {
 		return
 	}
 	gs.seacastProbeCopyOf(root, index, from)
 }
 
 func (gs *GossipSubRouter) seacastProbeCopyOf(root string, index uint32, from peer.ID) {
-	g := gs.seacast.groups[root]
-	if g == nil || g.probe == nil {
+	g := gs.seacast.group(root)
+	if g == nil || g.Ext == nil {
 		return
 	}
-	pr := g.probe
+	pr := g.Ext
 	if pr.index != index || pr.asked != from || pr.own || pr.verdict || pr.cancelled {
 		return
 	}
@@ -129,7 +129,7 @@ func (gs *GossipSubRouter) seacastProbeCopyOf(root string, index uint32, from pe
 // claimant, once, before anything else reconsider decides; only its own copy passes it. A probe
 // cancelled by the claimant's close gets none. Router goroutine.
 func (gs *GossipSubRouter) seacastProbeVerdict(root string, g *seacastGroup) {
-	pr := g.probe
+	pr := g.Ext
 	if pr == nil || pr.cancelled || pr.verdict {
 		return
 	}
@@ -214,11 +214,11 @@ func (gs *GossipSubRouter) seacastProbeWritten(p peer.ID, mids []string) {
 		if !ok {
 			continue
 		}
-		g := sc.groups[root]
-		if g == nil || g.probe == nil {
+		g := sc.group(root)
+		if g == nil || g.Ext == nil {
 			continue
 		}
-		pr := g.probe
+		pr := g.Ext
 		if pr.mid != mid || pr.asked != p || pr.sent || pr.verdict || pr.cancelled {
 			continue
 		}
@@ -236,8 +236,8 @@ func (gs *GossipSubRouter) seacastProbeWritten(p peer.ID, mids []string) {
 			}
 		})
 		due := time.Now().Add(window)
-		if g.reconsiderAt.After(due) {
-			due = g.reconsiderAt
+		if g.ReconsiderAt.After(due) {
+			due = g.ReconsiderAt
 		}
 		gs.seacastArm(root, due)
 	}
@@ -312,7 +312,7 @@ func (gs *GossipSubRouter) seacastServeWaitingProbe(T ObjectType, root string, i
 			continue
 		}
 		delete(sc.probeWaiting[root], q)
-		if sc.probeServed[q][root] || (limit > 0 && sc.served[root][q] >= limit) {
+		if sc.probeServed[q][root] || sc.served.Limited(seacastGID(root), q, limit) {
 			continue
 		}
 		if _, connected := gs.peers[q]; !connected {

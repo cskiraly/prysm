@@ -31,6 +31,9 @@ func (gs *GossipSubRouter) seacastAsk(p peer.ID, root string, index uint32, stan
 		sc.ctr.AskOutside.Add(1) // outside may_be_asked (§4.5, P7): refused at the sender
 		return false
 	}
+	if gs.seacastTiedIndex(p, root, index) {
+		return false // p's copy of it waits for its root: not asked meanwhile (seacast-lite.md §7.2's filter_entry, tied_to_root)
+	}
 	sc.registerAsk(root, index, p)
 	want := encodeWantV2(root, index, standing, hops)
 	gs.sendRPC(p, rpcWithControl(nil, nil, []*pb.ControlIWant{{MessageIDs: []string{want}}}, nil, nil, nil), !standing && hops == 0)

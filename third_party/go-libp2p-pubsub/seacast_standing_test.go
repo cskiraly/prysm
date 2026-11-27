@@ -80,7 +80,7 @@ func TestSeacastStandingAndServeLimit(t *testing.T) {
 		}
 		servedAtA := func(root string) int {
 			var n int
-			read(gsA, func() { n = gsA.seacast.served[root][hosts[1].ID()] })
+			read(gsA, func() { n = gsA.seacast.served.Of(seacastGID(root), hosts[1].ID()) })
 			return n
 		}
 		standingAtA := func() int {

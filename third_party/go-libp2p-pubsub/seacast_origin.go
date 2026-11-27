@@ -3,6 +3,7 @@ package pubsub
 import (
 	"sync"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -21,19 +22,20 @@ import (
 // A refused push is not owed here: that is unpush, under v0.5's A′ (specv05.go), a switch; at the source it
 // owes to the source_pool the push was planned from (seacastSourceOwes).
 
-// seacastOrigin is the source's state for a group it publishes on the path. Router goroutine.
+// seacastOrigin is the binding's part of the source's state for a group it publishes on the path: the
+// topic and the chunks' ids. The core's part is in originAcks. Router goroutine.
 type seacastOrigin struct {
-	topic   string
-	ids     map[uint32]string               // each own chunk's id, by index
-	planned map[uint32]map[peer.ID]struct{} // the push targets chosen at dispatch, by index
-	led     map[peer.ID]bool                // the targets whose lead holding has gone
+	topic string
+	ids   map[uint32]string // each own chunk's id, by index
 }
 
-// originAcks is the acknowledged indices of the groups the node publishes on the path, read by
-// haveBitsFor for every holding of such a group (which may run off the router goroutine).
+// originAcks is the core's state of each group the node publishes on the path (core.Origin: the chunks
+// acknowledged, the push targets chosen at dispatch and the targets whose lead holding has gone), under
+// one mutex: haveBitsFor reads the chunks acknowledged for every holding of such a group, which may run
+// off the router goroutine.
 type originAcks struct {
 	mu    sync.Mutex
-	roots map[string]*haveBits
+	roots map[string]*core.Origin[peer.ID]
 }
 
 // bits is a copy of root's acknowledged indices; ok is false for a root the node does not publish on the
@@ -48,30 +50,76 @@ func (o *originAcks) bits(root string) (b *haveBits, ok bool) {
 	if !ok {
 		return nil, false
 	}
-	if a == nil || len(a.b) == 0 {
+	acked := a.Acked()
+	if len(acked) == 0 {
 		return nil, true
 	}
-	return &haveBits{b: append([]byte(nil), a.b...)}, true
+	return &acked, true
+}
+
+// has says whether the node publishes root on the path: the group is in origin (seacast.md §1.5's
+// holding_of).
+func (o *originAcks) has(root string) bool {
+	if o == nil {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, ok := o.roots[root]
+	return ok
 }
 
 func (o *originAcks) open(root string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if _, ok := o.roots[root]; !ok {
-		o.roots[root] = &haveBits{}
+		o.roots[root] = &core.Origin[peer.ID]{}
 	}
 }
 
-// ack sets index i of root; newly is false when it was set already.
-func (o *originAcks) ack(root string, i uint32) (newly bool) {
+// dropBeyond is drop_beyond for root's source state once its count n is known (core.Origin.DropBeyond).
+func (o *originAcks) dropBeyond(root string, n uint32) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if a := o.roots[root]; a != nil {
+		a.DropBeyond(n)
+	}
+}
+
+// plan records chunk i of root's push targets (core.Origin.Plan).
+func (o *originAcks) plan(root string, i uint32, targets []peer.ID) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if a := o.roots[root]; a != nil {
+		a.Plan(i, targets)
+	}
+}
+
+// lead is the holding to send p just before its first chunk of root, chunk i (core.Origin.Lead); ok
+// is false once p has had its lead.
+func (o *originAcks) lead(root string, p peer.ID, i uint32) (b haveBits, ok bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	a := o.roots[root]
-	if a == nil || a.Has(i) {
-		return false
+	if a == nil {
+		return nil, false
 	}
-	a.Set(i)
-	return true
+	return a.Lead(p, i)
+}
+
+// ack is origin_acked(g, i) for root (core.Origin.Ack): newly is false when i was acknowledged
+// already; offer is the peers of pool not planned to be pushed i.
+func (o *originAcks) ack(root string, i uint32, pool []peer.ID) (offer []peer.ID, newly bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	a := o.roots[root]
+	if a == nil {
+		return nil, false
+	}
+	return a.Ack(i, pool)
 }
 
 func (o *originAcks) forget(root string) {
@@ -103,12 +151,12 @@ func (gs *GossipSubRouter) seacastOriginOpen(msg *Message) {
 	}
 	o := sc.origin[root]
 	if o == nil {
-		o = &seacastOrigin{topic: msg.GetTopic(), ids: map[uint32]string{}, planned: map[uint32]map[peer.ID]struct{}{}, led: map[peer.ID]bool{}}
+		o = &seacastOrigin{topic: msg.GetTopic(), ids: map[uint32]string{}}
 		sc.origin[root] = o
 	}
 	o.ids[index] = mid
 	if gs.have.originAcks == nil {
-		gs.have.originAcks = &originAcks{roots: map[string]*haveBits{}}
+		gs.have.originAcks = &originAcks{roots: map[string]*core.Origin[peer.ID]{}}
 	}
 	gs.have.originAcks.open(root)
 }
@@ -128,11 +176,11 @@ func (gs *GossipSubRouter) seacastOriginPlan(mid string, tosend map[peer.ID]stru
 	if o == nil || o.ids[index] != mid {
 		return false
 	}
-	targets := make(map[peer.ID]struct{}, len(tosend))
+	targets := make([]peer.ID, 0, len(tosend))
 	for p := range tosend {
-		targets[p] = struct{}{}
+		targets = append(targets, p)
 	}
-	o.planned[index] = targets
+	gs.have.originAcks.plan(root, index, targets)
 	return true
 }
 
@@ -153,19 +201,42 @@ func (gs *GossipSubRouter) seacastOriginLead(p peer.ID, rpc *RPC) {
 		if !ok {
 			continue
 		}
-		o := sc.origin[root]
-		if o == nil || o.led[p] {
+		if sc.origin[root] == nil {
 			continue
 		}
-		o.led[p] = true
-		var bits haveBits
-		if a, _ := gs.have.originAcks.bits(root); a != nil {
-			bits = *a
+		bits, first := gs.have.originAcks.lead(root, p, index)
+		if !first {
+			continue
 		}
-		bits.Set(index)
 		lead := rpcWithControl(nil, nil, nil, nil, nil, []*pb.ControlIDontWant{{MessageIDs: []string{gs.seacastEncodeHave(root, &bits, false)}}})
 		gs.sendRPC(p, lead, true)
 	}
+}
+
+// seacastOriginBelowCount is bits without the indices at or beyond root's count, for a group the node
+// publishes whose count the type knows; otherwise bits itself. Such a group can hold an acknowledgement
+// taken while its count was unknown, and the router takes it out (seacastDropBeyond) only at the
+// header's validation, which the type may know before. A receiver that knows the count refuses a
+// holding naming such an index whole.
+func (gs *GossipSubRouter) seacastOriginBelowCount(root string, bits *haveBits) *haveBits {
+	if bits == nil || gs.have == nil || !gs.have.originAcks.has(root) {
+		return bits
+	}
+	T := gs.seacastRootType(root)
+	if T == nil {
+		return bits
+	}
+	n := T.IndexCount(root)
+	if n <= 0 || len(*bits)*8 <= n {
+		return bits // unknown, or no index at or beyond it
+	}
+	below := &haveBits{}
+	for _, i := range bits.Indices() {
+		if int64(i) < int64(n) {
+			below.Set(i)
+		}
+	}
+	return below
 }
 
 // seacastOriginAckIndices is a peer's HAVE newly naming indices of groups: an index of a group the node
@@ -189,7 +260,18 @@ func (gs *GossipSubRouter) seacastOriginAck(root string, i uint32) {
 		return
 	}
 	o := sc.origin[root]
-	if o == nil || !gs.have.originAcks.ack(root, i) {
+	if o == nil {
+		return
+	}
+	if T := gs.seacastRootType(root); T != nil {
+		if n := T.IndexCount(root); n > 0 && int64(i) >= int64(n) {
+			// An index the group has not, once its count is known: a window timeout of a copy sent
+			// while it was unknown. drop_beyond took it, and it stays out.
+			return
+		}
+	}
+	offer, newly := gs.have.originAcks.ack(root, i, gs.seacastSourcePool(o.topic))
+	if !newly {
 		return
 	}
 	sc.ctr.OriginAcked.Add(1)
@@ -198,10 +280,7 @@ func (gs *GossipSubRouter) seacastOriginAck(root string, i uint32) {
 		return
 	}
 	gs.idontwantMesh(o.topic, []string{mid}, "") // the holding, now naming i, to the suppression scope
-	for _, p := range gs.seacastSourcePool(o.topic) {
-		if _, planned := o.planned[i][p]; planned {
-			continue
-		}
+	for _, p := range offer {
 		gs.seacastOriginOffer(p, o.topic, mid)
 	}
 }
@@ -249,7 +328,6 @@ func (gs *GossipSubRouter) seacastOriginOffer(p peer.ID, topic, mid string) {
 		return
 	}
 	ihave := rpcWithControl(nil, []*pb.ControlIHave{{TopicID: &topic, MessageIDs: ids}}, nil, nil, nil, nil)
-	gs.haveOriginOffered(mid)
 	gs.sendRPC(p, ihave, false)
 }
 

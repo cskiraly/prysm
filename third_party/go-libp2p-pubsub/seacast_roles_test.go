@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -70,15 +71,15 @@ func TestSeacastRoles(t *testing.T) {
 		t.Fatalf("wants from me after the peer's holding of two: %d, want 30", got)
 	}
 	if gs.have.pushed[all] == nil {
-		gs.have.pushed[all] = map[string]*haveEntry{}
+		gs.have.pushed[all] = map[core.GroupID]*core.Push{}
 	}
-	pe := &haveEntry{}
-	pe.bits.Set(2)
-	gs.have.pushed[all][root] = pe
+	pe := &core.Push{}
+	pe.Bits.Set(2)
+	gs.have.pushed[all][seacastGID(root)] = pe
 	if got := count(gs.seacastWantsFromMe(all, root)); got != 29 {
 		t.Fatalf("wants from me after our push of one more: %d, want 29", got)
 	}
-	gs.have.peers[all][root].complete = true
+	gs.have.peers[all][seacastGID(root)].Complete = true
 	if got := count(gs.seacastWantsFromMe(all, root)); got != 0 {
 		t.Fatalf("wants from me with the peer's interest satisfied: %d, want 0", got)
 	}

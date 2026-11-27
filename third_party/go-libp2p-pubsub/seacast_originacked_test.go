@@ -76,11 +76,11 @@ func (c *originAckedCell) read(i int, f func(gs *GossipSubRouter)) {
 func (c *originAckedCell) state(i int, root string, ix uint32) (holds, srcNames bool) {
 	S := c.hosts[0].ID()
 	c.read(i, func(gs *GossipSubRouter) {
-		if e := gs.have.mine[root]; e != nil {
-			holds = e.bits.Has(ix)
+		if e := gs.have.mine[seacastGID(root)]; e != nil {
+			holds = e.Bits.Has(ix)
 		}
-		if e := gs.have.peers[S][root]; e != nil {
-			srcNames = e.bits.Has(ix)
+		if e := gs.have.peers[S][seacastGID(root)]; e != nil {
+			srcNames = e.Bits.Has(ix)
 		}
 	})
 	return
@@ -125,7 +125,7 @@ func TestSeacastSourceOffersAtAck(t *testing.T) {
 				var pushed peer.ID
 				c.read(0, func(gs *GossipSubRouter) {
 					for p, roots := range gs.have.pushed {
-						if e := roots[root]; e != nil && e.bits.Has(ix) {
+						if e := roots[seacastGID(root)]; e != nil && e.Bits.Has(ix) {
 							pushedSet[p] = true
 							pushed = p
 						}
@@ -176,6 +176,11 @@ func TestSeacastSourceOffersAtAck(t *testing.T) {
 				}
 				if n := ctrS.OriginAcked.Load(); n != 1 {
 					t.Errorf("acknowledgements at S: %d; want 1 (a later copy's timeout acknowledges nothing new)", n)
+				}
+				// The acknowledgement's offers go to the leaves the dispatch did not push: a push
+				// target is not offered the chunk (none at the dispatch, the source's offers wait).
+				if n := ctrS.Offered.Load(); n != int64(3-rnode) {
+					t.Errorf("offers by S: %d; want %d, one to each leaf not pushed", n, 3-rnode)
 				}
 			})
 		})

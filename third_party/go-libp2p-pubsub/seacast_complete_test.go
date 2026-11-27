@@ -91,23 +91,23 @@ func TestSeacastCompletion(t *testing.T) {
 					}
 				}
 				time.Sleep(300 * time.Millisecond)
-				var state uint8
+				state := seacastCollecting
 				var stopPull, gated, complete, claimAll bool
 				read(gsB, func() {
-					if g := gsB.seacast.groups[root]; g != nil {
-						state, stopPull = g.state, g.stopPull
+					if g := gsB.seacast.group(root); g != nil {
+						state, stopPull = g.State, g.StopPull
 					}
 					// An ask of a cell B lacks and does not probe: a claim's probe draws its cell at
 					// random (seacast.md §4.6, R5), and an ask of the probed cell passes stop_pull.
 					idx := byte(7)
-					if g := gsB.seacast.groups[root]; g != nil && g.probe != nil && g.probe.index == 7 {
+					if g := gsB.seacast.group(root); g != nil && g.Ext != nil && g.Ext.index == 7 {
 						idx = 6
 					}
 					gated = !gsB.requestAllowed(hosts[0].ID(), topic, string(cell(idx)[:haveRootLen+1]))
 				})
 				read(gsA, func() {
-					if e := gsA.have.peers[hosts[1].ID()][root]; e != nil {
-						complete, claimAll = e.complete, e.claimAll
+					if e := gsA.have.peers[hosts[1].ID()][seacastGID(root)]; e != nil {
+						complete, claimAll = e.Complete, e.ClaimAll
 					}
 				})
 				if !c.machine {

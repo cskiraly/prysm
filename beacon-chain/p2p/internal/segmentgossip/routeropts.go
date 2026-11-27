@@ -23,6 +23,7 @@ const (
 	windowTimeout    = 500 * time.Millisecond // WINDOW_TIMEOUT: a lost acknowledgement frees its slot
 	windowGain       = 0.05                   // the window's gain, inert while min = max
 	stripeUplinkMbps = 1000                   // STRIPE_UPLINK: a source this fast pushes to every topic peer
+	askUplinkMbps    = 50                     // ASK_UPLINK (seacast.md §4.13): below it the ask window stretches
 )
 
 // Window is seacast-lite.md §7.1's W for an uplink of mbps: what the uplink sends in RTT_REF + TARGET,
@@ -84,29 +85,37 @@ func RouterOptions(s Setting, t pubsub.ObjectType, heartbeat time.Duration, m *P
 	w := float64(Window(s.UplinkMbps))
 	opts := []pubsub.Option{
 		pubsub.WithPhaseForwarding(func(string) bool { return false }, s.Params.RNode),
+		// A relay's sender stays a candidate of the forward and can take a place of the push budget;
+		// seacast-lite.md §5.2's forward leaves it out.
+		pubsub.WithSeacastSenderInForward(),
 		pubsub.WithHaveBitmaps(index),
 		pubsub.WithHaveAnnounceBitmaps(),
 		pubsub.WithHaveDispatch(s.Cancel, false),
 		pubsub.WithHaveRarestDispatch(),
+		// seacast.md §4.12's choose: the writer sends this node's own chunks first, over the whole
+		// queue ([X3]).
+		pubsub.WithOwnChunksFirst(),
 		pubsub.WithIWantDiscipline(iwantWindow),
+		// seacast.md §4.13: IWANT_WINDOW times max(1, ASK_UPLINK / UPLINK), so a node below 50 Mbps
+		// waits longer for an answer before it asks elsewhere.
+		pubsub.WithAskUplink(askUplinkMbps*1_000_000, int64(s.UplinkMbps)*1_000_000),
 		pubsub.WithIHaveCommitmentPark(parkStrikes, promiseWait, parkTTL, &m.ParkBreaks, &m.Parks),
 		pubsub.WithIHaveParkPerGroup(scope),
 		pubsub.WithOfferTable(&m.OfferRetries),
 		// The v0.5 rules the router's own defaults miss, after the park, the park per group and the
-		// offer table, which they need:
+		// offer table, which they need. A chunk's pull keeps its promise from the write, asks parked
+		// announcers once more (the last resort) and closes promises with the connection without
+		// these; the switches are for the router's other asks:
 		//   - §6.1: "A promise starts at the write, not at the decision to ask, so that no peer is
 		//     parked for an ask it never received." Started at the decision, an ask waiting behind
 		//     the window broke its promise and parked an honest peer.
 		//   - §5.2 and §4.1 (OfferSkipped): a push a full queue refuses is offered instead, and an answer it
 		//     refuses is owed. Dropped, a refused answer broke the asker's promise against this node.
-		//   - §6.1 (LastResort): when every announcer of a chunk is parked, each is asked once more, after
-		//     waits that double. Without it, a chunk whose announcers were all parked was out of reach
-		//     for the park's 30 s, longer than the group's live window.
-		//   - §6.1 and §8.1 (CloseWithConn): a promise closes, parking nobody, when the peer's
-		//     connection closes, and the peer's offers and tries go with it. Without it, the honest
-		//     peer was parked for an ask that went with the connection.
-		pubsub.WithSpecV05(pubsub.SpecV05{PromiseAtWrite: true, OfferSkipped: true, LastResort: true, CloseWithConn: true}, &m.V05),
+		pubsub.WithSpecV05(pubsub.SpecV05{PromiseAtWrite: true, OfferSkipped: true}, &m.V05),
 		pubsub.WithPacedGossip(heartbeat/paceTicks, 0),
+		// A paced job whose every id the peer holds by its tick is passed over within that tick, as
+		// measured; seacast-lite.md §6.4's on_pace_tick spends the tick on it instead.
+		pubsub.WithPacedGossipSkipHeld(),
 		pubsub.WithPhaseSelectFewest(),
 		pubsub.WithPhaseSelectFewestGuard(guardGrace, func(peer.ID, string) { m.GuardDemotions.Add(1) }),
 		pubsub.WithPhaseSelectFewestTolerant(pubsub.PhaseSelectLowerHalf, 0),
@@ -129,6 +138,9 @@ func RouterOptions(s Setting, t pubsub.ObjectType, heartbeat time.Duration, m *P
 		pubsub.WithSeacastRoles(payloadRoles{}),
 		pubsub.WithSeacastMachine(),
 		pubsub.WithSeacastLimits(s.Limits),
+		// seacast.md §4.1's join_push: a peer that joins the payload topic's mesh is offered what the
+		// node holds of the live groups.
+		pubsub.WithSeacastJoinPush(),
 	)
 	return opts
 }

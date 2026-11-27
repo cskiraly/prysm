@@ -77,7 +77,7 @@ func TestSeacastAdmissionByWant(t *testing.T) {
 			t.Fatalf("C after its ask: store %d, admitted by WANT %d, accepted %d, want 1 1 1 (A served from the store %d, v4 WANTs %d)", held, ctrC.AdmittedByWant.Load(), ctrC.Accepted.Load(), gsA.seacast.ctr.ServedFromStore.Load(), gsA.seacast.ctr.WantsV4.Load())
 		}
 		read(gsA, func() {
-			if e := gsA.have.peers[hosts[2].ID()][root]; e == nil || !e.bits.Has(5) {
+			if e := gsA.have.peers[hosts[2].ID()][seacastGID(root)]; e == nil || !e.Bits.Has(5) {
 				t.Errorf("A did not hear C's holding of the cell it served")
 			}
 		})

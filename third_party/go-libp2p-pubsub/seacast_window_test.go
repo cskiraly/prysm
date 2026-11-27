@@ -59,7 +59,7 @@ func newSeacastWindowCell(t *testing.T, slots map[string]uint64, withPull bool) 
 		}
 		opts = append(opts, WithSeacast([]ObjectType{T}, nil))
 		if withPull {
-			opts = append(opts, WithSpecV05(SpecV05{LastResort: true, CloseWithConn: true}, nil))
+			opts = append(opts, WithSpecV05(SpecV05{}, nil))
 		}
 		return opts
 	})
@@ -116,7 +116,7 @@ func TestSeacastWindowRefusesBeforeValidation(t *testing.T) {
 			t.Fatalf("a chunk of slot 3 at slot 5: expired-dropped %d, validated %d, held %d, arrived %d; want 1 0 0 0", ctrB.ExpiredDropped.Load(), c.validated.Load(), held, ctrB.Arrived.Load())
 		}
 		c.read(c.gsB, func() {
-			if m := c.gsB.have.mine[r3]; m != nil {
+			if m := c.gsB.have.mine[seacastGID(r3)]; m != nil {
 				t.Errorf("B made holdings for a group out of the window")
 			}
 		})
@@ -139,7 +139,7 @@ func TestSeacastWindowRefusesBeforeValidation(t *testing.T) {
 			t.Fatalf("a chunk of slot 9 at slot 5: future %d, validated %d, held %d; want 1 1 1", ctrB.Future.Load(), c.validated.Load(), held)
 		}
 		c.read(c.gsB, func() {
-			if m := c.gsB.have.mine[r9]; m != nil {
+			if m := c.gsB.have.mine[seacastGID(r9)]; m != nil {
 				t.Errorf("B made holdings for a group of a future slot")
 			}
 		})
@@ -286,9 +286,9 @@ func TestSeacastWindowDropsPullState(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 			var asked, promised, offered bool
 			c.read(c.gsB, func() {
-				_, asked = c.gsB.iwantAsked[mid]
-				_, promised = c.gsB.iwantPromised[mid][c.hosts[0].ID()]
-				_, offered = c.gsB.offerTable[mid]
+				asked = c.gsB.pullAsked(mid)
+				promised = c.gsB.pullPromised(c.hosts[0].ID(), mid)
+				offered = c.gsB.pullOfferedByAny(mid)
 			})
 			if !asked || !promised || !offered {
 				t.Fatalf("after A's offer: asked %v promised %v offered %v, want all true", asked, promised, offered)
@@ -302,9 +302,9 @@ func TestSeacastWindowDropsPullState(t *testing.T) {
 			}
 			time.Sleep(2 * time.Second) // past the promise (400 ms), the retry and a heartbeat
 			c.read(c.gsB, func() {
-				_, asked = c.gsB.iwantAsked[mid]
-				_, promised = c.gsB.iwantPromised[mid][c.hosts[0].ID()]
-				_, offered = c.gsB.offerTable[mid]
+				asked = c.gsB.pullAsked(mid)
+				promised = c.gsB.pullPromised(c.hosts[0].ID(), mid)
+				offered = c.gsB.pullOfferedByAny(mid)
 			})
 			if advance {
 				if c.breaks.Load() != 0 || c.parks.Load() != 0 || asked || promised || offered {
@@ -368,7 +368,7 @@ func TestSeacastWindowForgetsAnUnplacedRoot(t *testing.T) {
 				sc := c.gsB.seacast
 				_, registered = sc.roots[r7]
 				_, tomb = sc.expired[r7]
-				_, offered = c.gsB.offerTable[mid]
+				offered = c.gsB.pullOfferedByAny(mid)
 			})
 			return
 		}
@@ -428,8 +428,8 @@ func TestSeacastWindowUnplacedRootValidatesLater(t *testing.T) {
 		time.Sleep(time.Second)
 		var held bool
 		c.read(c.gsB, func() {
-			m := c.gsB.have.mine[r7]
-			held = m != nil && m.bits.Has(1)
+			m := c.gsB.have.mine[seacastGID(r7)]
+			held = m != nil && m.Bits.Has(1)
 		})
 		if !held || c.validated.Load() != 1 {
 			t.Fatalf("a chunk of the group placed at slot 7: held %v, validated %d (holdings tombstone after the window forgot the root: %d heartbeats); want held, 1 validated", held, c.validated.Load(), tomb)
@@ -478,8 +478,8 @@ func TestSeacastWindowPlacementDuringSweep(t *testing.T) {
 		time.Sleep(time.Second)
 		var held bool
 		c.read(gs, func() {
-			m := gs.have.mine[root]
-			held = m != nil && m.bits.Has(1)
+			m := gs.have.mine[seacastGID(root)]
+			held = m != nil && m.Bits.Has(1)
 		})
 		if expired || tomb != 0 || c.validated.Load() != 1 || !held {
 			t.Fatalf("live placement: expired %v, holdings tombstone %d, validated %d, held %v; want false 0 1 true",
@@ -531,7 +531,7 @@ func TestSeacastWindowForgetsHeldBackOffers(t *testing.T) {
 			gs.seacastHoldBack([]string{mid}, c.hosts[0].ID())
 			gs.seacastAdvanceSlot(7)
 			_, held = gs.seacast.heldBack[mid]
-			gs.seacastRetryHeldBack()
+			gs.seacastHeartbeatLimits()
 			_, registered = gs.seacast.roots[root]
 			retried = gs.seacast.ctr.HeldBackRetried.Load()
 			gs.seacastRootType(root)
@@ -566,7 +566,7 @@ func TestSeacastWindowAgedHoldingsAfterTheRecord(t *testing.T) {
 				sc := c.gsB.seacast
 				_, registered = sc.roots[r4]
 				_, tomb = sc.expired[r4]
-				_, held = c.gsB.have.mine[r4]
+				_, held = c.gsB.have.mine[seacastGID(r4)]
 			})
 			return
 		}
@@ -580,6 +580,62 @@ func TestSeacastWindowAgedHoldingsAfterTheRecord(t *testing.T) {
 		time.Sleep(3 * time.Minute) // the holdings age out (holdTTL heartbeats)
 		if registered, tomb, held := state(); registered || tomb || held {
 			t.Fatalf("after the holdings aged out: registered %v, tombstone %v, held %v; want all false", registered, tomb, held)
+		}
+	})
+}
+
+// TestSeacastWindowForgetsHeldBackChunk: a chunk the IHAVE limits held back, whose group the window
+// forgets before the heartbeat, goes with it: the heartbeat's retry would look its root up again,
+// and a type that places roots it does not know would register it anew. Another group's chunk held
+// back stays.
+func TestSeacastWindowForgetsHeldBackChunk(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		root := strings.Repeat("r", haveRootLen)
+		c := newSeacastWindowCell(t, nil, false)
+		gs := c.gsB
+		other := seacastGID(strings.Repeat("o", haveRootLen))
+		var before, after, otherKept bool
+		c.read(gs, func() {
+			gs.seacastAdvanceSlot(5)
+			gs.seacastRootType(root)
+			gs.pull.held.Hold(seacastGID(root), 1)
+			gs.pull.held.Hold(other, 1)
+			before = gs.pull.held.Holds(seacastGID(root), 1)
+			gs.seacastAdvanceSlot(7) // the window passes the root's slot
+			after = gs.pull.held.Holds(seacastGID(root), 1)
+			otherKept = gs.pull.held.Holds(other, 1)
+		})
+		if !before || after || !otherKept {
+			t.Fatalf("held back before the window passed %v, after %v; the other group's %v; want true false true", before, after, otherKept)
+		}
+	})
+}
+
+// TestSeacastWindowForgetsTombstoneHeldBackChunk: a chunk the IHAVE limits held back, whose group
+// expired before its slot left the window (a tombstone), goes when the window passes the tombstone, as
+// a live group's does: the heartbeat's retry would look its root up again.
+func TestSeacastWindowForgetsTombstoneHeldBackChunk(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		root := strings.Repeat("t", haveRootLen)
+		c := newSeacastWindowCell(t, nil, false)
+		gs := c.gsB
+		var tomb, before, after, registered bool
+		c.read(gs, func() {
+			gs.seacastAdvanceSlot(5)
+			gs.seacastRootType(root)
+			gs.pull.held.Hold(seacastGID(root), 1)
+			gs.expireGroup(root) // its group expires early: a tombstone; its held-back chunk stays
+			_, tomb = gs.seacast.expired[root]
+			before = gs.pull.held.Holds(seacastGID(root), 1)
+			gs.seacastAdvanceSlot(7) // the window passes the tombstone
+			after = gs.pull.held.Holds(seacastGID(root), 1)
+			_, registered = gs.seacast.roots[root]
+		})
+		if !tomb || !before {
+			t.Fatalf("the scenario: tombstone %v, held back after the expiry %v; want true true", tomb, before)
+		}
+		if after || registered {
+			t.Fatalf("after the window passed the tombstone: held back %v, registered %v; want false false", after, registered)
 		}
 	})
 }

@@ -24,29 +24,17 @@ package pubsub
 import (
 	"fmt"
 
+	core "github.com/cskiraly/seacast-go"
+
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// SeacastLimits bounds the path's state (X6: limits before state).
-type SeacastLimits struct {
-	// PendingPerPeer caps the chunks kept per peer while their group's gate is closed.
-	PendingPerPeer int
-	// LiveWindow is the live window in slots (v0.3 §8.1, seacast_window.go): a group whose slot is
-	// this many behind the node's current slot has left it. More slots than a group needs to reach
-	// every honest node from its slot's start; the harness's groups complete within 2 s of a 12 s
-	// slot, so 2.
-	LiveWindow uint64
-	// UnknownGroupsPerPeer is MAX_PENDING_GROUPS (seacast-lite.md §8.2; spec f6c19db): the groups whose
-	// header is not yet validated that a peer's deferred copies may name. A copy of a further one is
-	// ignored, neither kept nor tied (seacast.md §4.2's defer, admitted). Zero: no limit, the
-	// toy's default ("the client's").
-	UnknownGroupsPerPeer int
-}
+// SeacastLimits bounds the path's state (X6: limits before state): the core's Limits.
+type SeacastLimits = core.Limits
 
-// DefaultSeacastLimits is the toy's: a closed gate holds a block's worth of a column per peer; the
-// window two slots.
-var DefaultSeacastLimits = SeacastLimits{PendingPerPeer: 64, LiveWindow: 2}
+// DefaultSeacastLimits is the toy's (core.DefaultLimits).
+var DefaultSeacastLimits = core.DefaultLimits
 
 // WithSeacastLimits sets the path's limits (after WithSeacast): the harness's cells set the live
 // window from their configuration.
@@ -62,17 +50,6 @@ func WithSeacastLimits(limits SeacastLimits) Option {
 		gs.seacast.limits = limits
 		return nil
 	}
-}
-
-// seacastPending is one copy kept while its gate is closed.
-type seacastPending struct {
-	from peer.ID
-	msg  *Message
-	root string
-	// slot is the slot the copy names, where the type reads it (slotOK): drop_stale_waits drops the copy
-	// when it leaves the live window.
-	slot   uint64
-	slotOK bool
 }
 
 // seacastPreprocess is the path's part of Preprocess for one message: true when the message is
@@ -92,11 +69,12 @@ func (gs *GossipSubRouter) seacastPreprocess(from peer.ID, msg *Message) bool {
 	return true
 }
 
-// seacastAdmit is the path's gate at admission (the receive goroutine, before the seen check and
-// validation): false keeps the message out, in the pending store while its group's header is not
-// validated, or dropped as a second copy of a pending id or over the per-peer bound. Off the
-// path's topics, true.
-func (gs *GossipSubRouter) seacastAdmit(msg *Message) bool {
+// seacastAdmit is the path's gate at admission (handleIncomingRPC, before the seen check and
+// validation; and again once validation finishes, validated): false keeps the message out, in the
+// deferred store while its group's header is not validated (core.Pending.Defer), or dropped as a
+// second copy of a kept id or over the per-peer bound, its sender tied either way. Off the path's
+// topics, true.
+func (gs *GossipSubRouter) seacastAdmit(msg *Message, validated bool) bool {
 	T := gs.seacastType(msg.GetTopic())
 	if T == nil || gs.have == nil {
 		return true
@@ -118,61 +96,54 @@ func (gs *GossipSubRouter) seacastAdmit(msg *Message) bool {
 		sc.ctr.Future.Add(1) // a chunk of a later slot: ignored, as a block from a future slot is
 		return false
 	}
-	if _, dup := sc.pending[mid]; dup {
-		sc.ctr.PendingDup.Add(1)
-		if gs.seacastAdmitted(msg.ReceivedFrom, root) {
-			gs.seacastTie(msg.ReceivedFrom, root, index, mid) // another copy of one that waits: its sender too
+	env := waitEnv{gs: gs, mid: mid}
+	if s := env.Slot(seacastChunk(root, index, mid)); !env.Live(s) {
+		// The slot the copy names, where its type reads one (ChunkSlotter), out of the live window:
+		// on_chunk's and on_validated's not live(f.slot), at admission and once validated.
+		if s > sc.slot {
+			sc.ctr.Future.Add(1)
+		} else {
+			sc.ctr.ExpiredDropped.Add(1)
 		}
+		return false
+	}
+	if sc.waits.Has(mid) {
+		sc.ctr.PendingDup.Add(1)
+		gs.seacastTie(msg.ReceivedFrom, root, index, mid) // another copy of one that waits: its sender too, if admitted
 		return false
 	}
 	if T.HeaderKnown(root) {
 		return true // the gate is open: validated now, filled at ACCEPT
 	}
-	from := msg.ReceivedFrom
-	if !gs.seacastAdmitted(from, root) {
+	if !validated && gs.p.seenMessage(mid) {
+		// on_chunk's seen comes first: a copy of an id the node has seen (its own publication filled
+		// it while a copy waited, and the copy went) is a duplicate, never kept.
+		sc.ctr.SeenAtGate.Add(1)
+		return true
+	}
+	sc.noteGateMet(root)
+	from, g := msg.ReceivedFrom, seacastGID(root)
+	if !env.Admitted(from, g) {
 		sc.ctr.UnknownRefused.Add(1) // a group beyond the sender's unknown groups: neither kept nor tied
 		return false
 	}
-	if sc.pending == nil {
-		sc.pending = map[string]*seacastPending{}
-		sc.pendingOf = map[peer.ID]int{}
+	kept, tied := sc.waits.Of(from), sc.ties.Tied(from, g, index)
+	if _, again := sc.waits.Defer(env, &sc.ties, from, seacastChunk(root, index, mid), mid, sc.limits); again {
+		return true // the gate opened meanwhile: validated now
 	}
-	if sc.pendingOf[from] >= sc.limits.PendingPerPeer {
-		sc.ctr.PendingRefused.Add(1)
-		gs.seacastTie(from, root, index, mid) // refused, not kept: its sender tied all the same
-		return false
+	if !tied && sc.ties.Tied(from, g, index) {
+		sc.ctr.Tied.Add(1)
 	}
-	e := &seacastPending{from: from, msg: msg, root: root}
-	if cs, ok := T.(ChunkSlotter); ok {
-		e.slot, e.slotOK = cs.ChunkSlot(mid)
-	}
-	sc.pending[mid] = e
-	sc.pendingOf[from]++
-	sc.ctr.Pending.Add(1)
-	gs.seacastTie(from, root, index, mid) // kept: its sender tied to the root it names
-	return false
-}
-
-// seacastAdmitted is seacast.md §4.2's admitted (seacast-lite.md §8.2's MAX_PENDING_GROUPS; spec f6c19db):
-// whether p's deferred copy of root's group may be kept or tie p. p's unknown groups are the roots it is
-// tied to, whose headers are not yet validated (a root's ties go at its header's validation). Router side
-// of admission; the receive goroutine reads the tie table as seacastAdmit's other checks do.
-func (gs *GossipSubRouter) seacastAdmitted(p peer.ID, root string) bool {
-	sc := gs.seacast
-	lim := sc.limits.UnknownGroupsPerPeer
-	if lim <= 0 {
-		return true
-	}
-	if _, tied := sc.tied[root][p]; tied {
-		return true
-	}
-	n := 0
-	for r, byPeer := range sc.tied {
-		if _, ok := byPeer[p]; ok && r != root {
-			n++
+	if sc.waits.Of(from) > kept {
+		if sc.waitMsg == nil {
+			sc.waitMsg = map[string]*Message{}
 		}
+		sc.waitMsg[mid] = msg
+		sc.ctr.Pending.Add(1) // kept: its sender tied to the root it names
+	} else {
+		sc.ctr.PendingRefused.Add(1) // refused, not kept: its sender tied all the same
 	}
-	return n < lim
+	return false
 }
 
 // seacastVerdict is the validation's hook: the verdict of a message on the path's topics.
@@ -190,22 +161,21 @@ func (gs *GossipSubRouter) seacastVerdict(src peer.ID, msg *Message, result Vali
 		}
 		sc.rejected[mid] = struct{}{}
 		sc.ctr.Rejected.Add(1)
-		sc.dropPending(mid)
 	case ValidationIgnore:
 		sc.ctr.Ignored.Add(1)
 	}
 }
 
 // seacastAccepted is the fill, from Publish at ACCEPT of a message on the path's topics: the
-// holding and the id, the ask it closes, the holding to the suppression scope and the sender.
+// holding and the id, the ask it closes, the holding to the suppression scope on a claim and to
+// the sender.
 func (gs *GossipSubRouter) seacastAccepted(msg *Message) {
 	from := msg.ReceivedFrom
 	mid := gs.p.idGen.ID(msg)
 	sc := gs.seacast
-	sc.dropPending(mid)
 	gs.noteArrival(mid, from)
 	gs.iwantDelivered(mid)
-	gs.haveNoteArrival(mid)
+	claim := gs.haveNoteArrival(mid)
 	gs.haveArrived(mid, from)
 	sc.ctr.Accepted.Add(1)
 	h := gs.have
@@ -216,26 +186,32 @@ func (gs *GossipSubRouter) seacastAccepted(msg *Message) {
 	if !ok || len(root) != haveRootLen {
 		return
 	}
+	gs.seacastDropFilledWait(root, mid)
 	gs.seacastProbeCopy(root, index, from) // (R5) the claimant's own copy passes its probe
 	T := gs.seacastType(msg.GetTopic())
-	if g := sc.groups[root]; g != nil && g.state == seacastInvalid {
+	if g := sc.group(root); g != nil && g.State == seacastInvalid {
 		T = nil // an INVALID group is not taken up again (§4.2's fill, seacast.md §4.1)
 	}
 	if T != nil {
+		gs.seacastPlaceAccepted(T, root)                 // the group on its type's topic, from its first accepted chunk
 		gs.seacastOrderFill(T, root, index)              // (i) the gate before the fill (seacast_order.go)
 		gs.seacastStorePut(T, root, index, msg)          // the fill's store half: served after mcache lets go
 		gs.seacastServeStanding(T, root, index, msg)     // §4.10: the chunk a standing request waited for is here
 		gs.seacastServeWaitingProbe(T, root, index, msg) // (R5) a probe that reached us while we decoded
 		gs.seacastCheckCompletion(T, root)               // under the machine: the holding below carries its claims
 	}
-	// [c7] the holding to whoever may push this group to us, on v0.3's wire the topic's mesh;
-	// [c14] and to the sender, as its acknowledgement. Both leave exactly as the arrival HAVE
-	// does from Preprocess (the same lane, the same coalescing); the holding's encoding is v4 on the
-	// path's roots (haveIDontWantIDs). The stock IDONTWANT's size threshold does not apply: the
-	// draft's holding has no size rule, and a group's holding is one bitmap whatever the chunk's
-	// size.
+	// [c7] the holding to whoever may push this group to us, on v0.3's wire the topic's mesh,
+	// when the chunk is a claim; [c14] and to the sender always, as its acknowledgement
+	// (seacast-lite.md §4.2's on_validated; the core's HaveTargets). A copy of an index the node
+	// holds already, as one its decode rebuilt, changes nothing the scope has heard, so it goes
+	// to the sender alone. Both leave exactly as the arrival HAVE does from Preprocess (the same
+	// lane, the same coalescing); the holding's encoding is v4 on the path's roots
+	// (haveIDontWantIDs). The stock IDONTWANT's size threshold does not apply: the draft's
+	// holding has no size rule, and a group's holding is one bitmap whatever the chunk's size.
 	topic := msg.GetTopic()
-	gs.idontwantMesh(topic, []string{mid}, from)
+	if claim {
+		gs.idontwantMesh(topic, []string{mid}, from)
+	}
 	if from != gs.p.host.ID() && gs.feature(GossipSubFeatureIdontwant, gs.peers[from]) {
 		// The sender's acknowledgement, the holding ([c14]: the sender always hears it).
 		ids := gs.haveIDontWantIDs([]string{mid})
@@ -290,7 +266,7 @@ func (gs *GossipSubRouter) seacastAckAllowed(mid string) bool {
 	if sc == nil {
 		return true
 	}
-	if _, pending := sc.pending[mid]; pending {
+	if sc.waits.Has(mid) {
 		sc.ctr.DupUnacked.Add(1)
 		return false
 	}
@@ -301,7 +277,7 @@ func (gs *GossipSubRouter) seacastAckAllowed(mid string) bool {
 	if gs.have != nil {
 		if root, index, ok := gs.have.index(mid); ok && len(root) == haveRootLen {
 			if gs.seacastRootType(root) != nil {
-				if m := gs.have.mine[root]; m == nil || !m.bits.Has(index) {
+				if m := gs.have.mine[seacastGID(root)]; m == nil || !m.Bits.Has(index) {
 					sc.ctr.DupUnacked.Add(1)
 					return false
 				}
@@ -309,75 +285,6 @@ func (gs *GossipSubRouter) seacastAckAllowed(mid string) bool {
 		}
 	}
 	return true
-}
-
-// dropPending forgets a pending copy.
-func (sc *seacast) dropPending(mid string) {
-	e, ok := sc.pending[mid]
-	if !ok {
-		return
-	}
-	delete(sc.pending, mid)
-	sc.pendingOf[e.from]--
-}
-
-// seacastRelease pushes the pending copies of the given roots into the receive path: the gate
-// opened. Router goroutine (the receive loop's); a copy was never seen, so it is validated as the
-// arrival it is and, at ACCEPT, filled by seacastAccepted.
-func (gs *GossipSubRouter) seacastRelease(roots []string) {
-	sc := gs.seacast
-	if sc == nil {
-		return
-	}
-	if len(sc.pending) == 0 {
-		for _, r := range roots {
-			gs.seacastReleaseTies(r, nil) // ties of refused copies only
-		}
-		return
-	}
-	want := make(map[string]bool, len(roots))
-	for _, r := range roots {
-		want[r] = true
-	}
-	kept := map[string]map[peer.ID]map[uint32]bool{} // per root, the copies that resume, by sender and index
-	for mid, e := range sc.pending {
-		if !want[e.root] {
-			continue
-		}
-		delete(sc.pending, mid)
-		sc.pendingOf[e.from]--
-		if gs.seacastRootExpired(e.root) {
-			sc.ctr.Expired.Add(1) // the group expired or left the window while it waited: dropped
-			continue
-		}
-		_, index, _ := gs.have.index(mid)
-		if T := gs.seacastRootType(e.root); T != nil && int(index) >= T.IndexCount(e.root) {
-			// A copy naming an index its root's header does not admit: a forgery, dropped with its
-			// sender's offers of the index (seacast-lite.md's drop_tie); the recovery goes on without it.
-			sc.ctr.Forged.Add(1)
-			gs.seacastDropOffer(e.from, mid, e.root, index)
-			if gs.offerTable != nil && !gs.haveSeen(mid) {
-				gs.retryOfferedPull(mid) // the recovery goes on without the forger
-			}
-			continue
-		}
-		if kept[e.root] == nil {
-			kept[e.root] = map[peer.ID]map[uint32]bool{}
-		}
-		if kept[e.root][e.from] == nil {
-			kept[e.root][e.from] = map[uint32]bool{}
-		}
-		kept[e.root][e.from][index] = true
-		sc.ctr.Released.Add(1)
-		// The receive path's two steps, as handleIncomingRPC runs them for an admitted message.
-		if gs.p.shouldPush(e.msg) {
-			gs.Preprocess(e.from, []*Message{e.msg})
-			gs.p.pushMsg(e.msg)
-		}
-	}
-	for _, r := range roots {
-		gs.seacastReleaseTies(r, kept[r])
-	}
 }
 
 // seacastExpire ends the given groups' active lifetime (the application's word): each leaves a
@@ -398,14 +305,20 @@ func (gs *GossipSubRouter) seacastExpire(roots []string) {
 }
 
 // SeacastHeaderValidated tells the path that the application validated the header of the groups
-// named: their pending copies are validated now (on_header_validated). Any goroutine.
+// named: drop_beyond, then the gate's opening for each (on_header_validated): its kept copies are
+// validated now, its ties release and its ledger is retried. Any goroutine.
 func (p *PubSub) SeacastHeaderValidated(roots []string) {
 	gs, ok := p.rt.(*GossipSubRouter)
 	if !ok || gs.seacast == nil {
 		return
 	}
 	select {
-	case p.eval <- func() { gs.seacastDropBeyond(roots); gs.seacastRelease(roots) }:
+	case p.eval <- func() {
+		gs.seacastDropBeyond(roots)
+		for _, r := range roots {
+			gs.seacastOpenGate(r)
+		}
+	}:
 	case <-p.ctx.Done():
 	}
 }
@@ -413,8 +326,8 @@ func (p *PubSub) SeacastHeaderValidated(roots []string) {
 // seacastDropBeyond is seacast-lite.md §4.2's drop_beyond (spec f6c19db; seacast.md's fill carries it) at
 // the moment the fork learns a group's count, its header's validation (seacastCountKnown): what named an
 // index the group has not, while the count was unknown, goes: the offers of it with their ordered list,
-// per-group offer bits and queued asks, its promises, tries, ask record and last-resort counts. Ties
-// beyond the count go at their release (seacastReleaseTies). Router goroutine, before the release.
+// per-group offer bits and queued asks, its promises, tries, ask record and last-resort counts, and the
+// ties of indices beyond it (Ties.DropBeyond). Router goroutine, before the gate's opening.
 func (gs *GossipSubRouter) seacastDropBeyond(roots []string) {
 	sc := gs.seacast
 	for _, root := range roots {
@@ -426,6 +339,17 @@ func (gs *GossipSubRouter) seacastDropBeyond(roots []string) {
 		if n <= 0 {
 			continue
 		}
+		if gs.have != nil {
+			// The source's acknowledgements: an index acknowledged before the count was known goes,
+			// or its holding would name a bit its receivers refuse.
+			gs.have.originAcks.dropBeyond(root, uint32(n)) // lint:ignore uintcast -- n > 0, an index count.
+		}
+		if gs.pullOn() {
+			// A chunk's pull is the core's (seacast_pull.go), the ties with it.
+			sc.ctr.DroppedBeyond.Add(int64(gs.pullDropBeyond(root, seacastGID(root), uint32(n)))) // lint:ignore uintcast -- n > 0, an index count.
+			continue
+		}
+		sc.ties.DropBeyond(seacastGID(root), uint32(n)) // lint:ignore uintcast -- n > 0, an index count.
 		mids := map[string]uint32{}
 		note := func(mid string) {
 			if r, i, ok := gs.groupIndex(mid); ok && r == root && int64(i) >= int64(n) {
@@ -444,41 +368,27 @@ func (gs *GossipSubRouter) seacastDropBeyond(roots []string) {
 		for mid := range gs.iwantPromised {
 			note(mid)
 		}
-		if gs.v05 != nil {
-			for mid := range gs.v05.offerOrder {
-				note(mid)
-			}
-			for _, byRoot := range gs.v05.offered {
-				g := byRoot[root]
-				if g == nil {
-					continue
-				}
-				for i := n; i < len(g.bits.b)*8; i++ {
-					if g.bits.Has(uint32(i)) { // lint:ignore uintcast -- bounded by haveMaxBytes*8.
-						g.bits.Clear(uint32(i))           // lint:ignore uintcast -- as above.
-						note(encodeWant(root, uint32(i))) // lint:ignore uintcast -- as above.
-					}
-				}
-			}
+		for mid := range sc.askQueued {
+			note(mid)
 		}
 		for mid, i := range mids {
-			var peers []peer.ID
+			// Every peer something of ours names for it: an offer, a promise, or an ask still queued,
+			// which the offer table may not hold (its allowance refused the offer).
+			peers := map[peer.ID]struct{}{}
 			for p := range gs.offerTable[mid] {
-				peers = append(peers, p)
+				peers[p] = struct{}{}
 			}
 			for p := range gs.iwantPromised[mid] {
-				peers = append(peers, p)
+				peers[p] = struct{}{}
 			}
-			for _, p := range peers {
+			for p := range sc.askQueued[mid] {
+				peers[p] = struct{}{}
+			}
+			for p := range peers {
 				gs.seacastDropOffer(p, mid, root, i) // the offer, its bit, its queued ask, its promise
 			}
-			gs.clearOffers(mid) // the rest of the offer table's entry: tries, topic, ordered list
+			gs.clearOffers(mid) // the rest of the offer table's entry: tries, topic
 			delete(gs.iwantAsked, mid)
-			if gs.v05 != nil {
-				k := gs.chunkKey(mid)
-				delete(gs.v05.askedParked, k)
-				delete(gs.v05.lrArmedKeys, k)
-			}
 			sc.ctr.DroppedBeyond.Add(1)
 		}
 	}
@@ -504,7 +414,7 @@ func (p *PubSub) SeacastPending() int {
 	}
 	done := make(chan int, 1)
 	select {
-	case p.eval <- func() { done <- len(gs.seacast.pending) }:
+	case p.eval <- func() { done <- gs.seacast.waits.Len() }:
 	case <-p.ctx.Done():
 		return 0
 	}

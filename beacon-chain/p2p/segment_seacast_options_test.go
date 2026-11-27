@@ -157,6 +157,29 @@ func TestSeacastRouterOptions(t *testing.T) {
 	require.NoError(t, segmentgossip.CheckSetting(setting))
 	path := segmentgossip.RouterOptions(setting, typ, gossipSubHeartbeatInterval, &segmentgossip.PathMetrics{})
 
+	t.Run("the ask window follows the uplink", func(t *testing.T) {
+		// seacast.md §4.13: IWANT_WINDOW (200 ms) times max(1, ASK_UPLINK / UPLINK), ASK_UPLINK 50 Mbps.
+		for _, c := range []struct {
+			mbps int
+			want time.Duration
+		}{{10, time.Second}, {50, 200 * time.Millisecond}, {100, 200 * time.Millisecond}} {
+			at := setting
+			at.UplinkMbps = c.mbps
+			opts := append(append([]pubsub.Option{}, base...), segmentgossip.RouterOptions(at, typ, gossipSubHeartbeatInterval, &segmentgossip.PathMetrics{})...)
+			ps, err := newPubSub(t, opts)
+			require.NoError(t, err)
+			require.Equal(t, c.want, ps.AskWindow(), "at %d Mbps", c.mbps)
+		}
+	})
+
+	t.Run("own chunks first", func(t *testing.T) {
+		// seacast.md §4.12's choose [X3]: the writer sends the node's own chunks first.
+		opts := append(append([]pubsub.Option{}, base...), segmentgossip.RouterOptions(setting, typ, gossipSubHeartbeatInterval, &segmentgossip.PathMetrics{})...)
+		ps, err := newPubSub(t, opts)
+		require.NoError(t, err)
+		require.Equal(t, true, ps.OwnChunksFirst(), "own chunks first")
+	})
+
 	t.Run("phase forwarding left out", func(t *testing.T) {
 		err := newRouter(t, append(append([]pubsub.Option{}, base...), path[1:]...))
 		require.ErrorContains(t, "WithPhaseForwarding", err)

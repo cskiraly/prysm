@@ -101,8 +101,9 @@ type PubSub struct {
 	queueHooks func(*rpcQueue)
 	// admitMsg, when set, decides whether a received message enters at all: at ingress, before
 	// Preprocess and validation, and again when validation finishes (SEACAST's gate,
-	// seacast_accept.go: a chunk of a group past its lifetime is ignored). processLoop goroutine.
-	admitMsg func(*Message) bool
+	// seacast_accept.go: a chunk of a group past its lifetime is ignored); validated says which of
+	// the two. processLoop goroutine.
+	admitMsg func(msg *Message, validated bool) bool
 	// onVerdict, when set, hears each non-local message's validation verdict (seacast_accept.go).
 	onVerdict func(src peer.ID, msg *Message, result ValidationResult)
 	// admitUnsubscribed, when set, admits a received message on a topic we neither subscribe to nor
@@ -365,9 +366,12 @@ type RPC struct {
 	repair bool
 	// asks is every ask id the writer writes with this RPC, lost ones included, for v0.5's E
 	// (specv05.go): set by the writer as it pops the RPC, read at the write. lostOnly marks an RPC
-	// whose asks a class loss took entirely: reported at the write, then nothing is written.
+	// whose asks a class loss took entirely: reported at the write, then nothing is written. popped is
+	// the pop's number in askSeq's order (rpc_queue.go): only an ask dispatched before it can be one
+	// this RPC carries.
 	asks     []string
 	lostOnly bool
+	popped   uint64
 }
 
 func (rpc *RPC) From() peer.ID {
@@ -1761,7 +1765,7 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 			}
 
 			msg := &Message{Message: pmsg, ID: "", ReceivedFrom: rpc.from, ValidatorData: nil, Local: false}
-			if p.admitMsg != nil && !p.admitMsg(msg) {
+			if p.admitMsg != nil && !p.admitMsg(msg, false) {
 				continue
 			}
 			if p.shouldPush(msg) {
@@ -1880,7 +1884,7 @@ func (p *PubSub) checkSigningPolicy(msg *Message) error {
 }
 
 func (p *PubSub) publishMessage(msg *Message) {
-	if !msg.Local && p.admitMsg != nil && !p.admitMsg(msg) {
+	if !msg.Local && p.admitMsg != nil && !p.admitMsg(msg, true) {
 		// Its group died while it was being validated: ignored, and the tracers that saw it enter
 		// validation see it end there.
 		p.tracer.RejectMessage(msg, RejectValidationIgnored)

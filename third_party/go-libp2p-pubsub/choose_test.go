@@ -9,6 +9,7 @@ import (
 	"time"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -126,6 +127,39 @@ func TestChooseKnownAnswer11(t *testing.T) {
 	})
 }
 
+// TestOwnChunksFirstReported: OwnChunksFirst reports WithOwnChunksFirst, and nothing without HAVE
+// bitmaps; and the rule reaches the writer of each peer's queue (haveQueue), with the router's
+// counter of its picks.
+func TestOwnChunksFirstReported(t *testing.T) {
+	p := peer.ID("p")
+	gs := testHaveRouter()
+	gs.seacast = &seacast{ctr: &SeacastCounters{}, expired: map[string]struct{}{}}
+	q := newRpcQueue(8)
+	ps := &PubSub{rt: gs, peers: map[peer.ID]*rpcQueue{p: q}}
+	gs.p = ps
+	if ps.OwnChunksFirst() {
+		t.Fatal("own chunks first reported before the option")
+	}
+	if err := WithOwnChunksFirst()(ps); err != nil {
+		t.Fatal(err)
+	}
+	if !ps.OwnChunksFirst() {
+		t.Fatal("own chunks first not reported after the option")
+	}
+	if (&PubSub{rt: &GossipSubRouter{}}).OwnChunksFirst() {
+		t.Fatal("own chunks first reported without HAVE bitmaps")
+	}
+	if gs.haveQueue(p) != q {
+		t.Fatal("the peer's queue was not found")
+	}
+	q.queueMu.Lock()
+	ownFirst, counter := q.have.ownFirst, q.have.ownPickCtr
+	q.queueMu.Unlock()
+	if !ownFirst || counter != &gs.have.ownPicks {
+		t.Fatalf("the peer's writer: own first %v, the router's pick counter %v; want both", ownFirst, counter == &gs.have.ownPicks)
+	}
+}
+
 // TestOwnAtEnqueue: what the router marks own. Publish marks a message received from ourselves and
 // not rebuilt; a batch marks an RPC whose every message is not rebuilt; WithRebuiltPublication sets
 // the mark the two read.
@@ -159,6 +193,66 @@ func TestOwnAtEnqueue(t *testing.T) {
 	if c := shallowRPCCopy(&RPC{own: true, solicited: false}); !c.own {
 		t.Fatal("own survives the dispatch-time copy")
 	}
+}
+
+// TestOwnChunkOnChunkTopics: only a chunk is our own (§4.12's own_chunk). A message we publish on a
+// type's topic or on the phase path's is; one on any other topic (a block, an attestation) is not,
+// so the writer keeps it in the queue's order. Nor is a rebuilt chunk, or a message from a peer. A
+// batch's messages that are not our own chunks are the ones ownBatch refuses.
+func TestOwnChunkOnChunkTopics(t *testing.T) {
+	synctestTest(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		const typeTopic, phaseTopic, stockTopic = "seg/col/0", "phase/0", "beacon_block"
+		hosts := getDefaultHosts(t, 1)
+		psubs := getGossipsubsOptFn(ctx, hosts, func(int, host.Host) []Option {
+			T := &testObjectType{name: "col", params: TypeParams{RNode: 2}, topics: []string{typeTopic}}
+			return []Option{
+				WithMessageSignaturePolicy(StrictNoSign), WithNoAuthor(),
+				WithMessageIdFn(seacastTestID), WithHaveBitmaps(seacastTestIndex), WithHaveAnnounceBitmaps(),
+				WithPhaseForwarding(func(topic string) bool { return strings.HasPrefix(topic, "phase/") }, 2),
+				WithSeacast([]ObjectType{T}, nil), WithOwnChunksFirst(),
+			}
+		})
+		gs := psubs[0].rt.(*GossipSubRouter)
+		self := hosts[0].ID()
+		msg := func(topic string, from peer.ID, rebuilt bool) *Message {
+			return &Message{Message: &pb.Message{Topic: &topic, Data: []byte(topic)}, ReceivedFrom: from, rebuilt: rebuilt}
+		}
+		onType, onPhase, stock := msg(typeTopic, self, false), msg(phaseTopic, self, false), msg(stockTopic, self, false)
+		rebuilt, fromPeer := msg(typeTopic, self, true), msg(typeTopic, peer.ID("other"), false)
+		done := make(chan struct{})
+		gs.p.eval <- func() {
+			defer close(done)
+			for _, c := range []struct {
+				name string
+				m    *Message
+				want bool
+			}{
+				{"our chunk on a type's topic", onType, true},
+				{"our chunk on the phase path", onPhase, true},
+				{"our stock message", stock, false},
+				{"a chunk we rebuilt", rebuilt, false},
+				{"a peer's chunk", fromPeer, false},
+			} {
+				if got := gs.ownChunk(c.m); got != c.want {
+					t.Errorf("%s: own %v, want %v", c.name, got, c.want)
+				}
+			}
+			notOwn := gs.notOwnChunks([]*Message{onType, onPhase, stock, rebuilt})
+			if len(notOwn) != 2 || !notOwn[stock.Message] || !notOwn[rebuilt.Message] {
+				t.Errorf("a batch's messages not our own: %d, stock %v, rebuilt %v; want the stock and the rebuilt",
+					len(notOwn), notOwn[stock.Message], notOwn[rebuilt.Message])
+			}
+			if !ownBatch(&RPC{RPC: pb.RPC{Publish: []*pb.Message{onType.Message, onPhase.Message}}}, notOwn) {
+				t.Error("a batch RPC of our chunks is own")
+			}
+			if ownBatch(&RPC{RPC: pb.RPC{Publish: []*pb.Message{onType.Message, stock.Message}}}, notOwn) {
+				t.Error("a batch RPC with a stock message is not own")
+			}
+		}
+		<-done
+	})
 }
 
 // kaCellBytes is a cell's data bytes in the selector test's queues.

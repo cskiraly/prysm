@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -20,26 +21,15 @@ import (
 // (reconsider). Without the option nothing here runs.
 
 const (
-	seacastCollecting uint8 = iota
-	seacastComplete
-	seacastDecoding
-	seacastInvalid
+	seacastCollecting = core.Collecting
+	seacastComplete   = core.Complete
+	seacastDecoding   = core.Decoding
+	seacastInvalid    = core.Invalid
 )
 
-// seacastGroup is one group's state. Router goroutine.
-type seacastGroup struct {
-	state    uint8
-	stopPull bool
-	// reconsiderAt is the armed later duty's instant; zero when none is armed.
-	reconsiderAt time.Time
-	// probe is the group's one deferral on a claim (seacast_claims.go).
-	probe *seacastProbe
-	// decodeOp names the group's decode in flight; a result for another is stale. decodeHeld is the
-	// held count its snapshot took; decodedOK that a decode from K held installed (seacast_order.go).
-	decodeOp   uint64
-	decodeHeld int
-	decodedOK  bool
-}
+// seacastGroup is one group's state in the core's machine (seacast/machine.go). Its Ext is the
+// group's one deferral on a claim (seacast_claims.go). Router goroutine.
+type seacastGroup = core.Group[*seacastProbe]
 
 // WithSeacastMachine runs part 4's group machine on the path (seacast_complete.go). Requires
 // WithSeacast first.
@@ -50,156 +40,101 @@ func WithSeacastMachine() Option {
 			return fmt.Errorf("the group machine requires WithSeacast first")
 		}
 		gs.seacast.machine = true
-		gs.seacast.groups = make(map[string]*seacastGroup)
+		gs.seacast.gm = core.NewMachine[*seacastProbe]()
 		return nil
 	}
 }
 
+// seacastGID is the machine's key for root: the payload group's GroupID (seacast_wire.go), or, for
+// a root of another length, which the path never names, the root itself as an opaque key.
+func seacastGID(root string) core.GroupID {
+	if g, ok := seacastGroupID(root); ok {
+		return g
+	}
+	return core.GroupID(root)
+}
+
+// seacastGIDRoot is the root a machine key names, seacastGID's inverse.
+func seacastGIDRoot(g core.GroupID) string {
+	if root, ok := seacastRootOf(g); ok {
+		return root
+	}
+	return string(g)
+}
+
 // groupOf is root's state, made on first use. Router goroutine.
-func (sc *seacast) groupOf(root string) *seacastGroup {
-	g := sc.groups[root]
-	if g == nil {
-		g = &seacastGroup{}
-		sc.groups[root] = g
+func (sc *seacast) groupOf(root string) *seacastGroup { return sc.gm.Group(seacastGID(root)) }
+
+// group is root's state; nil when it has none or the machine is off. Router goroutine.
+func (sc *seacast) group(root string) *seacastGroup {
+	if sc.gm == nil {
+		return nil
 	}
-	return g
+	return sc.gm.Lookup(seacastGID(root))
 }
 
-// seacastInterestSatisfied is §1.5's interest_satisfied: K distinct chunks for an interest of every
-// index (a group with a code), else every wanted index held. Router goroutine.
-func (gs *GossipSubRouter) seacastInterestSatisfied(T ObjectType, root string, want *haveBits) bool {
-	var held *haveBits
-	if m := gs.have.mine[root]; m != nil {
-		held = &m.bits
+// forgetGroup drops root's state. Router goroutine.
+func (sc *seacast) forgetGroup(root string) {
+	if sc.gm != nil {
+		sc.gm.Forget(seacastGID(root))
 	}
-	if held == nil {
-		return false
-	}
-	n := T.IndexCount(root)
-	if want.Count() >= n {
-		return held.Count() >= T.Threshold(root)
-	}
-	for i := range n {
-		idx := uint32(i) // lint:ignore uintcast -- an index below the group's count.
-		if want.Has(idx) && !held.Has(idx) {
-			return false
-		}
-	}
-	return true
 }
 
-// seacastCheckCompletion is check_completion(g) for a path group, after a chunk of it was accepted
-// or filled: the group completes, stops its asks, closes its promises, and either decodes at once or
-// arms its later duty. The holding the caller sends next carries the new claims. Router goroutine.
+// seacastCheckCompletion is check_completion(g) for a path group (the core's
+// Machine.CheckCompletion), after a chunk of it was accepted or filled. Router goroutine.
 func (gs *GossipSubRouter) seacastCheckCompletion(T ObjectType, root string) {
 	sc := gs.seacast
 	if sc == nil || !sc.machine || gs.have == nil {
 		return
 	}
-	g := sc.groupOf(root)
-	if g.state != seacastCollecting {
-		return
-	}
-	want := gs.seacastInterestOfPeer(gs.p.host.ID(), root)
-	if want == nil || want.Count() == 0 || !gs.seacastInterestSatisfied(T, root, want) {
-		return
-	}
-	g.stopPull = true
-	sc.ctr.GroupsCompleted.Add(1)
-	gs.seacastDropQueuedAsks(root)
-	p := T.Params()
-	if p.DecodeAtK != nil && p.DecodeAtK(root) {
-		g.state = seacastDecoding
-	} else {
-		g.state = seacastComplete
-		if p.DecodeLater != nil {
-			if d, ok := p.DecodeLater(root); ok {
-				at, known := sc.knownAt[root]
-				if !known {
-					at = time.Now()
-				}
-				gs.seacastArm(root, at.Add(d))
-			}
-		}
-	}
-	gs.seacastClosePromises(root)
-	if g.state == seacastDecoding {
-		gs.seacastStartDecode(T, root)
-	}
+	sc.gm.CheckCompletion(gs.seacastEnv(T), seacastGID(root))
 }
 
-// seacastArm is arm(g, at): a later duty that fires at at unless re-armed or the group was taken up
-// meanwhile. The timer is made on the router's goroutine and comes back through eval.
+// seacastArm is arm(g, at) (the core's Machine.Arm): the timer comes back through eval as
+// seacastReconsider. Router goroutine.
 func (gs *GossipSubRouter) seacastArm(root string, at time.Time) {
-	g := gs.seacast.groupOf(root)
-	g.reconsiderAt = at
-	gs.seacast.ctr.DutiesArmed.Add(1)
-	time.AfterFunc(max(0, time.Until(at)), func() {
-		select {
-		case gs.p.eval <- func() { gs.seacastReconsider(root, at) }:
-		case <-gs.p.ctx.Done():
-		}
-	})
+	gs.seacast.gm.Arm(gs.seacastEnv(nil), seacastGID(root), at)
 }
 
-// seacastReconsider is reconsider(g, at): a stale or re-armed timer, or a group no longer COMPLETE,
-// does nothing; a group whole in the node's holdings needs nothing rebuilt; then the views and the
-// claims in the draft's order (seacastReconsiderVerdict); otherwise the late
-// decode claim, as at K. Router goroutine.
+// seacastReconsider is reconsider(g, at) (the core's Machine.Reconsider). Router goroutine.
 func (gs *GossipSubRouter) seacastReconsider(root string, at time.Time) {
-	sc := gs.seacast
-	g := sc.groups[root]
-	if g == nil || !g.reconsiderAt.Equal(at) || g.state != seacastComplete {
+	if gs.seacast.gm == nil {
 		return
 	}
-	g.reconsiderAt = time.Time{}
-	T := gs.seacastRootType(root)
-	if T == nil {
-		return
-	}
-	gs.seacastProbeVerdict(root, g) // (R5) the verdict on the claimant, once, before anything returns
-	if m := gs.have.mine[root]; m != nil && m.bits.Count() >= T.IndexCount(root) {
-		sc.ctr.DutiesCancelled.Add(1)
-		return
-	}
-	if gs.seacastReconsiderVerdict(T, root, g) {
-		return // the views and the claims (seacast_claims.go)
-	}
-	if gs.seacastKnownInScope(T, root).Count() >= T.IndexCount(root) {
-		sc.ord(ordDecodeWhole) // a late decode of a group whole in the subnet's view (seacast_order.go)
-	}
-	g.state = seacastDecoding
-	sc.ctr.LateDecodes.Add(1)
-	sc.event(SeacastEvLateDecode, root)
-	gs.seacastSendHolding(T, root)
-	gs.seacastStartDecode(T, root)
-}
-
-// seacastStartDecode starts decode_group (§4.6) for root, off the router's goroutine
-// (seacast_decode.go). Router goroutine.
-func (gs *GossipSubRouter) seacastStartDecode(T ObjectType, root string) {
-	gs.seacast.ctr.DecodesStarted.Add(1)
-	gs.seacastDecodeStart(T, root)
+	gs.seacast.gm.Reconsider(gs.seacastEnv(gs.seacastRootType(root)), seacastGID(root), at)
 }
 
 // seacastSendHolding sends root's holding, with its claims, to the group's suppression scope (the
-// topic's mesh on v0.3's wire), as an acceptance's holding goes. Router goroutine.
+// topic's mesh on v0.3's wire), as an acceptance's holding goes (seacastHoldingID). Router goroutine.
 func (gs *GossipSubRouter) seacastSendHolding(T ObjectType, root string) {
 	topic, ok := T.TopicOf(root)
-	if !ok || gs.have == nil {
+	if !ok {
 		return
 	}
-	m := gs.have.mine[root]
-	if m == nil {
+	id, ok := gs.seacastHoldingID(root)
+	if !ok {
 		return
 	}
-	id := gs.seacastEncodeHave(root, &m.bits, false)
 	for p := range gs.mesh[topic] {
 		if gs.feature(GossipSubFeatureIdontwant, gs.peers[p]) {
 			gs.sendRPC(p, rpcWithControl(nil, nil, nil, nil, nil, []*pb.ControlIDontWant{{MessageIDs: []string{id}}}), true)
 		}
 	}
 	gs.seacast.ctr.HoldingsSent.Add(1)
+}
+
+// seacastHoldingID is the holding seacastSendHolding sends for a group the node holds: its bitmap is
+// have_bits (haveBitsFor), so for a group the node publishes, the chunks acknowledged so far, not
+// what it holds. ok is false when nothing goes: no group held, or none of it acknowledged.
+func (gs *GossipSubRouter) seacastHoldingID(root string) (id string, ok bool) {
+	if gs.have == nil || gs.have.mine[seacastGID(root)] == nil {
+		return "", false
+	}
+	bits := gs.have.haveBitsFor(root)
+	if bits == nil {
+		return "", false
+	}
+	return gs.seacastEncodeHave(root, bits, false), true
 }
 
 // seacastClosePromises is close_promises_of_group(g): nobody owes us chunks of a completed group.
@@ -212,6 +147,11 @@ func (gs *GossipSubRouter) seacastClosePromises(root string) {
 		gs.gossipTracer.fulfillPromisesWhere(func(mid string) bool { return gs.seacastAskRoot(mid) == root })
 	}
 	if gs.iwantPromised == nil {
+		return
+	}
+	if gs.pullOn() {
+		// A chunk's promises are the core's (seacast_pull.go).
+		gs.seacast.ctr.PromisesClosed.Add(int64(gs.pull.promises.CloseGroup(seacastGID(root))))
 		return
 	}
 	for mid := range gs.iwantPromised {
@@ -282,8 +222,8 @@ func (gs *GossipSubRouter) seacastGated(mid string) bool {
 	if !ok {
 		return false
 	}
-	g := sc.groups[root]
-	if g == nil || !g.stopPull {
+	g := sc.group(root)
+	if g == nil || !g.StopPull {
 		return false
 	}
 	if sc.seacastProbeExempt(mid, root, index) {
@@ -302,11 +242,38 @@ func (gs *GossipSubRouter) seacastStopPulled(mid string) bool {
 		return false
 	}
 	root, _, ok := gs.seacastAskCell(mid)
+	return ok && gs.seacastStopPulledRoot(root)
+}
+
+// seacastStopPulledRoot says whether root's group stopped pulling at its completion. Router goroutine.
+func (gs *GossipSubRouter) seacastStopPulledRoot(root string) bool {
+	sc := gs.seacast
+	if sc == nil || !sc.machine || gs.have == nil {
+		return false
+	}
+	g := sc.group(root)
+	return g != nil && g.StopPull
+}
+
+// seacastUnauthenticable says whether mid is a chunk of a registered group whose gate is closed: no
+// installed block's bid commits it yet (seacast-lite.md §4.4's authenticable, §3, "the block first").
+// Its offer is recorded and not asked; the gate's opening asks for it from the ledger
+// (seacastOpenGate). With the chunk pull off there is no ledger, and the offer is asked as before.
+// Router goroutine.
+func (gs *GossipSubRouter) seacastUnauthenticable(mid string) bool {
+	if gs.seacast == nil || !gs.pullOn() {
+		return false
+	}
+	root, _, ok := gs.seacastAskCell(mid)
 	if !ok {
 		return false
 	}
-	g := sc.groups[root]
-	return g != nil && g.stopPull
+	T := gs.seacastRootOwner(root)
+	if T == nil || T.HeaderKnown(root) {
+		return false
+	}
+	gs.seacast.noteGateMet(root) // the gate's opening asks for it (seacastOpenGate)
+	return true
 }
 
 // requestAllowed is the request check every ask passes: the machine's stop_pull. Without the

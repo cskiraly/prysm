@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
@@ -41,9 +42,13 @@ type pacedTopicIDs struct {
 
 type pacedGossip struct {
 	tick, minAge time.Duration
-	queue        []pacedJob
-	born         map[string]time.Time
-	started      bool
+	// skipHeld passes over, within the same tick, a typed job whose every id the peer holds or has
+	// declined (WithPacedGossipSkipHeld); without it such a job spends its tick (seacast-lite.md
+	// §6.4's on_pace_tick).
+	skipHeld bool
+	queue    []pacedJob
+	born     map[string]time.Time
+	started  bool
 
 	released, dropped, deferred, emptied atomic.Int64
 }
@@ -60,6 +65,21 @@ func WithPacedGossip(tick, minAge time.Duration) Option {
 			return fmt.Errorf("paced gossip needs a positive tick and a non-negative minimum age")
 		}
 		gs.paced = &pacedGossip{tick: tick, minAge: minAge, born: make(map[string]time.Time)}
+		return nil
+	}
+}
+
+// WithPacedGossipSkipHeld passes over, within the same tick, a typed job (the path's gossip, one per
+// peer) whose every id the peer holds or has declined by the tick, so that the next job goes out in
+// that tick. Without it, as seacast-lite.md §6.4's on_pace_tick does, such a job spends its tick and
+// offers nothing. Requires WithPacedGossip, given before it.
+func WithPacedGossipSkipHeld() Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok || gs.paced == nil {
+			return fmt.Errorf("passing over held paced jobs requires paced gossip, given before it")
+		}
+		gs.paced.skipHeld = true
 		return nil
 	}
 }
@@ -159,13 +179,14 @@ func (gs *GossipSubRouter) releaseGossip() {
 
 // nextPaced takes the next job to release and the ids it may offer now: jobs older than a
 // heartbeat or to a peer gone are dropped, ids the peer holds are left out, and a job with
-// nothing old enough yet goes to the back and ends the tick.
+// nothing old enough yet goes to the back and ends the tick. A typed job left with nothing ends
+// the tick too, unless WithPacedGossipSkipHeld passes it over.
 func (gs *GossipSubRouter) nextPaced(now time.Time) (pacedJob, []string, bool) {
 	pg := gs.paced
 	for len(pg.queue) > 0 {
 		j := pg.queue[0]
 		pg.queue = pg.queue[1:]
-		if now.Sub(j.at) >= gs.params.HeartbeatInterval {
+		if core.PaceStale(j.at, now, gs.params.HeartbeatInterval) {
 			pg.dropped.Add(1)
 			continue
 		}
@@ -204,6 +225,9 @@ func (gs *GossipSubRouter) nextPaced(now time.Time) (pacedJob, []string, bool) {
 				return pacedJob{}, nil, false
 			}
 			pg.emptied.Add(1)
+			if !pg.skipHeld {
+				return pacedJob{}, nil, false // the job spends its tick, offering nothing (on_pace_tick)
+			}
 			continue
 		}
 		mids := make([]string, 0, len(j.mids))

@@ -10,6 +10,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	core "github.com/cskiraly/seacast-go"
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-pubsub/timecache"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -234,6 +235,45 @@ func TestSpecV05OwedAtFullQueue(t *testing.T) {
 	}
 	if on != 8 || ctr.Unpushed.Load() == 0 || ctr.OwedSent.Load() == 0 {
 		t.Fatalf("with A′ the receiver should get all 8 through the owed offers, got %d", on)
+	}
+}
+
+// TestSpecV05OweLeavesPushed: what is owed to a peer names no index recorded as pushed to it. A
+// bitmap the queue refuses after a push of one of its indices (PublishBatch plans its RPCs before
+// it serves standing answers) owes the others alone, and one of pushed indices alone owes nothing,
+// as the spec's with_owed takes pushed out at the write.
+func TestSpecV05OweLeavesPushed(t *testing.T) {
+	root, topic := strings.Repeat("o", haveRootLen), "seg/col/0"
+	gs := testHaveRouter()
+	gs.v05 = &specV05{SpecV05: SpecV05{OfferSkipped: true}, ctr: &SpecV05Counters{}}
+	p := peer.ID("p")
+	q := newRpcQueue(16)
+	gs.p = &PubSub{peers: map[peer.ID]*rpcQueue{p: q}}
+	e, _ := gs.have.pushed.Entry(p, seacastGID(root))
+	e.Bits.Set(3)
+	e.TTL = gs.have.pushTTL
+	refuse := func(idx ...uint32) {
+		var b haveBits
+		for _, i := range idx {
+			b.Set(i)
+		}
+		gs.oweRefused(p, q, &RPC{RPC: pb.RPC{Control: &pb.ControlMessage{Ihave: []*pb.ControlIHave{{TopicID: &topic, MessageIDs: []string{encodeHave(root, &b)}}}}}})
+	}
+	owed := func() []uint32 {
+		q.queueMu.Lock()
+		defer q.queueMu.Unlock()
+		if g := q.owed[root]; g != nil {
+			return g.bits.Indices()
+		}
+		return nil
+	}
+	refuse(3)
+	if got := owed(); len(got) != 0 || gs.v05.ctr.OffersOwed.Load() != 0 {
+		t.Fatalf("a refused bitmap of a pushed index owes %v (counted %d); want nothing", got, gs.v05.ctr.OffersOwed.Load())
+	}
+	refuse(3, 4)
+	if got := owed(); len(got) != 1 || got[0] != 4 || gs.v05.ctr.OffersOwed.Load() != 1 {
+		t.Fatalf("a refused bitmap of 3 (pushed) and 4 owes %v (counted %d); want [4] (1)", got, gs.v05.ctr.OffersOwed.Load())
 	}
 }
 
@@ -583,7 +623,7 @@ func TestSpecV05WriterEdges(t *testing.T) {
 	t.Run("under E an IWANT loss is drawn at the writer", func(t *testing.T) {
 		q := newRpcQueue(4)
 		var reported []string
-		q.onAsks = func(mids []string, _ time.Time) { reported = append(reported, mids...) }
+		q.onAsks = func(mids []string, _ uint64, _ time.Time) { reported = append(reported, mids...) }
 		q.askLoss = func(ids []string) (kept, lost []string) {
 			for _, id := range ids {
 				if id == "lost" {
@@ -713,7 +753,7 @@ func TestSpecV05RejectAfterValidation(t *testing.T) {
 	tr := &v05RejectTracer{}
 	delivered := false
 	p := &PubSub{
-		admitMsg: func(*Message) bool { return false },
+		admitMsg: func(*Message, bool) bool { return false },
 		tracer:   &pubsubTracer{raw: []RawTracer{tr}, pid: "self"},
 		idGen:    newMsgIdGenerator(),
 	}
@@ -733,13 +773,14 @@ func TestSpecV05RejectAfterValidation(t *testing.T) {
 	}
 }
 
-// TestSpecV05LostAskAfterSendDelay: under E an ask lost on the wire opens its promise when it is
-// written, after the writer's send delay. The asker writes every RPC 600 ms late and loses 99 % of
-// its asks; the source offers it seven chunks. As measured the lost asks' promises run from the
-// decision and park the source within 0.8 s; with E they run from the write, which comes later.
+// TestSpecV05LostAskAfterSendDelay: an ask of a chunk lost on the wire opens its promise when it is
+// written, after the writer's send delay (seacast_pull.go; E for the score's). The asker writes every
+// RPC 600 ms late and loses 99 % of its asks; the source offers it seven chunks. The lost asks'
+// promises run from the write, so nobody is parked within 0.8 s, and the source is by 3.8 s. Before
+// the chunk pull, without E, they ran from the decision and parked the source within 0.8 s.
 func TestSpecV05LostAskAfterSendDelay(t *testing.T) {
 	root := strings.Repeat("s", 32)
-	run := func(t *testing.T, on bool) (early, late int64) {
+	run := func(t *testing.T) (early, late int64) {
 		var parks atomic.Int64
 		synctestTest(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -749,11 +790,8 @@ func TestSpecV05LostAskAfterSendDelay(t *testing.T) {
 				if i == 0 {
 					return append(v05Base(nil), WithPhaseSourcePushQuota(1))
 				}
-				opts := append(v05Base(&parks), WithRPCClassLoss("iwant", 99, 11, nil), WithSendDelay(600*time.Millisecond))
-				if on {
-					opts = append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, nil))
-				}
-				return opts
+				return append(v05Base(&parks), WithRPCClassLoss("iwant", 99, 11, nil), WithSendDelay(600*time.Millisecond),
+					WithSpecV05(SpecV05{PromiseAtWrite: true}, nil))
 			})
 			topics := v05Join(t, psubs)
 			newV05Collect(ctx, t, topics)
@@ -775,25 +813,62 @@ func TestSpecV05LostAskAfterSendDelay(t *testing.T) {
 		})
 		return early, late
 	}
-	offEarly, offLate := run(t, false)
-	onEarly, onLate := run(t, true)
-	t.Logf("parks by 0.8 s and by 3.8 s: as measured %d, %d; with E %d, %d", offEarly, offLate, onEarly, onLate)
-	if offEarly == 0 {
-		t.Fatal("known answer: as measured a lost ask's promise runs from the decision and parks the source within 0.8 s")
+	early, late := run(t)
+	t.Logf("parks by 0.8 s and by 3.8 s: %d, %d", early, late)
+	if early != 0 || late == 0 {
+		t.Fatalf("the lost asks' promises run from the write, after the send delay: %d parks by 0.8 s, %d by 3.8 s", early, late)
 	}
-	if onEarly != 0 || onLate == 0 {
-		t.Fatalf("with E the lost asks' promises run from the write, after the send delay: %d parks by 0.8 s, %d by 3.8 s", onEarly, onLate)
+}
+
+// TestSpecV05LostAskWithoutE: TestSpecV05LostAskAfterSendDelay's case without E, where the asks' loss is
+// drawn at the dispatch, before the queue. A chunk's lost ask counts as written and lost: its promise
+// opens and its queued record closes, so the lost asks' promises break and park the source. Were the
+// lost asks left queued, the source would stay outstanding for them, never promised, and nobody would be
+// parked.
+func TestSpecV05LostAskWithoutE(t *testing.T) {
+	root := strings.Repeat("w", 32)
+	var parks atomic.Int64
+	synctestTest(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		hosts := v05Hosts(t, 2, 20, time.Millisecond)
+		psubs := getGossipsubsOptFn(ctx, hosts, func(i int, _ host.Host) []Option {
+			if i == 0 {
+				return append(v05Base(nil), WithPhaseSourcePushQuota(1))
+			}
+			return append(v05Base(&parks), WithRPCClassLoss("iwant", 99, 11, nil), WithSendDelay(600*time.Millisecond),
+				WithSpecV05(SpecV05{}, nil))
+		})
+		topics := v05Join(t, psubs)
+		newV05Collect(ctx, t, topics)
+		connectAll(t, hosts)
+		time.Sleep(8 * time.Second)
+		var batch MessageBatch
+		for i := byte(0); i < 8; i++ {
+			if err := topics[0].AddToBatch(ctx, &batch, v05Frame(root, i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := psubs[0].PublishBatch(&batch); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(3800 * time.Millisecond)
+	})
+	t.Logf("parks by 3.8 s: %d", parks.Load())
+	if parks.Load() == 0 {
+		t.Fatal("the asks lost at the dispatch opened no promise: nobody parked by 3.8 s")
 	}
 }
 
 // TestSpecV05LastResort is F2: a slow answer parks a node's only provider. The provider publishes
 // a group one frame every 300 ms, pushes the receiver its first (push quota 1) and offers the rest,
 // and answers every ask 600 ms late. The receiver's first promises break and park the provider for
-// the group, so it ignores the later offers and stays short; under B′ the last resort asks the
-// parked provider once more, and the receiver completes.
+// the group, so it passes over the later offers; the last resort asks the parked provider once more
+// (seacast_pull.go), and the receiver completes. Before the chunk pull, without B′, it stayed short of
+// 4 frames.
 func TestSpecV05LastResort(t *testing.T) {
 	root := strings.Repeat("b", 32)
-	run := func(t *testing.T, on bool) (got int, parked int64, ctr *SpecV05Counters) {
+	run := func(t *testing.T) (got int, parked int64, ctr *SpecV05Counters) {
 		ctr = &SpecV05Counters{}
 		var parks atomic.Int64
 		synctestTest(t, func(t *testing.T) {
@@ -807,10 +882,7 @@ func TestSpecV05LastResort(t *testing.T) {
 				} else {
 					opts = v05Base(&parks)
 				}
-				if on {
-					opts = append(opts, WithSpecV05(SpecV05{LastResort: true}, ctr))
-				}
-				return opts
+				return append(opts, WithSpecV05(SpecV05{}, ctr))
 			})
 			topics := v05Join(t, psubs)
 			c := newV05Collect(ctx, t, topics)
@@ -827,25 +899,25 @@ func TestSpecV05LastResort(t *testing.T) {
 		})
 		return got, parks.Load(), ctr
 	}
-	off, offParks, _ := run(t, false)
-	on, onParks, ctr := run(t, true)
-	t.Logf("frames at the receiver: %d as measured (%d parks), %d with B′ (%d parks; last resorts armed %d, asks %d, to parked %d)",
-		off, offParks, on, onParks, ctr.LastResortsArmed.Load(), ctr.LastResortAsks.Load(), ctr.ParkedAsked.Load())
-	if off >= 4 || offParks == 0 {
-		t.Fatalf("known answer: without B′ the parked provider should leave the receiver short of 4, got %d frames, %d parks", off, offParks)
+	got, parks, ctr := run(t)
+	t.Logf("frames at the receiver: %d (%d parks; last resorts armed %d, asks %d, to parked %d)",
+		got, parks, ctr.LastResortsArmed.Load(), ctr.LastResortAsks.Load(), ctr.ParkedAsked.Load())
+	if parks == 0 {
+		t.Fatalf("the provider should be parked, got %d parks", parks)
 	}
-	if on < 4 || ctr.ParkedAsked.Load() == 0 {
-		t.Fatalf("with B′ the receiver should complete through the last resort, got %d frames, %d parked asks", on, ctr.ParkedAsked.Load())
+	if got < 4 || ctr.ParkedAsked.Load() == 0 {
+		t.Fatalf("the receiver should complete through the last resort, got %d frames, %d parked asks", got, ctr.ParkedAsked.Load())
 	}
 }
 
 // TestSpecV05PromiseAtWrite is F5: a peer parked for an ask it never received. The asker's own
 // pushes hold its one-slot window, which the muted peer never acknowledges, so its ask waits
-// behind them until the slot times out at 1.5 s. Decided at once, the promise breaks at 400 ms
-// and parks the peer that is about to answer; started at the write (E), it is kept.
+// behind them until the slot times out at 1.5 s. Started at the write (seacast_pull.go), the promise
+// is kept and the asker gets every frame. Before the chunk pull, without E, it started at the
+// decision, broke at 400 ms and parked the peer about to answer.
 func TestSpecV05PromiseAtWrite(t *testing.T) {
 	asker, source := strings.Repeat("c", 32), strings.Repeat("d", 32)
-	run := func(t *testing.T, on bool) (got int, parked int64, ctr *SpecV05Counters) {
+	run := func(t *testing.T) (got int, parked int64, ctr *SpecV05Counters) {
 		ctr = &SpecV05Counters{}
 		var parks atomic.Int64
 		synctestTest(t, func(t *testing.T) {
@@ -860,10 +932,7 @@ func TestSpecV05PromiseAtWrite(t *testing.T) {
 				} else { // the muted source: never acknowledges the asker's frames
 					opts = append(v05Base(nil), WithPhaseSourcePushQuota(1), WithControlMute(nil))
 				}
-				if on {
-					opts = append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, ctr))
-				}
-				return opts
+				return append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, ctr))
 			})
 			topics := v05Join(t, psubs)
 			c := newV05Collect(ctx, t, topics)
@@ -895,27 +964,23 @@ func TestSpecV05PromiseAtWrite(t *testing.T) {
 		})
 		return got, parks.Load(), ctr
 	}
-	off, offParks, _ := run(t, false)
-	on, onParks, ctr := run(t, true)
-	t.Logf("as measured: %d frames, %d parks; with E: %d frames, %d parks (promises opened at the write %d)",
-		off, offParks, on, onParks, ctr.PromisesAtWrite.Load())
-	if offParks == 0 {
-		t.Fatal("known answer: a promise from the decision should break while the ask waits, and park the source")
+	got, parks, ctr := run(t)
+	t.Logf("%d frames, %d parks (promises opened at the write %d)", got, parks, ctr.PromisesAtWrite.Load())
+	if parks != 0 || ctr.PromisesAtWrite.Load() == 0 {
+		t.Fatalf("no park for an ask that had not left: %d parks, %d promises at the write", parks, ctr.PromisesAtWrite.Load())
 	}
-	if onParks != 0 || ctr.PromisesAtWrite.Load() == 0 {
-		t.Fatalf("with E no park for an ask that had not left: %d parks, %d promises at the write", onParks, ctr.PromisesAtWrite.Load())
-	}
-	if on != 8 {
-		t.Fatalf("with E the asker should still get the source's 8 frames, got %d", on)
+	if got != 8 {
+		t.Fatalf("the asker should get the source's 8 frames, got %d", got)
 	}
 }
 
 // TestSpecV05CloseWithConn: a promise open when its connection closes goes with it, and parks
-// nobody. The receiver asks a provider that never answers, and the connection closes before the
-// promise falls due.
+// nobody (seacast_pull.go). The receiver asks a provider that never answers, and the connection closes
+// before the promise falls due. Before the chunk pull, without the rule, the promises fell due after
+// the close and parked the provider.
 func TestSpecV05CloseWithConn(t *testing.T) {
 	root := strings.Repeat("e", 32)
-	run := func(t *testing.T, on bool) (parked int64, ctr *SpecV05Counters) {
+	run := func(t *testing.T) (parked int64, ctr *SpecV05Counters) {
 		ctr = &SpecV05Counters{}
 		var parks atomic.Int64
 		synctestTest(t, func(t *testing.T) {
@@ -929,11 +994,8 @@ func TestSpecV05CloseWithConn(t *testing.T) {
 				} else {
 					opts = v05Base(&parks)
 				}
-				if on {
-					// E on as well: the writer's late reports must not reopen what the close closed.
-					opts = append(opts, WithSpecV05(SpecV05{CloseWithConn: true, PromiseAtWrite: true}, ctr))
-				}
-				return opts
+				// E on: the writer's late reports must not reopen what the close closed.
+				return append(opts, WithSpecV05(SpecV05{PromiseAtWrite: true}, ctr))
 			})
 			topics := v05Join(t, psubs)
 			newV05Collect(ctx, t, topics)
@@ -956,14 +1018,10 @@ func TestSpecV05CloseWithConn(t *testing.T) {
 		})
 		return parks.Load(), ctr
 	}
-	offParks, _ := run(t, false)
-	onParks, ctr := run(t, true)
-	t.Logf("parks: %d as measured, %d with the connection rule (promises closed with it %d)", offParks, onParks, ctr.ClosedPromises.Load())
-	if offParks == 0 {
-		t.Fatal("known answer: the open promises should fall due after the close and park the provider")
-	}
-	if onParks != 0 || ctr.ClosedPromises.Load() == 0 {
-		t.Fatalf("with the rule the promises close with the connection: %d parks, %d closed", onParks, ctr.ClosedPromises.Load())
+	parks, ctr := run(t)
+	t.Logf("parks: %d (promises closed with the connection %d)", parks, ctr.ClosedPromises.Load())
+	if parks != 0 || ctr.ClosedPromises.Load() == 0 {
+		t.Fatalf("the promises close with the connection: %d parks, %d closed", parks, ctr.ClosedPromises.Load())
 	}
 }
 
@@ -983,25 +1041,26 @@ func TestPromiseAtWriteAfterClose(t *testing.T) {
 		gs := newParkRouter(true)
 		gs.p = &PubSub{eval: make(chan func(), 16), ctx: ctx, seenMessages: seen}
 		gs.iwantAsked = make(map[string]time.Time)
+		gs.offerTable = make(map[string]map[peer.ID]time.Time) // with the park per group: the core pulls chunks
 		gs.parkPromise = 400 * time.Millisecond
 		gs.v05 = &specV05{SpecV05: SpecV05{PromiseAtWrite: true}, ctr: &SpecV05Counters{}}
 		gs.have = newHaveState(testIndex)
-		gs.have.mine[root] = &haveEntry{}
-		gs.have.mine[root].bits.Set(1) // rebuilt by the decode: held, its content id not in the seen cache
+		gs.have.mine[seacastGID(root)] = &core.Holding{}
+		gs.have.mine[seacastGID(root)].Bits.Set(1) // rebuilt by the decode: held, its content id not in the seen cache
 		if path {
-			gs.seacast = &seacast{ctr: &SeacastCounters{}, machine: true,
-				groups: map[string]*seacastGroup{done: {state: seacastComplete, stopPull: true}}}
+			gs.seacast = &seacast{ctr: &SeacastCounters{}, machine: true, gm: core.NewMachine[*seacastProbe]()}
+			gs.seacast.gm.Put(seacastGID(done), &seacastGroup{State: seacastComplete, StopPull: true})
 		}
 		return gs
 	}
-	opened := func(gs *GossipSubRouter, mid string) bool { _, ok := gs.iwantPromised[mid][p]; return ok }
+	opened := func(gs *GossipSubRouter, mid string) bool { return gs.pullPromised(p, mid) } // the core's (seacast_pull.go)
 	t.Run("the index is held", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			gs := router(ctx, false)
 			held, open := testMid(root, 1), testMid(root, 2) // asks by content id
-			gs.promisesFromWrite(p, []string{held, open}, time.Now())
+			gs.promisesFromWrite(p, []string{held, open}, nextAskSeq(), time.Now())
 			if opened(gs, held) || !opened(gs, open) || gs.v05.ctr.PromisesAtWrite.Load() != 1 {
 				t.Fatalf("held %v open %v at the write %d, want no promise for the held index and one for the other",
 					opened(gs, held), opened(gs, open), gs.v05.ctr.PromisesAtWrite.Load())
@@ -1024,7 +1083,7 @@ func TestPromiseAtWriteAfterClose(t *testing.T) {
 			closed, completed, open := testMid(root, 3), testMid(done, 0), testMid(root, 2)
 			gs.seacastAskQueued(p, []string{closed, completed, open})
 			gs.seacastAsksClosed(closed) // delivered by another peer, say, before the report
-			gs.promisesFromWrite(p, []string{closed, completed, open}, time.Now())
+			gs.promisesFromWrite(p, []string{closed, completed, open}, nextAskSeq(), time.Now())
 			if opened(gs, closed) || opened(gs, completed) || !opened(gs, open) || gs.v05.ctr.PromisesAtWrite.Load() != 1 {
 				t.Fatalf("closed %v completed %v open %v at the write %d, want only the open ask's promise",
 					opened(gs, closed), opened(gs, completed), opened(gs, open), gs.v05.ctr.PromisesAtWrite.Load())
@@ -1042,21 +1101,25 @@ func TestPromiseAtWriteAfterClose(t *testing.T) {
 			mid := testMid(root, 4)
 			gs.seacastAskQueued(p, []string{mid}) // ask A
 			time.Sleep(time.Millisecond)
-			wroteA := time.Now()        // A is written; its report waits on the router's loop
-			gs.seacastAskClosed(p, mid) // A's offer is dropped (F13) before the report lands
+			poppedA, wroteA := nextAskSeq(), time.Now() // A is written; its report waits on the router's loop
+			gs.seacastAskClosed(p, mid)                 // A's offer is dropped (F13) before the report lands
 			time.Sleep(time.Millisecond)
 			gs.seacastAskQueued(p, []string{mid}) // ask B, of a fresh offer, still queued
-			gs.promisesFromWrite(p, []string{mid}, wroteA)
+			gs.promisesFromWrite(p, []string{mid}, poppedA, wroteA)
 			if opened(gs, mid) || !gs.seacastAskIsQueued(p, mid) {
 				t.Fatalf("A's late report: promise %v, B queued %v; want no promise and B still queued",
 					opened(gs, mid), gs.seacastAskIsQueued(p, mid))
 			}
 			time.Sleep(time.Millisecond)
-			wroteB := time.Now()
-			gs.promisesFromWrite(p, []string{mid}, wroteB)
-			if !gs.iwantPromised[mid][p].Equal(wroteB) || gs.seacastAskIsQueued(p, mid) {
-				t.Fatalf("B's report: promise at %v (want B's write, %v), B queued %v", gs.iwantPromised[mid][p], wroteB,
-					gs.seacastAskIsQueued(p, mid))
+			poppedB, wroteB := nextAskSeq(), time.Now()
+			gs.promisesFromWrite(p, []string{mid}, poppedB, wroteB)
+			if !opened(gs, mid) || gs.seacastAskIsQueued(p, mid) {
+				t.Fatalf("B's report: promise %v, B queued %v; want true false", opened(gs, mid), gs.seacastAskIsQueued(p, mid))
+			}
+			// The promise open is B's: due as one opened at A's write it does nothing, at B's it parks.
+			g := seacastGID(root)
+			if gs.pull.promises.Due(g, 4, p, wroteA, time.Now(), time.Minute) || !gs.pull.promises.Due(g, 4, p, wroteB, time.Now(), time.Minute) {
+				t.Fatal("B's report: the promise open is not the one opened at B's write")
 			}
 		})
 	})

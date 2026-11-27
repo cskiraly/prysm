@@ -254,3 +254,33 @@ func TestRpcQueueCancelPop(t *testing.T) {
 		}
 	})
 }
+
+// TestPriorityQueueKeepsItsArray: a normal lane that empties keeps its array, so pushing and popping
+// one RPC at a time allocates nothing, and the slots its pops give up hold no RPC.
+func TestPriorityQueueKeepsItsArray(t *testing.T) {
+	var q priorityQueue
+	rpc := &RPC{}
+	q.NormalPush(rpc)
+	q.Pop()
+	if allocs := testing.AllocsPerRun(100, func() {
+		q.NormalPush(rpc)
+		q.Pop()
+	}); allocs != 0 {
+		t.Fatalf("a push and a pop on an empty lane allocate %v times, want 0", allocs)
+	}
+	a, b, c := &RPC{}, &RPC{}, &RPC{}
+	q.NormalPush(a)
+	q.NormalPush(b)
+	q.NormalPush(c)
+	if got := q.PopAt(1); got != b {
+		t.Fatal("PopAt(1) did not return the middle RPC")
+	}
+	if q.Pop() != a || q.Pop() != c || q.Len() != 0 {
+		t.Fatal("the lane did not keep its order")
+	}
+	for i, r := range q.normal[:cap(q.normal)] {
+		if r != nil {
+			t.Fatalf("slot %d of the empty lane's array still holds an RPC", i)
+		}
+	}
+}

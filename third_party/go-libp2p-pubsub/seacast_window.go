@@ -54,10 +54,15 @@ func (gs *GossipSubRouter) seacastSlotOf(root string) (uint64, bool) {
 // type's slot for a root it places, else the slot the path registered the root at (one registered by
 // a chunk that never validates, or only named in an offer, or registered again after the type dropped
 // its record). While the type still places the root by its slot, a later chunk, offer or ask registers
-// it again and is dropped as expired; the next advance forgets it again. Router goroutine.
+// it again and is dropped as expired; the next advance forgets it again. Its chunks held back go too, a
+// live group's and a tombstone's: the heartbeat's retry would look the root up again, and a type may
+// place a root it forgot as new, where the spec's retry finds the group out of the window. Router
+// goroutine.
 func (gs *GossipSubRouter) seacastForgetRoot(root string) {
 	sc := gs.seacast
 	gs.seacastForgetHeldBack(root)
+	gs.pull.held.ForgetGroup(seacastGID(root))
+	gs.seacastForgetWaits(root) // its ties and kept copies: the heartbeat must not look the root up again
 	delete(sc.roots, root)
 	delete(sc.rootTopic, root)
 	delete(sc.knownAt, root)
@@ -134,52 +139,6 @@ func (gs *GossipSubRouter) seacastAdvanceSlot(slot uint64) {
 	for root := range passed {
 		gs.seacastForgetRoot(root)
 	}
-	gs.seacastDropStaleWaits(slot)
-}
-
-// seacastDropStaleWaits is seacast-lite.md §4.2's drop_stale_waits (spec f6c19db) for what the group's own
-// slot leaves alone (a root the application cannot place): a kept copy goes when the slot it names leaves
-// the live window, its reservation back; a sender's ties to a root go when the slot its first copy named
-// does, through drop_tie: its offers of those indices and their asks go, and the retry runs without it
-// where the group can be checked. Router goroutine, at the slot's advance (the window moves only then).
-func (gs *GossipSubRouter) seacastDropStaleWaits(slot uint64) {
-	sc := gs.seacast
-	stale := func(s uint64) bool { return s+sc.limits.LiveWindow <= slot }
-	for mid, e := range sc.pending {
-		if e.slotOK && stale(e.slot) {
-			delete(sc.pending, mid)
-			sc.pendingOf[e.from]--
-			sc.ctr.StaleWaits.Add(1)
-		}
-	}
-	for root, byPeer := range sc.tieSlot {
-		for p, s := range byPeer {
-			ids, tied := sc.tied[root][p]
-			if !tied {
-				delete(byPeer, p) // its ties went another way (released, expired, the connection)
-				continue
-			}
-			if !stale(s) {
-				continue
-			}
-			delete(byPeer, p)
-			delete(sc.tied[root], p)
-			if len(sc.tied[root]) == 0 {
-				delete(sc.tied, root)
-			}
-			sc.ctr.StaleWaits.Add(1)
-			T := gs.seacastRootType(root)
-			for index, mid := range ids {
-				gs.seacastDropOffer(p, mid, root, index)
-				if T != nil && T.HeaderKnown(root) {
-					gs.retryOfferedPull(mid) // authenticable: the recovery goes on without p
-				}
-			}
-		}
-		if len(byPeer) == 0 {
-			delete(sc.tieSlot, root)
-		}
-	}
 }
 
 // seacastDropGroup ends a group's active lifetime on the path: its pending copies, its store's
@@ -200,18 +159,11 @@ func (gs *GossipSubRouter) seacastClearGroup(root string) {
 	sc.storeForget([]string{root})
 	sc.askedForget([]string{root})
 	sc.standingForget(root)
-	delete(sc.groups, root)  // its state (seacast_complete.go)
-	sc.orderForget(root)     // its ordering state (seacast_order.go), before its rebuilt indices go
-	delete(sc.rebuilt, root) // its rebuilt indices (seacast_decode.go)
-	delete(sc.tied, root)    // its ties go with it (seacast-lite.md §8.1)
+	sc.forgetGroup(root)        // its state (seacast_complete.go)
+	sc.orderForget(root)        // its ordering state (seacast_order.go), before its rebuilt indices go
+	delete(sc.rebuilt, root)    // its rebuilt indices (seacast_decode.go)
+	gs.seacastForgetWaits(root) // its ties and kept copies go with it (seacast-lite.md §8.1)
 	gs.seacastOriginForget(root)
-	for mid, e := range sc.pending {
-		if e.root == root {
-			delete(sc.pending, mid)
-			sc.pendingOf[e.from]--
-			sc.ctr.Expired.Add(1)
-		}
-	}
 }
 
 // seacastGroupAged is the ledger's word that a path root's holdings aged out (haveHeartbeat, GROUP_TTL
@@ -242,18 +194,11 @@ func (gs *GossipSubRouter) seacastGroupAged(root string) {
 	sc.storeForget([]string{root})
 	sc.askedForget([]string{root})
 	sc.standingForget(root)
-	delete(sc.groups, root)  // its state (seacast_complete.go)
+	sc.forgetGroup(root)     // its state (seacast_complete.go)
 	sc.orderForget(root)     // its ordering state (seacast_order.go), before its rebuilt indices go
 	delete(sc.rebuilt, root) // its rebuilt indices (seacast_decode.go)
-	delete(sc.tied, root)
+	gs.seacastForgetWaits(root)
 	gs.seacastOriginForget(root)
-	for mid, e := range sc.pending {
-		if e.root == root {
-			delete(sc.pending, mid)
-			sc.pendingOf[e.from]--
-			sc.ctr.Expired.Add(1)
-		}
-	}
 }
 
 // SeacastAdvanceSlot tells the path the node's current slot (the harness: the block's number as

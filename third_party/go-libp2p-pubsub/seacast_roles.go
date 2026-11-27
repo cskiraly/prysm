@@ -10,36 +10,30 @@ package pubsub
 // interest, and the sampler's DECLARED interest from its standing WANTs (part 2).
 
 import (
+	core "github.com/cskiraly/seacast-go"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// InterestKind is what a node is to receive of a group (§1.2).
-type InterestKind uint8
-
-const (
-	InterestAll      InterestKind = iota // the whole object
-	InterestDerived                      // computed by both ends from the node id and the custody count
-	InterestDeclared                     // told per group in a WANT: a sample
+// InterestKind, Duty, Join and NodeID are the core's (package seacast): what a node is to receive
+// of a group and what it does for others (§1.2), its declaration per object type (§2's Join), and
+// the id derived interest is computed from. The core numbers the enums as SEACAST's message
+// encoding does (seacast-bindings.md §1.2: NONE 0, FORWARD 1); this binding reads them by name only. Its
+// role table keys a Join by the type's name, so the Join's ObjectType and Colours stay zero here:
+// on gossipsub the relation is the mesh (seacast.md §7).
+type (
+	InterestKind = core.Interest
+	Duty         = core.Duty
+	Join         = core.Join
+	NodeID       = core.NodeID
 )
 
-// Duty is what a node does for others (§1.2).
-type Duty uint8
-
 const (
-	DutyForward Duty = iota // holds relations and forwards into others' interest
-	DutyNone                // receives only; serves asks like any node
+	InterestAll      = core.InterestAll
+	InterestDerived  = core.InterestDerived
+	InterestDeclared = core.InterestDeclared
+	DutyForward      = core.DutyForward
+	DutyNone         = core.DutyNone
 )
-
-// Join is a peer's declaration for one object type (§2's Join without the wire fields the
-// subscription carries).
-type Join struct {
-	Interest     InterestKind
-	CustodyCount uint64 // the input to derived interest (the ENR's cgc), else 0
-	Duty         Duty
-}
-
-// NodeID is the id derived interest is computed from (the ENR's node id).
-type NodeID [32]byte
 
 // RoleTable gives each peer's Join per object type and its node id. Both run on the router
 // goroutine; a peer the table does not know has no JOIN for the type.
@@ -200,14 +194,14 @@ func (gs *GossipSubRouter) seacastWantsFromMe(p peer.ID, root string) *haveBits 
 	if gs.have == nil {
 		return in
 	}
-	if e := gs.have.peers[p][root]; e != nil {
-		if e.complete {
+	if e := gs.have.peers.Of(p, seacastGID(root)); e != nil {
+		if e.Complete {
 			return &haveBits{}
 		}
-		in = in.AndNot(&e.bits)
+		in = in.AndNot(&e.Bits)
 	}
-	if pe := gs.have.pushed[p][root]; pe != nil {
-		in = in.AndNot(&pe.bits)
+	if pe := gs.have.pushed.Of(p, seacastGID(root)); pe != nil {
+		in = in.AndNot(&pe.Bits)
 	}
 	return in
 }
