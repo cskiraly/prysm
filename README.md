@@ -11,6 +11,25 @@
 
 ---
 
+## SEACAST on this branch
+
+This branch adds SEACAST to Prysm's pq-devnet-0: the execution payload travels as erasure-coded chunks over a fork of
+go-libp2p-pubsub v0.19.0. The fork lives in `third_party/go-libp2p-pubsub`, and `go.mod` replaces upstream
+go-libp2p-pubsub with it. The protocol's core is a module of its own, which the fork imports:
+[github.com/cskiraly/seacast-go](https://github.com/cskiraly/seacast-go), licensed LGPL-3.0-or-later.
+
+Build and test this branch with Go:
+
+```
+go build ./cmd/beacon-chain ./cmd/validator
+```
+
+The SEACAST tests are the ones [`.github/workflows/seacast.yml`](.github/workflows/seacast.yml) runs. Bazel isn't
+supported here: it would build upstream go-libp2p-pubsub rather than the fork, so a patch that `deps.bzl` applies
+makes such a build fail. Upstream Prysm is removing Bazel as well.
+
+---
+
 ## 📖 Overview
 
 This is the core repository for Prysm, a [Golang](https://go.dev/) implementation of the [Ethereum Consensus](https://ethereum.org/en/developers/docs/consensus-mechanisms/#proof-of-stake) [specification](https://github.com/ethereum/consensus-specs), developed by [Offchain Labs](https://www.offchainlabs.com).
