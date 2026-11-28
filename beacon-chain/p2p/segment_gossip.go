@@ -51,7 +51,7 @@ func (s *Service) SegmentGroupCommitted(group [32]byte, committed []byte) {
 // seacastWindow moves SEACAST's live window with the beacon slot, from now and then at the start of
 // every slot, until the service stops. A no-op while segmented payload gossip is off.
 func (s *Service) seacastWindow() {
-	if s.segmentPayloadType == nil {
+	if s.segmentPayloadType == nil && s.aggregateType == nil {
 		return
 	}
 	s.seacastAdvance(uint64(slots.CurrentSlot(s.genesisTime)))
@@ -77,6 +77,11 @@ func (s *Service) seacastWindow() {
 // NoteGroup takes the clock's slot instead.
 func (s *Service) seacastAdvance(slot uint64) {
 	s.pubsub.SeacastAdvanceSlotWith(slot, func(slot uint64) {
-		s.segmentPayloadType.Advance(slot, pubsub.DefaultSeacastLimits.LiveWindow)
+		if s.segmentPayloadType != nil {
+			s.segmentPayloadType.Advance(slot, pubsub.DefaultSeacastLimits.LiveWindow)
+		}
+		if s.aggregateType != nil {
+			s.aggregateType.Advance(slot)
+		}
 	})
 }

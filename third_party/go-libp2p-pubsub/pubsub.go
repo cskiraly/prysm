@@ -69,6 +69,9 @@ type PubSub struct {
 	// See: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
 	counter uint64
 
+	attachedTopics  map[string]AttachedObject // Immutable after setup.
+	segmentForWhole map[string]string
+
 	host host.Host
 
 	rt PubSubRouter
@@ -1178,14 +1181,22 @@ func (p *PubSub) handlePendingPeers() {
 			continue
 		}
 
-		rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
-		rpcQueue.hose, rpcQueue.peer = p.hose, pid
-		if p.queueHooks != nil {
-			p.queueHooks(rpcQueue)
-		}
+		rpcQueue := p.newPeerQueue(pid)
 		p.peers[pid] = rpcQueue
 		go p.handleNewPeer(p.ctx, pid, rpcQueue)
 	}
+}
+
+func (p *PubSub) newPeerQueue(pid peer.ID) *rpcQueue {
+	q := newRpcQueue(p.peerOutboundQueueSize)
+	q.hose, q.peer = p.hose, pid
+	if p.queueHooks != nil {
+		p.queueHooks(q)
+	}
+	if len(p.attachedTopics) > 0 {
+		q.prepareAttached = p.prepareAttachedData
+	}
+	return q
 }
 
 func (p *PubSub) onClosedIncomingStream(pid peer.ID, proto protocol.ID) {
@@ -1244,11 +1255,7 @@ func (p *PubSub) handleDeadPeers() {
 			// still connected, must be a duplicate connection being closed.
 			// we respawn the writer as we need to ensure there is a stream active
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
-			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
-			rpcQueue.hose, rpcQueue.peer = p.hose, pid
-			if p.queueHooks != nil {
-				p.queueHooks(rpcQueue)
-			}
+			rpcQueue := p.newPeerQueue(pid)
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
 		}
@@ -1894,9 +1901,14 @@ func (p *PubSub) publishMessage(msg *Message) {
 		return
 	}
 	p.notifySubs(msg)
-	if !msg.Local {
+	if !msg.Local && !p.segmentSubscribed(msg.GetTopic()) {
 		p.rt.Publish(msg)
 	}
+}
+
+func (p *PubSub) segmentSubscribed(whole string) bool {
+	segment, ok := p.segmentForWhole[whole]
+	return ok && len(p.mySubs[segment]) > 0
 }
 
 func (p *PubSub) publishMessageBatch(batchAndOpts messageBatchAndPublishOptions) {
@@ -1906,7 +1918,9 @@ func (p *PubSub) publishMessageBatch(batchAndOpts messageBatchAndPublishOptions)
 			continue
 		}
 		p.notifySubs(msg)
-		msgs = append(msgs, msg)
+		if !p.segmentSubscribed(msg.GetTopic()) {
+			msgs = append(msgs, msg)
+		}
 	}
 
 	// We type checked when pushing the batch to the channel

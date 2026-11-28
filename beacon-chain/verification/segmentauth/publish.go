@@ -87,6 +87,30 @@ func SegmentMessagesForEnvelope(
 	if err != nil {
 		return nil, err
 	}
+	out, err := segmentBytes(encoded, p, hasher)
+	if err != nil {
+		return nil, fmt.Errorf("segment envelope: %w", err)
+	}
+	if err := segments.WithContext(out, hasher, slot, blockRoot); err != nil {
+		return nil, fmt.Errorf("segment envelope: %w", err)
+	}
+	return out, nil
+}
+
+// SegmentAggregate cuts the SSZ of a signed PQ aggregate using the SEACAST default coding.
+func SegmentAggregate(encoded []byte) ([]*segments.SegmentMessage, error) {
+	p := DefaultParams()
+	h, err := segments.HasherByID(p.HashID)
+	if err != nil {
+		return nil, err
+	}
+	return segmentBytes(encoded, p, h)
+}
+
+func segmentBytes(encoded []byte, p Params, hasher segments.Hasher) ([]*segments.SegmentMessage, error) {
+	if len(encoded) == 0 {
+		return nil, segments.ErrEmptyMessage
+	}
 	segmentSize, err := segmentSizeAsInt(p.SegmentSize)
 	if err != nil {
 		return nil, err
@@ -109,14 +133,7 @@ func SegmentMessagesForEnvelope(
 			layout.Parity = k
 		}
 	}
-	out, err := segments.Build(committed, layout)
-	if err != nil {
-		return nil, fmt.Errorf("segment envelope: %w", err)
-	}
-	if err := segments.WithContext(out, hasher, slot, blockRoot); err != nil {
-		return nil, fmt.Errorf("segment envelope: %w", err)
-	}
-	return out, nil
+	return segments.Build(committed, layout)
 }
 
 // marshalEnvelope is a signed envelope's SSZ encoding, with its slot and block root, for the

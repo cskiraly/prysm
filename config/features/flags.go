@@ -152,6 +152,10 @@ var (
 		Name:  "prepare-all-payloads",
 		Usage: "Informs the engine to prepare all local payloads. Useful for relayers and builders.",
 	}
+	EnableSegmentedAggregateGossip = &cli.BoolFlag{
+		Name:  "enable-segmented-aggregate-gossip",
+		Usage: "Subscribe to SEACAST PQ aggregate segments and publish eligible aggregates only as segments while subscribed.",
+	}
 	EnableSegmentedPayloadGossip = &cli.BoolFlag{
 		Name: "enable-segmented-payload-gossip",
 		Usage: "Publishes execution payload envelopes as authenticated gossip segments on their own topic, " +
@@ -161,7 +165,7 @@ var (
 	SeacastUplinkMbps = &cli.IntFlag{
 		Name: "seacast-uplink-mbps",
 		Usage: "The node's uplink in Mbps, which sizes the segment topic's send window and push budget. " +
-			"Required with --enable-segmented-payload-gossip.",
+			"Required with segmented payload or aggregate gossip.",
 	}
 	SeacastPayloadOnly = &cli.BoolFlag{
 		Name: "seacast-payload-only",
@@ -321,6 +325,7 @@ var BeaconChainFlags = combinedFlags([]cli.Flag{
 	aggregateThirdInterval,
 	disableResourceManager,
 	EnableLightClient,
+	EnableSegmentedAggregateGossip,
 	EnableSegmentedPayloadGossip,
 	SeacastUplinkMbps,
 	SeacastPayloadOnly,

@@ -541,13 +541,12 @@ func (sc *seacast) String() string {
 
 // --- the codec to the core's messages
 //
-// The binding's strings to the core's types (package seacast) and back. Bindings §4 names a group
-// by 32 bytes, "seacast-lite.md §2's group key, which is the whole id of a payload group"; the core
-// names it by its GroupId (§1.2), the payload's GroupId(0, key, 0). How the strings name a column's
-// or a row's group is open there (§4's first open point), so the codec maps the payload's groups
-// only. A holding travels in an IDONTWANT and an offer in an IHAVE, so the reader takes the carrier.
+// Both segment topics carry a 32-byte group key. The router uses that same key across
+// its holdings, requests and machine state. The topic registry identifies the object type.
+// Payload and attached frames have distinct key preimages (only payloads include the slot).
+// The core's zero type/index namespace encodes this topicless wire key in its tables.
 
-// seacastGroupID is the core's GroupID of a payload group the binding names by root.
+// seacastGroupID maps a wire group key to the core's table key.
 func seacastGroupID(root string) (core.GroupID, bool) {
 	if len(root) != haveRootLen {
 		return "", false
@@ -557,7 +556,7 @@ func seacastGroupID(root string) (core.GroupID, bool) {
 	return core.NewGroupID(core.TypePayload, key, 0), true
 }
 
-// seacastRootOf is the binding's name of g: the payload group's key.
+// seacastRootOf recovers the 32-byte wire key.
 func seacastRootOf(g core.GroupID) (string, bool) {
 	if !g.Valid() || g.Type() != core.TypePayload || g.Index() != 0 {
 		return "", false

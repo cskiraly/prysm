@@ -126,6 +126,8 @@ func (s *Service) topicScoreParams(topic string) (*pubsub.TopicScoreParams, erro
 	switch {
 	case strings.Contains(topic, GossipBlockMessage):
 		return defaultBlockTopicParams(), nil
+	case isAggregateSegmentTopic(topic):
+		return segmentTopicParams(), nil
 	case strings.Contains(topic, GossipAggregateAndProofMessage):
 		activeValidators, err := s.retrieveActiveValidators()
 		if err != nil {

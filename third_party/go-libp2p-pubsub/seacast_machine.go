@@ -53,6 +53,9 @@ func (e seacastEnv) Event(g core.GroupID, ev core.Event) {
 	case core.EvDecodeStale:
 		sc.ctr.DecodesStale.Add(1)
 	case core.EvDecodeFailed:
+		if t, ok := e.T.(AttachedObject); ok {
+			e.gs.settleAttached(t, seacastGIDRoot(g), false)
+		}
 		sc.ctr.DecodesFailed.Add(1)
 		sc.event(SeacastEvDecodeFailed, seacastGIDRoot(g))
 	case core.EvDecodeDone:

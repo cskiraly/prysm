@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/encoder"
+	"github.com/OffchainLabs/prysm/v7/beacon-chain/p2p/internal/segmentgossip"
 	"github.com/OffchainLabs/prysm/v7/config/features"
 	"github.com/OffchainLabs/prysm/v7/config/params"
 	"github.com/OffchainLabs/prysm/v7/consensus-types/primitives"
@@ -57,6 +58,8 @@ const (
 	GossipSignedProposerPreferencesMessage = "proposer_preferences"
 	// GossipExecutionPayloadSegmentMessage is the name for one segment of a segmented execution payload envelope.
 	GossipExecutionPayloadSegmentMessage = "execution_payload_segment"
+	GossipAggregateSegmentMessage        = segmentgossip.AggregateTopicName
+	AggregateSegmentTopicFormat          = GossipProtocolAndDigest + GossipAggregateSegmentMessage
 
 	// Topic Formats
 	//
@@ -184,6 +187,9 @@ func (s *Service) allTopics() []topic {
 		newTopic(gloas, future, empty, GossipExecutionPayloadEnvelopeMessage),
 		newTopic(gloas, future, empty, GossipExecutionPayloadBidMessage),
 		newTopic(gloas, future, empty, GossipSignedProposerPreferencesMessage),
+	}
+	if features.Get().EnableSegmentedAggregateGossip {
+		templates = append(templates, newTopic(cfg.PQForkEpoch, future, empty, GossipAggregateSegmentMessage))
 	}
 	if features.Get().EnableSegmentedPayloadGossip {
 		// Only a node on the segment path may join the segment topic; others refuse its subscriptions.

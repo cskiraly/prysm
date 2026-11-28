@@ -142,6 +142,9 @@ func (s *Service) validateAggregateAndProof(ctx context.Context, pid peer.ID, ms
 	// Verify the block being voted on is in the beacon chain.
 	// If not, store this attestation in the map of pending attestations.
 	if !s.hasBlockAndState(ctx, bytesutil.ToBytes32(data.BeaconBlockRoot)) {
+		if msg.Local {
+			m = localPendingAggregate{m}
+		}
 		s.savePendingAggregate(pid, m)
 		return pubsub.ValidationIgnore, nil
 	}

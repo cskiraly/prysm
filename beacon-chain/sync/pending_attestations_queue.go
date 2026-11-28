@@ -442,7 +442,16 @@ func (s *Service) processVerifiedAttestation(
 	})
 }
 
+// localPendingAggregate preserves a reconstructed message's local-only delivery while its block is missing.
+type localPendingAggregate struct {
+	ethpb.SignedAggregateAttAndProof
+}
+
 func (s *Service) processAggregate(ctx context.Context, aggregate ethpb.SignedAggregateAttAndProof) error {
+	local, localOnly := aggregate.(localPendingAggregate)
+	if localOnly {
+		aggregate = local.SignedAggregateAttAndProof
+	}
 	res, err := s.validateAggregatedAtt(ctx, aggregate)
 	if err != nil {
 		log.WithError(err).Debug("Pending aggregated attestation failed validation")
@@ -464,6 +473,9 @@ func (s *Service) processAggregate(ctx context.Context, aggregate ethpb.SignedAg
 
 	_ = s.setAggregatorIndexEpochSeen(att.GetData().Target.Epoch, aggregate.AggregateAttestationAndProof().GetAggregatorIndex())
 
+	if localOnly {
+		return nil
+	}
 	if err := s.cfg.p2p.Broadcast(ctx, aggregate); err != nil {
 		log.WithError(err).Debug("Could not broadcast aggregated attestation")
 	}

@@ -50,7 +50,7 @@ type PathMetrics struct {
 type payloadRoles struct{}
 
 func (payloadRoles) JoinOf(_ peer.ID, t pubsub.ObjectType) (pubsub.Join, bool) {
-	if t.Name() != PayloadTypeName {
+	if t.Name() != PayloadTypeName && t.Name() != AggregateTypeName {
 		return pubsub.Join{}, false
 	}
 	return pubsub.Join{Interest: pubsub.InterestAll, Duty: pubsub.DutyForward}, true
@@ -70,7 +70,7 @@ func (payloadRoles) NodeIDOf(peer.ID) (pubsub.NodeID, bool) { return pubsub.Node
 // Some of these act on every topic, not only the payload's: the window holds every data frame
 // until a slot frees, and under SEACAST the IHAVE limit counts offer-bearing RPCs and holds asks
 // back rather than ignoring the IHAVE.
-func RouterOptions(s Setting, t pubsub.ObjectType, heartbeat time.Duration, m *PathMetrics) []pubsub.Option {
+func RouterOptions(s Setting, t pubsub.ObjectType, heartbeat time.Duration, m *PathMetrics, additional ...pubsub.ObjectType) []pubsub.Option {
 	index := func(mid string) (string, uint32, bool) {
 		c, ok := ParseMessageID(mid)
 		if !ok {
@@ -134,7 +134,7 @@ func RouterOptions(s Setting, t pubsub.ObjectType, heartbeat time.Duration, m *P
 			Timeout:    windowTimeout,
 			FrameSlots: true,
 		}),
-		pubsub.WithSeacast([]pubsub.ObjectType{t}, &m.Seacast),
+		pubsub.WithSeacast(append([]pubsub.ObjectType{t}, additional...), &m.Seacast),
 		pubsub.WithSeacastRoles(payloadRoles{}),
 		pubsub.WithSeacastMachine(),
 		pubsub.WithSeacastLimits(s.Limits),

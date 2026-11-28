@@ -67,6 +67,9 @@ func (gs *GossipSubRouter) seacastDecodeInstall(T ObjectType, root string, op ui
 	if !sc.gm.Decoded(env, gid, op, ok) {
 		return
 	}
+	if t, attached := T.(AttachedObject); attached {
+		gs.settleAttached(t, root, true)
+	}
 	g := sc.gm.Lookup(gid)
 	idxs := make([]uint32, 0, len(cells))
 	for idx := range cells {

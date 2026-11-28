@@ -13,12 +13,19 @@
 
 ## SEACAST on this branch
 
-This branch adds SEACAST to Prysm's pq-devnet-0: the execution payload travels as erasure-coded chunks over a fork of
+This branch adds SEACAST to Prysm’s pq-devnet-1. Execution payloads and PQ aggregates can travel as erasure-coded chunks over a fork of
 go-libp2p-pubsub v0.19.0. The fork lives in `third_party/go-libp2p-pubsub`, and `go.mod` replaces upstream
 go-libp2p-pubsub with it. The protocol's core is a module of its own, which the fork imports:
 [github.com/cskiraly/seacast-go](https://github.com/cskiraly/seacast-go), licensed LGPL-3.0-or-later.
 
-Build and test this branch with Go:
+Enable PQ aggregate chunks with `--enable-segmented-aggregate-gossip --seacast-uplink-mbps=<Mbps>`.
+While subscribed to `beacon_aggregate_and_proof_segment`, Prysm publishes aggregates only as chunks.
+A publish with no segment peers returns an error. Receivers reconstruct the signed aggregate and run
+the ordinary aggregate validator locally. The first chunk sent to a peer that has yet to learn the
+group carries its vote metadata.
+Within a slot and committee, that metadata lets relays defer competing groups while they reconstruct them.
+
+Build the beacon node and validator with Go.
 
 ```
 go build ./cmd/beacon-chain ./cmd/validator

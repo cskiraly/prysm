@@ -93,11 +93,12 @@ type rpcQueue struct {
 
 	// have, when set, is the HAVE state the writer reads at dispatch (havebitmap.go); cancelled
 	// counts messages dropped there, attached the RPCs that carried a pending HAVE.
-	have      *queueHave
-	cancelled atomic.Int64
-	attached  atomic.Int64
-	reordered atomic.Int64
-	projected atomic.Int64
+	prepareAttached func(peer.ID, *RPC) *RPC
+	have            *queueHave
+	cancelled       atomic.Int64
+	attached        atomic.Int64
+	reordered       atomic.Int64
+	projected       atomic.Int64
 
 	// urgentCh wakes a writer waiting for a hose slot when an urgent RPC arrives, so the urgent
 	// lane never waits for one.
@@ -146,6 +147,9 @@ func newRpcQueue(maxSize int) *rpcQueue {
 // announced, attach what it has not been told, record the pop. nil when nothing is left to send.
 func (q *rpcQueue) dispatch(rpc *RPC) *RPC {
 	if q.have == nil {
+		if q.prepareAttached != nil {
+			return q.prepareAttached(q.peer, rpc)
+		}
 		return rpc
 	}
 	kept, cancelled, projected := q.have.filter(rpc)
@@ -193,6 +197,12 @@ func (q *rpcQueue) dispatch(rpc *RPC) *RPC {
 	if out := q.have.attach(kept); out != nil {
 		q.attached.Add(1)
 		kept = out
+	}
+	if q.prepareAttached != nil {
+		kept = q.prepareAttached(q.peer, kept)
+		if kept == nil {
+			return nil
+		}
 	}
 	for _, m := range kept.Publish {
 		q.have.notePopped(m)

@@ -27,7 +27,8 @@ const MaxPlainChunks = 8192
 type PayloadConfig struct {
 	// Topics is the segment topic at every fork digest the node can run, from Gloas on.
 	Topics []string
-	// CurrentTopic is the segment topic at the current fork digest.
+	// CurrentTopic places unknown groups when payload is the only active type.
+	// When nil, a topic-bearing frame or offer must identify the type first.
 	CurrentTopic func() string
 	// CurrentSlot is the node's current slot.
 	CurrentSlot func() uint64
@@ -274,6 +275,9 @@ func (t *PayloadType) TopicOf(root string) (string, bool) {
 	t.mu.Unlock()
 	if ok && g.topic != "" {
 		return g.topic, true
+	}
+	if t.cfg.CurrentTopic == nil {
+		return "", false
 	}
 	topic := t.cfg.CurrentTopic()
 	return topic, topic != ""

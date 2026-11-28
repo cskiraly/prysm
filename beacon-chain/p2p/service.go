@@ -80,6 +80,7 @@ type Service struct {
 	metaData                 metadata.Metadata
 	pubsub                   *pubsub.PubSub
 	partialColumnBroadcaster partialdatacolumnbroadcaster.Broadcaster
+	aggregateType            *segmentgossip.AggregateType
 	segmentPayloadType       *segmentgossip.PayloadType // the payload on SEACAST's path; nil with the segment flag off
 	seacastMetrics           *segmentgossip.PathMetrics // what the path's options count
 	joinedTopics             map[string]*pubsub.Topic
