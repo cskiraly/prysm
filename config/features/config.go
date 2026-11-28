@@ -41,6 +41,7 @@ type Flags struct {
 	EnablePeerScorer                    bool // EnablePeerScorer enables experimental peer scoring in p2p.
 	EnableLightClient                   bool // EnableLightClient enables light client APIs.
 	EnableQUIC                          bool // EnableQUIC specifies whether to enable QUIC transport for libp2p.
+	EnableSegmentedAggregateGossip      bool
 	EnableSegmentedPayloadGossip        bool // EnableSegmentedPayloadGossip publishes and reassembles execution payload envelopes as gossip segments.
 	SeacastUplinkMbps                   int  // SeacastUplinkMbps is the node's uplink, which sizes the segment path's send window and push budget.
 	SeacastPayloadOnly                  bool // SeacastPayloadOnly sends a published or queued envelope as segments only, never whole, unless segmenting fails.
@@ -255,6 +256,10 @@ func ConfigureBeaconChain(ctx *cli.Context) error {
 	if ctx.IsSet(disableResourceManager.Name) {
 		logEnabled(disableResourceManager)
 		cfg.DisableResourceManager = true
+	}
+	if ctx.Bool(EnableSegmentedAggregateGossip.Name) {
+		logEnabled(EnableSegmentedAggregateGossip)
+		cfg.EnableSegmentedAggregateGossip = true
 	}
 	if ctx.Bool(EnableSegmentedPayloadGossip.Name) {
 		logEnabled(EnableSegmentedPayloadGossip)

@@ -862,6 +862,9 @@ func (gs *GossipSubRouter) OnClosedOutboundStream(p peer.ID) {
 	gs.brokenPromises.forget(p)
 	gs.v05PeerGone(p)
 	gs.seacastPeerGone(p)
+	for _, t := range gs.p.attachedTopics {
+		t.ForgetPeer(p)
+	}
 }
 
 func (gs *GossipSubRouter) EnoughPeers(topic string, suggested int) bool {

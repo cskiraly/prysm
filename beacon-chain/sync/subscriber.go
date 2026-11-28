@@ -224,6 +224,20 @@ func (s *Service) registerSubscribers(nse params.NetworkScheduleEntry) bool {
 	})
 	s.spawn(func() {
 		s.subscribe(p2p.AggregateAndProofSubnetTopicFormat, s.validateAggregateAndProof, s.beaconAggregateProofSubscriber, nse)
+		if features.Get().EnableSegmentedAggregateGossip && nse.Epoch >= params.BeaconConfig().PQForkEpoch {
+			if s.subscriptionRequestExpired(nse) {
+				return
+			}
+			topic := s.addDigestToTopic(p2p.AggregateSegmentTopicFormat, nse.ForkDigest) + s.cfg.p2p.Encoding().ProtocolSuffix()
+			// The router verifies each frame before deduplication and delivers a reconstructed
+			// aggregate through the ordinary whole-topic validator with its remote sender.
+			s.subscribeWithBase(topic, func(ctx context.Context, pid peer.ID, msg *pubsub.Message) (pubsub.ValidationResult, error) {
+				if s.cfg.initialSync.Syncing() {
+					return pubsub.ValidationIgnore, nil
+				}
+				return pubsub.ValidationAccept, nil
+			}, nil)
+		}
 	})
 	s.spawn(func() {
 		s.subscribe(p2p.ExitSubnetTopicFormat, s.validateVoluntaryExit, s.voluntaryExitSubscriber, nse)
@@ -508,7 +522,7 @@ func (s *Service) subscribeWithBase(topic string, validator wrappedVal, handle s
 				return
 			}
 
-			if msg.ReceivedFrom == s.cfg.p2p.PeerID() {
+			if handle == nil || msg.ReceivedFrom == s.cfg.p2p.PeerID() {
 				continue
 			}
 

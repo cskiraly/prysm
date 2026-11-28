@@ -365,6 +365,14 @@ func WithSeacast(types []ObjectType, ctr *SeacastCounters) Option {
 					return fmt.Errorf("seacast: topic %q of type %q is also matched by the phase path", topic, T.Name())
 				}
 				sc.types[topic] = T
+				if a, ok := T.(AttachedObject); ok {
+					if ps.attachedTopics == nil {
+						ps.attachedTopics = make(map[string]AttachedObject)
+						ps.segmentForWhole = make(map[string]string)
+					}
+					ps.attachedTopics[topic] = a
+					ps.segmentForWhole[a.WholeTopic(topic)] = topic
+				}
 			}
 		}
 		gs.seacast = sc
@@ -376,6 +384,20 @@ func WithSeacast(types []ObjectType, ctr *SeacastCounters) Option {
 		// The gate at admission, ahead of any admission the application set.
 		prevAdmit := ps.admitMsg
 		ps.admitMsg = func(m *Message, validated bool) bool {
+			if a := ps.attachedTopics[m.GetTopic()]; a != nil && !validated {
+				verdict, opened := a.AdmitFrame(m)
+				if opened != "" {
+					gs.seacastPlaceRoot(m.GetTopic(), opened)
+					gs.seacastDropBeyond([]string{opened})
+				}
+				switch verdict {
+				case ValidationReject:
+					ps.tracer.RejectMessage(m, RejectValidationFailed)
+					return false
+				case ValidationIgnore:
+					return false
+				}
+			}
 			if !gs.seacastAdmit(m, validated) {
 				return false
 			}

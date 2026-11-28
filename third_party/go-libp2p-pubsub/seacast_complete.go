@@ -45,7 +45,7 @@ func WithSeacastMachine() Option {
 	}
 }
 
-// seacastGID is the machine's key for root: the payload group's GroupID (seacast_wire.go), or, for
+// seacastGID is the machine's key for root: the wire key's GroupID (seacast_wire.go), or, for
 // a root of another length, which the path never names, the root itself as an opaque key.
 func seacastGID(root string) core.GroupID {
 	if g, ok := seacastGroupID(root); ok {

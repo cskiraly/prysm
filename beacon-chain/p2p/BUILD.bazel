@@ -131,6 +131,7 @@ go_test(
     name = "go_default_test",
     srcs = [
         "addr_factory_test.go",
+        "aggregate_segment_test.go",
         "broadcaster_test.go",
         "connection_gater_test.go",
         "custody_test.go",

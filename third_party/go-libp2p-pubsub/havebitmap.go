@@ -305,6 +305,11 @@ func (gs *GossipSubRouter) haveAbsorb(p peer.ID, mid string) bool {
 // The bitmap's trailing zero bytes go first (the wire drops them, core.Bits): a padded holding grows
 // neither the entry nor the writer's copy past its highest index.
 func (gs *GossipSubRouter) haveTake(p peer.ID, root string, enc []byte, claimAll, complete bool) {
+	if gs.seacast != nil {
+		if t, ok := gs.seacastRootOwner(root).(AttachedObject); ok {
+			t.NoteHolding(root, p)
+		}
+	}
 	enc = core.Bits(enc).Trim()
 	h := gs.have
 	newly := h.peers.Absorb(p, seacastGID(root), enc, claimAll, complete, gs.params.IDontWantMessageTTL)

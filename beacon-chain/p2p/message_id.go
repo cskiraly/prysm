@@ -13,12 +13,13 @@ import (
 // isSegmentTopic reports whether a topic is the execution payload segment topic, whose message
 // ids carry the segment's claim ahead of the content id; see segmentgossip.MessageID.
 var isSegmentTopic = segmentgossip.TopicMatcher(GossipExecutionPayloadSegmentMessage)
+var isAggregateSegmentTopic = segmentgossip.TopicMatcher(GossipAggregateSegmentMessage)
 
 // MsgID is a content addressable ID function.
 //
-// On the execution payload segment topic the 20-byte content id below is the tail of a
-// 56-byte id whose head names the segment's group root and index, read from the SSZ body;
-// every other topic keeps the spec's 20 bytes. See segmentgossip.MessageID.
+// Segment topics prefix the content ID with the group key and index. On the
+// aggregate topic only the inner frame contributes to the ID, so attaching a
+// claim for a new peer preserves the identity of the chunk.
 //
 // Ethereum Beacon Chain spec defines the message ID as:
 //
@@ -115,6 +116,13 @@ func postAltairMsgID(pmsg *pubsubpb.Message) string {
 		h := hash.Hash(combinedData)
 		return bytesutil.UnsafeCastToString(h[:20])
 	}
+	var attached bool
+	if isAggregateSegmentTopic(topic) {
+		if _, frame, ok := segmentgossip.AggregateFrame(decodedData); ok {
+			attached = true
+			decodedData = frame
+		}
+	}
 	totalLength, err := math.AddInt(
 		len(params.BeaconConfig().MessageDomainValidSnappy),
 		len(topicLenBytes),
@@ -135,6 +143,9 @@ func postAltairMsgID(pmsg *pubsubpb.Message) string {
 	combinedData = append(combinedData, decodedData...)
 	h := hash.Hash(combinedData)
 	contentID := string(h[:20])
+	if attached {
+		return segmentgossip.AggregateMessageID(decodedData, contentID)
+	}
 	if isSegmentTopic(topic) {
 		return segmentgossip.MessageID(decodedData, contentID)
 	}

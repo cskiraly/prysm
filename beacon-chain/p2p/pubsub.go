@@ -180,7 +180,7 @@ func (s *Service) pubsubOptions() ([]pubsub.Option, error) {
 		directPeersAddrInfos, err := parsePeersEnr(s.cfg.StaticPeers)
 		if err != nil {
 			log.WithError(err).Error("Could not add direct peer option")
-			if features.Get().EnableSegmentedPayloadGossip {
+			if features.Get().EnableSegmentedPayloadGossip || features.Get().EnableSegmentedAggregateGossip {
 				// Returning here would start the node without the segment path and its checks.
 				return nil, errors.Wrap(err, "static peers")
 			}
@@ -191,7 +191,7 @@ func (s *Service) pubsubOptions() ([]pubsub.Option, error) {
 	if s.partialColumnBroadcaster != nil {
 		psOpts = s.partialColumnBroadcaster.AppendPubSubOpts(psOpts)
 	}
-	if features.Get().EnableSegmentedPayloadGossip {
+	if features.Get().EnableSegmentedPayloadGossip || features.Get().EnableSegmentedAggregateGossip {
 		seacastOpts, err := s.seacastOptions(filt)
 		if err != nil {
 			return nil, err
@@ -207,12 +207,38 @@ func (s *Service) pubsubOptions() ([]pubsub.Option, error) {
 // breaks one of the path's conditions does not start.
 func (s *Service) seacastOptions(filt pubsub.SubscriptionFilter) ([]pubsub.Option, error) {
 	setting, typ := s.seacastSetting(filt)
+	var types []pubsub.ObjectType
+	var aggregate *segmentgossip.AggregateType
+	metrics := &segmentgossip.PathMetrics{}
+	if features.Get().EnableSegmentedPayloadGossip {
+		metrics.Payload = typ.Counts()
+		types = append(types, typ)
+	}
+	if features.Get().EnableSegmentedAggregateGossip {
+		var topics []string
+		for _, topic := range s.allTopicStrings() {
+			if isAggregateSegmentTopic(topic) {
+				topics = append(topics, topic)
+			}
+		}
+		if len(topics) > 0 {
+			aggregate = segmentgossip.NewAggregateType(segmentgossip.PayloadConfig{Topics: topics, CurrentSlot: s.seacastCurrentSlot, UplinkMbps: setting.UplinkMbps})
+			setting.SegmentTopics = append(setting.SegmentTopics, topics...)
+			setting.TypeTopics = append(setting.TypeTopics, topics...)
+			types = append(types, aggregate)
+		}
+	}
+	if len(types) == 0 {
+		return nil, nil
+	}
 	if err := segmentgossip.CheckSetting(setting); err != nil {
 		return nil, err
 	}
-	s.segmentPayloadType = typ
-	s.seacastMetrics = &segmentgossip.PathMetrics{Payload: typ.Counts()} // exported once the router is built (NewService)
-	return segmentgossip.RouterOptions(setting, typ, gossipSubHeartbeatInterval, s.seacastMetrics), nil
+	if features.Get().EnableSegmentedPayloadGossip {
+		s.segmentPayloadType = typ
+	}
+	s.aggregateType, s.seacastMetrics = aggregate, metrics
+	return segmentgossip.RouterOptions(setting, types[0], gossipSubHeartbeatInterval, metrics, types[1:]...), nil
 }
 
 // seacastSetting is the node's setting for the segment path, and the payload type it runs: the
@@ -226,9 +252,13 @@ func (s *Service) seacastSetting(filt pubsub.SubscriptionFilter) (segmentgossip.
 		}
 	}
 	uplink := features.Get().SeacastUplinkMbps
+	currentTopic := s.currentSegmentTopic
+	if features.Get().EnableSegmentedAggregateGossip {
+		currentTopic = nil
+	}
 	typ := segmentgossip.NewPayloadType(segmentgossip.PayloadConfig{
 		Topics:       topics,
-		CurrentTopic: s.currentSegmentTopic,
+		CurrentTopic: currentTopic,
 		CurrentSlot:  s.seacastCurrentSlot,
 		UplinkMbps:   uplink,
 	})
@@ -286,7 +316,7 @@ func pubsubGossipParam() pubsub.GossipSubParams {
 	gParams.HeartbeatInterval = gossipSubHeartbeatInterval
 	gParams.HistoryLength = gossipSubMcacheLen
 	gParams.HistoryGossip = gossipSubMcacheGossip
-	if features.Get().EnableSegmentedPayloadGossip {
+	if features.Get().EnableSegmentedPayloadGossip || features.Get().EnableSegmentedAggregateGossip {
 		gParams.MaxIHaveMessages = segmentgossip.MaxIHaveMessages
 	}
 	return gParams

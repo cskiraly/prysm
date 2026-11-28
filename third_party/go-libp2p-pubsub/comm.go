@@ -239,22 +239,11 @@ func (p *PubSub) handlePeerDead(s network.Stream) {
 }
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing *rpcQueue, firstMessage chan *RPC) {
-	writeRpc := func(rpc *RPC) error {
-		if d := time.Duration(p.sendDelay.Load()); d > 0 {
-			select {
-			case <-time.After(d):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		if rpc = outgoing.dropSettledProbes(rpc); rpc == nil {
-			return nil // only a probe settled while queued was left: not written (probe_settled)
-		}
-		if rpc.lostOnly {
-			outgoing.noteAsksWritten(rpc) // its asks were lost on the wire: reported as written
-			return nil                    // and nothing to write
-		}
+	writeFrame := func(rpc *RPC) error {
 		size := uint64(proto.Size(&rpc.RPC))
+		if size == 0 {
+			return nil
+		}
 
 		buf := pool.Get(varint.UvarintSize(size) + int(size))
 		defer pool.Put(buf)
@@ -288,6 +277,41 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 		p.rpcLogger.Debug("sent", "peer", s.Conn().RemotePeer(), "rpc", rpc)
 		p.tracer.SendRPCCompleted(rpc, s.Conn().RemotePeer(), writeDuration)
 		return nil
+	}
+
+	writeRpc := func(rpc *RPC) error {
+		if d := time.Duration(p.sendDelay.Load()); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if rpc = outgoing.dropSettledProbes(rpc); rpc == nil {
+			return nil // only a probe settled while queued was left: not written (probe_settled)
+		}
+		if rpc.lostOnly {
+			outgoing.noteAsksWritten(rpc) // its asks were lost on the wire: reported as written
+			return nil                    // and nothing to write
+		}
+		prepared := p.filterAttachedOffers(rpc)
+		if len(p.attachedTopics) > 0 && len(prepared.Publish) > 0 && proto.Size(&prepared.RPC) > p.maxMessageSize {
+			// Adding first-contact metadata can push an already packed RPC over the wire limit.
+			for part := range prepared.split(p.maxMessageSize, p.maxControlMessageSize) {
+				if proto.Size(&part.RPC) > p.maxMessageSize {
+					return io.ErrShortBuffer
+				}
+				part.solicited, part.repair = prepared.solicited, prepared.repair
+				if part.Control != nil {
+					part.asks, part.popped = prepared.asks, prepared.popped
+				}
+				if err := writeFrame(part); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return writeFrame(prepared)
 	}
 
 	select {

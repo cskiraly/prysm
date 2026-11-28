@@ -3,6 +3,8 @@ load("@prysm//tools/go:def.bzl", "go_library", "go_test")
 go_library(
     name = "go_default_library",
     srcs = [
+        "aggregatetype.go",
+        "aggregatewire.go",
         "msgid.go",
         "payloadtype.go",
         "routeropts.go",
@@ -13,6 +15,8 @@ go_library(
     visibility = ["//beacon-chain/p2p:__subpackages__"],
     deps = [
         "//beacon-chain/p2p/encoder:go_default_library",
+        "//beacon-chain/verification/segmentauth:go_default_library",
+        "//config/fieldparams:go_default_library",
         "//config/params:go_default_library",
         "//container/segments:go_default_library",
         "//proto/prysm/v1alpha1:go_default_library",
@@ -20,19 +24,25 @@ go_library(
         "@com_github_libp2p_go_libp2p//core/peer:go_default_library",
         "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
         "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
 
 go_test(
     name = "go_default_test",
     srcs = [
+        "aggregate_test.go",
         "msgid_test.go",
         "seacast_test.go",
     ],
     embed = [":go_default_library"],
     deps = [
+        "//config/fieldparams:go_default_library",
+        "//container/segments:go_default_library",
         "//proto/prysm/v1alpha1:go_default_library",
         "//testing/require:go_default_library",
+        "@com_github_golang_snappy//:go_default_library",
         "@com_github_libp2p_go_libp2p_pubsub//:go_default_library",
+        "@com_github_libp2p_go_libp2p_pubsub//pb:go_default_library",
     ],
 )

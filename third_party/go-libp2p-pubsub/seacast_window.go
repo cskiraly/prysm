@@ -32,7 +32,15 @@ func (gs *GossipSubRouter) seacastRootState(root string) (expired, future bool) 
 	if s > sc.slot {
 		return false, true
 	}
-	return s+sc.limits.LiveWindow <= sc.slot, false
+	return s+gs.seacastLiveWindow(root) <= sc.slot, false
+}
+
+// Attached aggregate groups expire at the next wall slot.
+func (gs *GossipSubRouter) seacastLiveWindow(root string) uint64 {
+	if _, ok := gs.seacastRootOwner(root).(AttachedObject); ok {
+		return 1
+	}
+	return gs.seacast.limits.LiveWindow
 }
 
 // seacastRootExpired is seacastRootState's first answer, for the callers that drop both ways.
@@ -99,7 +107,7 @@ func (gs *GossipSubRouter) seacastAdvanceSlot(slot uint64) {
 	}
 	passed := map[string]bool{} // the tombstones the window passed: already dropped, not expired again
 	for root := range sc.expired {
-		if s, ok := gs.seacastRegistrySlot(root); ok && s+sc.limits.LiveWindow <= slot {
+		if s, ok := gs.seacastRegistrySlot(root); ok && s+gs.seacastLiveWindow(root) <= slot {
 			delete(sc.expired, root)
 			passed[root] = true
 			sc.ctr.TombstonesDropped.Add(1)
@@ -118,7 +126,7 @@ func (gs *GossipSubRouter) seacastAdvanceSlot(slot uint64) {
 				continue
 			}
 		}
-		if s+sc.limits.LiveWindow > slot {
+		if s+gs.seacastLiveWindow(root) > slot {
 			continue
 		}
 		sc.ctr.WindowExpired.Add(1)
@@ -180,7 +188,7 @@ func (gs *GossipSubRouter) seacastGroupAged(root string) {
 		return
 	}
 	if sc.slotKnown {
-		if s, ok := gs.seacastRegistrySlot(root); ok && s+sc.limits.LiveWindow <= sc.slot {
+		if s, ok := gs.seacastRegistrySlot(root); ok && s+gs.seacastLiveWindow(root) <= sc.slot {
 			return // its slot has left the window: the window keeps it out, no tombstone
 		}
 	}

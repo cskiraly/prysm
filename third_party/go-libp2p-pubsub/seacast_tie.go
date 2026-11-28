@@ -251,7 +251,7 @@ func (gs *GossipSubRouter) seacastWaitExpired(root string) bool {
 		return false
 	}
 	s, ok := T.SlotOf(root)
-	return ok && s+sc.limits.LiveWindow <= sc.slot
+	return ok && s+gs.seacastLiveWindow(root) <= sc.slot
 }
 
 // seacastTie ties from to root for index (Ties.Tie): from's promise for mid closes without a charge.

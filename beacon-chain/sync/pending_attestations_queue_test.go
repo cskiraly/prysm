@@ -950,14 +950,29 @@ func TestProcessPendingAtts_HasBlockSaveAggregatedAtt(t *testing.T) {
 
 	require.NoError(t, r.cfg.beaconDB.SaveState(t.Context(), s, root))
 
-	r.blkRootToPendingAtts[root] = []any{&ethpb.SignedAggregateAttestationAndProof{Message: aggregateAndProof, Signature: aggreSig}}
-	require.NoError(t, r.processPendingAttsForBlock(t.Context(), root))
+	signed := &ethpb.SignedAggregateAttestationAndProof{Message: aggregateAndProof, Signature: aggreSig}
+	for _, tc := range []struct {
+		name      string
+		pending   ethpb.SignedAggregateAttAndProof
+		broadcast bool
+	}{
+		{"ordinary", signed, true}, {"reconstructed", localPendingAggregate{signed}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r.cfg.attPool = attestations.NewPool()
+			r.seenAggregatedAttestationCache = lruwrpr.New(10)
+			p1.BroadcastCalled.Store(false)
+			r.blkRootToPendingAtts[root] = []any{tc.pending}
+			require.NoError(t, r.processPendingAttsForBlock(t.Context(), root))
 
-	assert.Equal(t, 1, len(r.cfg.attPool.AggregatedAttestations()), "Did not save aggregated att")
-	assert.DeepEqual(t, att, r.cfg.attPool.AggregatedAttestations()[0], "Incorrect saved att")
-	atts := r.cfg.attPool.UnaggregatedAttestations()
-	assert.Equal(t, 0, len(atts), "Did save aggregated att")
-	require.LogsContain(t, hook, "Verified and saved pending attestations to pool")
+			assert.Equal(t, 1, len(r.cfg.attPool.AggregatedAttestations()), "Did not save aggregated att")
+			assert.DeepEqual(t, att, r.cfg.attPool.AggregatedAttestations()[0], "Incorrect saved att")
+			atts := r.cfg.attPool.UnaggregatedAttestations()
+			assert.Equal(t, 0, len(atts), "Did save aggregated att")
+			require.LogsContain(t, hook, "Verified and saved pending attestations to pool")
+			require.Equal(t, tc.broadcast, p1.BroadcastCalled.Load())
+		})
+	}
 	cancel()
 }
 

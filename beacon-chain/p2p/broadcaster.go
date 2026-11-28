@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -186,6 +188,31 @@ func (s *Service) BroadcastSegments(ctx context.Context, segs []*segments.Segmen
 		return err
 	}
 	return nil
+}
+
+func (s *Service) broadcastAggregateSegments(ctx context.Context, aggregate *ethpb.SignedAggregateAttestationAndProofPQ, topic string) error {
+	handle, err := s.JoinTopic(topic)
+	if err != nil {
+		return err
+	}
+	return s.aggregateType.Publish(aggregate, topic, func(frames [][]byte) error {
+		if len(handle.ListPeers()) == 0 {
+			return ErrSegmentsNoPeers
+		}
+		ctx, cancel := context.WithTimeout(ctx, segmentBatchDeadline)
+		defer cancel()
+		var batch pubsub.MessageBatch
+		for _, wire := range frames {
+			if err := handle.AddToBatch(ctx, &batch, wire); err != nil {
+				return err
+			}
+		}
+		report := make(chan int, 1)
+		if err := s.pubsub.PublishBatch(&batch, pubsub.WithBatchEnqueued(func(n int) { report <- n })); err != nil {
+			return err
+		}
+		return awaitEnqueued(ctx, report)
+	})
 }
 
 // awaitEnqueued waits for the router's report of how many peers' queues took a batch, and
@@ -783,6 +810,12 @@ func (s *Service) broadcastObject(ctx context.Context, obj ssz.Marshaler, topic 
 
 	span.SetAttributes(trace.StringAttribute("topic", topic))
 
+	if agg, ok := obj.(*ethpb.SignedAggregateAttestationAndProofPQ); ok && s.aggregateType != nil {
+		segmentTopic := strings.TrimSuffix(topic, GossipAggregateAndProofMessage) + GossipAggregateSegmentMessage + s.Encoding().ProtocolSuffix()
+		if slices.Contains(s.pubsub.GetTopics(), segmentTopic) {
+			return s.broadcastAggregateSegments(ctx, agg, segmentTopic)
+		}
+	}
 	data, fullTopic, err := s.encodeGossipMessage(obj, topic)
 	if err != nil {
 		tracing.AnnotateError(span, err)

@@ -2425,8 +2425,8 @@ def prysm_deps():
     go_repository(
         name = "com_github_nalepae_go_leanxmss",
         importpath = "github.com/nalepae/go-leanxmss",
-        sum = "h1:SYj6zVti/pOvNFHfnE8GmCyS45FMwZMgUUYRlAjJqZM=",
-        version = "v0.0.0-20261123114007-4b4dc8e0fbbc",
+        sum = "h1:436JgNMR/qJ/uvVKecVMjMz71WVuOr6Xx6BsNKdxn1U=",
+        version = "v0.0.0-20261124221022-cb33291bc3b3",
     )
     go_repository(
         name = "com_github_naoina_go_stringutil",
@@ -4768,6 +4768,15 @@ def prysm_deps():
         importpath = "gonum.org/v1/gonum",
         sum = "h1:VbpOemQlsSMrYmn7T2OUvQ4dqxQXU+ouZFQsZOx50z4=",
         version = "v0.17.0",
+    )
+    go_repository(
+        name = "org_leanvm_go",
+        build_file_generation = "off",
+        importpath = "leanvm.org/go",
+        patch_args = ["-p1"],
+        patches = ["//third_party:org_leanvm_go.patch"],
+        sum = "h1:/6NV2hSa2FdqNgpN4YytvXlYP3zWMLkzQWF0l/gySX0=",
+        version = "v0.19.0",
     )
     go_repository(
         name = "org_uber_go_atomic",
